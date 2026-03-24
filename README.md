@@ -18,10 +18,12 @@ The default landing page for each project is `.agent-subsessions/projects/<proje
 - `tasks.md` shows assignment state and summary titles
 - `manager-summary.md` shows the latest manager aggregation
 - `questions.md` shows human decisions and blockers
+- `answers.md` is the human-edited answer file the manager reads
+- `answers-template.md` gives copy-ready lines for open questions
 - `conflicts.md` shows overlap risk between writers
 - `reports/<run-id>.md` stores one markdown report per child session
 
-While child sessions are running, the manager refreshes those markdown files automatically in the background.
+While child sessions are running, the manager refreshes those markdown files automatically in the background. Tasks with `depends_on` are held automatically until their prerequisites complete, then the manager launches the next wave on its own.
 
 ## Install After Pushing
 

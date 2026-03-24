@@ -13,7 +13,7 @@ Treat a subsession as a full Codex worker with its own thread, context window, t
 
 Use the control script in `scripts/team_leader.py` instead of ad hoc shell fragments. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.agent-subsessions/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. If an older `.codex-subsessions/` directory already exists, the script will keep using it.
 
-When runs are linked to a project, the script also maintains a central markdown workspace under `.agent-subsessions/projects/<project>/` with a default `README.md` landing page, a live dashboard, task ledger, manager summary, questions for humans, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
+When runs are linked to a project, the script also maintains a central markdown workspace under `.agent-subsessions/projects/<project>/` with a default `README.md` landing page, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
 
 Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
 
@@ -93,7 +93,7 @@ python3 scripts/team_leader.py dispatch \
   --prompt-file /tmp/api-review-prompt.md
 ```
 
-That project link is what enables automatic markdown aggregation and progress visualization.
+That project link is what enables automatic markdown aggregation, progress visualization, and dependency-aware next-wave launching.
 
 ### 3. Track progress
 
@@ -112,6 +112,8 @@ For project-linked runs, the manager also updates:
 - `projects/<project>/tasks.md`
 - `projects/<project>/manager-summary.md`
 - `projects/<project>/questions.md`
+- `projects/<project>/answers.md`
+- `projects/<project>/answers-template.md`
 - `projects/<project>/conflicts.md`
 - `projects/<project>/reports/<run-id>.md`
 
@@ -159,6 +161,7 @@ Every child prompt should include:
 - Write boundary: whether the child may edit files, and if so which ones
 - Validation: tests, checks, or evidence expectations
 - Return contract: what summary or artifact the child must produce
+- Human questions: tell the child to put unresolved decisions under a `Questions` or `Questions For Humans` heading when needed
 
 When running multiple writers in parallel, assign disjoint file ownership. If that is not possible, turn some children into read-only researchers or reviewers instead of concurrent editors.
 
@@ -169,17 +172,18 @@ Populate `--owned-path` when a child is allowed to write. The project workspace 
 - Prefer `--sandbox read-only` for research-only children
 - Prefer `--sandbox workspace-write --full-auto` for normal autonomous implementation children
 - Prefer linking every meaningful child to `--project`, `--task-id`, `--summary`, and `--role` so the markdown dashboard remains useful
+- Use `--depends-on` when a task should wait for another task to complete; the manager now keeps blocked tasks parked and launches them automatically when their prerequisites finish
 - Use `--add-dir` for extra writable paths outside the main repo root
 - Use `--skip-git-repo-check` if a child must run outside a Git repository
 - Use `attach-session` if auto-detection misses a session ID and you need a stable resume handle
 - Use `attach-thread` as a Codex-specific compatibility alias
 - Use `reconcile` to backfill session IDs after runs finish
 - When adding another CLI later, preserve the registry and run commands; only add a new adapter and keep provider branching out of the shared lifecycle code
-- Use `README.md` as the default landing page for a project workspace, then open `dashboard.md` for live progress, `tasks.md` for assignment state, `questions.md` for escalation, and `manager-summary.md` for the latest aggregate snapshot
+- Use `README.md` as the default landing page for a project workspace, then open `dashboard.md` for live progress, `tasks.md` for assignment state, `questions.md` for escalation, `answers.md` for human responses, and `manager-summary.md` for the latest aggregate snapshot
 
 ## Guardrails
 
 - Each child session consumes normal Codex usage. Use only as many concurrent children as the task justifies.
 - Do not run concurrent writers against the same files unless the user explicitly accepts merge risk.
-- `conflicts.md` reports overlap risk from declared ownership. It does not automatically merge conflicting file edits.
+- `conflicts.md` reports overlap risk from declared ownership. Conflict resolution stays in the manager's domain; the tool does not auto-merge file edits.
 - This skill manages child provider sessions, not arbitrary background jobs. Keep the current workflow centered on real CLI session primitives rather than custom task shims.

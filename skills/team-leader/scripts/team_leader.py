@@ -5,6 +5,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,9 @@ DEFAULT_PROVIDER = "codex"
 GENERIC_ROOT_NAME = ".agent-subsessions"
 LEGACY_ROOT_NAME = ".codex-subsessions"
 QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
+ANSWER_LINE_RE = re.compile(r"^\s*[-*+]\s*`?([a-z0-9][a-z0-9-]*)`?\s*:\s*(.+?)\s*$", re.IGNORECASE)
+PRELAUNCH_STATUSES = {"prepared", "blocked"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "exited"}
 
 
 def utc_now() -> str:
@@ -368,8 +372,11 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("task_id", None)
         run.setdefault("role", None)
         run.setdefault("summary", None)
+        run.setdefault("created_at", run.get("launched_at"))
         run.setdefault("owned_paths", [])
         run.setdefault("depends_on", [])
+        run.setdefault("dispatch_state", None)
+        run.setdefault("blocked_on", [])
         if get_session_id(run):
             set_session_id(run, get_session_id(run))
     return data
@@ -499,8 +506,8 @@ def run_status_counts(runs: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def run_sort_key(run: dict[str, Any]) -> tuple[str, str]:
-    launched_at = str(run.get("launched_at") or "")
-    return launched_at, str(run.get("run_id") or "")
+    created_at = str(run.get("created_at") or run.get("launched_at") or "")
+    return created_at, str(run.get("run_id") or "")
 
 
 def markdown_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -610,6 +617,46 @@ def extract_questions(text: str | None) -> list[str]:
     return unique
 
 
+def question_id_for(run: dict[str, Any], text: str) -> str:
+    payload = f"{run['run_id']}\n{text}".encode("utf-8")
+    digest = hashlib.sha1(payload).hexdigest()[:10]
+    return f"q-{digest}"
+
+
+def build_question_record(run: dict[str, Any], text: str) -> dict[str, str]:
+    return {
+        "id": question_id_for(run, text),
+        "run_id": str(run["run_id"]),
+        "task_id": str(run.get("task_id") or run["run_id"]),
+        "summary": str(run.get("summary") or "-"),
+        "text": text,
+    }
+
+
+def load_answers(project_dir: Path) -> dict[str, str]:
+    text = read_text_if_exists(project_dir / "answers.md")
+    if not text:
+        return {}
+    answers: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        match = ANSWER_LINE_RE.match(raw_line.strip())
+        if not match:
+            continue
+        question_id = match.group(1).strip()
+        answer = match.group(2).strip()
+        if answer:
+            answers[question_id] = answer
+    return answers
+
+
+def unanswered_questions(question_records: list[dict[str, str]], answers: dict[str, str]) -> list[dict[str, str]]:
+    return [record for record in question_records if record["id"] not in answers]
+
+
+def answered_questions(question_records: list[dict[str, str]], answers: dict[str, str]) -> list[dict[str, str]]:
+    return [record for record in question_records if record["id"] in answers]
+
+
 def last_message_for_run(run: dict[str, Any]) -> str | None:
     return read_text_if_exists(Path(run["last_message_path"]))
 
@@ -675,6 +722,57 @@ def detect_conflict_risks(runs: list[dict[str, Any]]) -> list[dict[str, str]]:
     return conflicts
 
 
+def dependency_pool(index: dict[str, Any], run: dict[str, Any]) -> list[dict[str, Any]]:
+    project_slug_value = normalize_optional_text(run.get("project_slug"))
+    pool = [candidate for candidate in index["runs"] if candidate is not run]
+    if not project_slug_value:
+        return pool
+    return [
+        candidate
+        for candidate in pool
+        if normalize_optional_text(candidate.get("project_slug")) == project_slug_value
+    ]
+
+
+def unresolved_dependencies(index: dict[str, Any], run: dict[str, Any]) -> list[str]:
+    depends_on = normalize_str_list(run.get("depends_on"), "depends_on")
+    if not depends_on:
+        return []
+    pool = dependency_pool(index, run)
+    unresolved: list[str] = []
+    for task_id in depends_on:
+        candidates = [
+            candidate
+            for candidate in pool
+            if normalize_optional_text(candidate.get("task_id")) == task_id
+        ]
+        if any(str(candidate.get("status") or "") == "completed" for candidate in candidates):
+            continue
+        unresolved.append(task_id)
+    return unresolved
+
+
+def compute_dispatch_state(index: dict[str, Any], run: dict[str, Any]) -> tuple[str, list[str]]:
+    status = str(run.get("status") or "")
+    if status == "running":
+        return "running", []
+    if status in TERMINAL_STATUSES:
+        return status, []
+    if status == "dry-run":
+        return "dry-run", []
+    blocked_on = unresolved_dependencies(index, run)
+    if blocked_on:
+        return "blocked", blocked_on
+    return "ready", []
+
+
+def update_dispatch_metadata(index: dict[str, Any]) -> None:
+    for run in index["runs"]:
+        dispatch_state, blocked_on = compute_dispatch_state(index, run)
+        run["dispatch_state"] = dispatch_state
+        run["blocked_on"] = list(blocked_on)
+
+
 def ensure_project_workspace(root: Path, project_name: str, slug: str) -> Path:
     project_dir = root / "projects" / slug
     (project_dir / "reports").mkdir(parents=True, exist_ok=True)
@@ -685,6 +783,7 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
     counts = run_status_counts(runs)
     cwd_values = sorted({str(run.get("cwd") or "-") for run in runs})
     watcher_state, watcher_heartbeat = monitor_state(project_dir.parent.parent)
+    blocked_count = sum(1 for run in runs if str(run.get("dispatch_state") or "") == "blocked")
     watcher_line = f"- Manager watcher: `{watcher_state}`"
     if watcher_heartbeat:
         watcher_line += f" (last heartbeat `{watcher_heartbeat}`)"
@@ -701,6 +800,7 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             watcher_line,
             f"- Working directories: {format_inline_list(cwd_values)}",
             f"- Total tracked runs: `{len(runs)}`",
+            f"- Blocked by dependencies: `{blocked_count}`",
             f"- Running: `{counts['running']}`",
             f"- Completed: `{counts['completed']}`",
             f"- Failed: `{counts['failed']}`",
@@ -712,6 +812,8 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             "- `tasks.md`: task-oriented ledger with summaries and ownership",
             "- `manager-summary.md`: concise manager snapshot",
             "- `questions.md`: human-facing questions and blockers",
+            "- `answers.md`: human-maintained answers keyed by question id",
+            "- `answers-template.md`: copy-ready answer lines for open questions",
             "- `conflicts.md`: ownership overlap and conflict-risk notes",
             "- `reports/`: one markdown report per child run",
             "",
@@ -728,6 +830,8 @@ def render_task_ledger(runs: list[dict[str, Any]]) -> str:
                 str(run.get("summary") or "-"),
                 str(run.get("role") or "-"),
                 str(run.get("status") or "-"),
+                str(run.get("dispatch_state") or "-"),
+                format_inline_list(normalize_str_list(run.get("blocked_on"), "blocked_on")),
                 str(run["run_id"]),
                 format_inline_list(normalize_str_list(run.get("depends_on"), "depends_on")),
                 format_inline_list(relative_owned_paths(run)),
@@ -739,15 +843,21 @@ def render_task_ledger(runs: list[dict[str, Any]]) -> str:
             "# Task Ledger",
             "",
             markdown_table(
-                ["task", "summary", "role", "status", "run", "depends_on", "owned_paths", "session"],
-                rows or [["-", "-", "-", "-", "-", "-", "-", "-"]],
+                ["task", "summary", "role", "status", "dispatch", "blocked_on", "run", "depends_on", "owned_paths", "session"],
+                rows or [["-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]],
             ),
             "",
         ]
     )
 
 
-def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: list[dict[str, str]], questions: list[str]) -> str:
+def render_dashboard(
+    project_name: str,
+    runs: list[dict[str, Any]],
+    conflicts: list[dict[str, str]],
+    question_records: list[dict[str, str]],
+    answers: dict[str, str],
+) -> str:
     counts = run_status_counts(runs)
     project_dir = project_root(Path(runs[0]["run_dir"]).parent.parent, runs[0]) if runs else None
     watcher_state = "idle"
@@ -757,6 +867,9 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
     rows: list[list[str]] = []
     active: list[dict[str, Any]] = []
     completed: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    open_questions = unanswered_questions(question_records, answers)
+    answered = answered_questions(question_records, answers)
     for run in sorted(runs, key=run_sort_key):
         rows.append(
             [
@@ -765,6 +878,7 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
                 short_summary(str(run.get("summary") or "-")),
                 str(run.get("role") or "-"),
                 str(run.get("status") or "-"),
+                str(run.get("dispatch_state") or "-"),
                 str(run.get("session_id") or "-"),
                 format_inline_list(relative_owned_paths(run)),
                 format_short_timestamp(normalize_optional_text(run.get("launched_at"))),
@@ -773,6 +887,8 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
         status = str(run.get("status") or "")
         if status == "running":
             active.append(run)
+        elif str(run.get("dispatch_state") or "") == "blocked":
+            blocked.append(run)
         elif status in {"completed", "failed", "cancelled"}:
             completed.append(run)
     lines = [
@@ -788,8 +904,8 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
         "## Run Table",
         "",
         markdown_table(
-            ["run", "task", "summary", "role", "status", "session", "owned_paths", "launched"],
-            rows or [["-", "-", "-", "-", "-", "-", "-", "-"]],
+            ["run", "task", "summary", "role", "status", "dispatch", "session", "owned_paths", "launched"],
+            rows or [["-", "-", "-", "-", "-", "-", "-", "-", "-"]],
         ),
         "",
         "## Active Runs",
@@ -816,6 +932,21 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
             )
             if live_note:
                 lines.extend([preview_text(live_note, max_lines=3, max_chars=320), ""])
+    lines.extend(["## Blocked Runs", ""])
+    if not blocked:
+        lines.append("_No tasks are currently blocked on dependencies._")
+    else:
+        for run in blocked:
+            lines.extend(
+                [
+                    f"### {run['run_id']}",
+                    "",
+                    f"- Task: `{run.get('task_id') or '-'}`",
+                    f"- Summary: {run.get('summary') or '-'}",
+                    f"- Waiting on: {format_inline_list(normalize_str_list(run.get('blocked_on'), 'blocked_on'))}",
+                    "",
+                ]
+            )
     lines.extend(["## Recent Child Output", ""])
     if not completed:
         lines.append("_No finished child output yet._")
@@ -832,11 +963,21 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
                 ]
             )
     lines.extend(["## Questions For Humans", ""])
-    if not questions:
+    if not open_questions:
         lines.append("_No human questions detected._")
     else:
-        for question in questions:
-            lines.append(f"- {question}")
+        for question in open_questions:
+            lines.append(
+                f"- `{question['id']}` for `{question['task_id']}`: {question['text']}"
+            )
+    lines.extend(["", "## Human Answers", ""])
+    if not answered:
+        lines.append("_No answered questions recorded yet._")
+    else:
+        for question in answered[-5:]:
+            lines.append(
+                f"- `{question['id']}` for `{question['task_id']}`: {answers[question['id']]}"
+            )
     lines.extend(["", "## Conflict Risks", ""])
     if not conflicts:
         lines.append("_No owned-path overlap detected._")
@@ -849,13 +990,26 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
     return "\n".join(lines)
 
 
-def render_manager_summary(project_name: str, runs: list[dict[str, Any]], conflicts: list[dict[str, str]], questions: list[str]) -> str:
+def render_manager_summary(
+    project_name: str,
+    runs: list[dict[str, Any]],
+    conflicts: list[dict[str, str]],
+    question_records: list[dict[str, str]],
+    answers: dict[str, str],
+) -> str:
     counts = run_status_counts(runs)
+    open_questions = unanswered_questions(question_records, answers)
+    answered = answered_questions(question_records, answers)
+    blocked = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("dispatch_state") or "") == "blocked"
+    ]
     lines = [
         f"# {project_name} Manager Summary",
         "",
         f"- Updated: `{utc_now()}`",
         f"- Total runs: `{len(runs)}`",
+        f"- Blocked: `{len(blocked)}`",
         f"- Running: `{counts['running']}`",
         f"- Completed: `{counts['completed']}`",
         f"- Failed: `{counts['failed']}`",
@@ -864,14 +1018,32 @@ def render_manager_summary(project_name: str, runs: list[dict[str, Any]], confli
         "## Human Attention",
         "",
     ]
-    if not questions and not conflicts:
+    if not open_questions and not conflicts:
         lines.append("_No human questions or conflict alerts detected._")
     else:
-        for question in questions:
-            lines.append(f"- {question}")
+        for question in open_questions:
+            lines.append(
+                f"- Open question `{question['id']}` for `{question['task_id']}`: {question['text']}"
+            )
         for conflict in conflicts:
             lines.append(
                 f"- Conflict risk between `{conflict['left_run']}` and `{conflict['right_run']}` on {conflict['paths']}"
+            )
+    lines.extend(["", "## Human Answers", ""])
+    if not answered:
+        lines.append("_No human answers recorded yet._")
+    else:
+        for question in answered[-5:]:
+            lines.append(
+                f"- `{question['id']}` for `{question['task_id']}`: {answers[question['id']]}"
+            )
+    lines.extend(["", "## Blocked Tasks", ""])
+    if not blocked:
+        lines.append("_No blocked tasks._")
+    else:
+        for run in blocked:
+            lines.append(
+                f"- `{run.get('task_id') or run['run_id']}` waiting on {format_inline_list(normalize_str_list(run.get('blocked_on'), 'blocked_on'))}"
             )
     lines.extend(["", "## Finished Runs", ""])
     finished = [
@@ -895,19 +1067,90 @@ def render_manager_summary(project_name: str, runs: list[dict[str, Any]], confli
     return "\n".join(lines)
 
 
-def render_questions(questions: list[str]) -> str:
+def render_questions(question_records: list[dict[str, str]], answers: dict[str, str]) -> str:
+    open_questions = unanswered_questions(question_records, answers)
+    answered = answered_questions(question_records, answers)
     lines = [
         "# Questions For Humans",
         "",
         f"_Updated: `{utc_now()}`_",
         "",
+        "Copy any line from `answers-template.md` into `answers.md` and replace `TODO` with the human answer.",
+        "",
+        "## Open",
+        "",
     ]
-    if not questions:
-        lines.append("_No human questions detected._")
+    if not open_questions:
+        lines.append("_No open human questions detected._")
     else:
-        for question in questions:
-            lines.append(f"- {question}")
+        for question in open_questions:
+            lines.extend(
+                [
+                    f"### {question['id']}",
+                    "",
+                    f"- Task: `{question['task_id']}`",
+                    f"- Run: `{question['run_id']}`",
+                    f"- Summary: {question['summary']}",
+                    f"- Question: {question['text']}",
+                    "",
+                ]
+            )
+    lines.extend(["## Answered", ""])
+    if not answered:
+        lines.append("_No answered questions recorded yet._")
+    else:
+        for question in answered:
+            lines.extend(
+                [
+                    f"### {question['id']}",
+                    "",
+                    f"- Task: `{question['task_id']}`",
+                    f"- Run: `{question['run_id']}`",
+                    f"- Question: {question['text']}",
+                    f"- Answer: {answers[question['id']]}",
+                    "",
+                ]
+            )
     lines.append("")
+    return "\n".join(lines)
+
+
+def render_answers_stub() -> str:
+    return "\n".join(
+        [
+            "# Answers For Humans",
+            "",
+            "Add one bullet per answered question in this format:",
+            "",
+            "- `q-example1234`: your answer here",
+            "",
+            "The manager reads only bullet lines in that format and leaves the rest of this file alone.",
+            "",
+        ]
+    )
+
+
+def render_answers_template(question_records: list[dict[str, str]], answers: dict[str, str]) -> str:
+    open_questions = unanswered_questions(question_records, answers)
+    lines = [
+        "# Answer Template",
+        "",
+        "Copy any line below into `answers.md` and replace `TODO` with the human answer.",
+        "",
+    ]
+    if not open_questions:
+        lines.append("_No open questions right now._")
+        lines.append("")
+        return "\n".join(lines)
+    for question in open_questions:
+        lines.extend(
+            [
+                f"- `{question['id']}`: TODO",
+                f"  Source: `{question['task_id']}` / `{question['run_id']}`",
+                f"  Question: {question['text']}",
+                "",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -930,19 +1173,27 @@ def render_conflicts(conflicts: list[dict[str, str]]) -> str:
         [
             markdown_table(["left_run", "right_run", "left_task", "right_task", "overlap"], rows),
             "",
-            "These are conflict risks, not automatic merges. Resolve by narrowing ownership or turning one child into a reviewer.",
+            "These are conflict risks for the manager to resolve, not automatic merges. Resolve by narrowing ownership or turning one child into a reviewer.",
             "",
         ]
     )
     return "\n".join(lines)
 
 
-def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list[str]:
-    questions: list[str] = []
+def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list[dict[str, str]]:
+    question_records: list[dict[str, str]] = []
+    seen_question_ids: set[str] = set()
     for run in runs:
         report_path = project_dir / "reports" / f"{run['run_id']}.md"
         last_message = last_message_for_run(run)
-        questions.extend(extract_questions(last_message))
+        run_questions: list[dict[str, str]] = []
+        for question_text in extract_questions(last_message):
+            record = build_question_record(run, question_text)
+            run_questions.append(record)
+            if record["id"] in seen_question_ids:
+                continue
+            seen_question_ids.add(record["id"])
+            question_records.append(record)
         content = "\n".join(
             [
                 f"# {run['run_id']}",
@@ -959,17 +1210,18 @@ def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list
                 "",
                 last_message.strip() if last_message and last_message.strip() else "_No child report yet._",
                 "",
+                "## Questions Raised",
+                "",
+                *(
+                    [f"- `{record['id']}`: {record['text']}" for record in run_questions]
+                    if run_questions
+                    else ["_No human questions detected from this child yet._"]
+                ),
+                "",
             ]
         )
         write_text(report_path, content)
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for question in questions:
-        if question in seen:
-            continue
-        seen.add(question)
-        deduped.append(question)
-    return deduped
+    return question_records
 
 
 def sync_projects(root: Path, index: dict[str, Any]) -> None:
@@ -985,35 +1237,33 @@ def sync_projects(root: Path, index: dict[str, Any]) -> None:
         project_name = str(payload["name"])
         runs = sorted(payload["runs"], key=run_sort_key)
         project_dir = ensure_project_workspace(root, project_name, slug)
-        questions = write_project_reports(project_dir, runs)
+        question_records = write_project_reports(project_dir, runs)
+        answers_path = project_dir / "answers.md"
+        if not answers_path.exists():
+            write_text(answers_path, render_answers_stub())
+        answers = load_answers(project_dir)
         conflicts = detect_conflict_risks(runs)
-        for conflict in conflicts:
-            questions.append(
-                f"Resolve overlap between {conflict['left_run']} and {conflict['right_run']} on {conflict['paths']}."
-            )
-        deduped_questions: list[str] = []
-        seen: set[str] = set()
-        for question in questions:
-            if question in seen:
-                continue
-            seen.add(question)
-            deduped_questions.append(question)
         delete_if_exists(project_dir / "project.md")
         write_text(project_dir / "README.md", render_project_overview(project_name, project_dir, runs))
         write_text(project_dir / "tasks.md", render_task_ledger(runs))
         write_text(
             project_dir / "dashboard.md",
-            render_dashboard(project_name, runs, conflicts, deduped_questions),
+            render_dashboard(project_name, runs, conflicts, question_records, answers),
         )
         write_text(
             project_dir / "manager-summary.md",
-            render_manager_summary(project_name, runs, conflicts, deduped_questions),
+            render_manager_summary(project_name, runs, conflicts, question_records, answers),
         )
-        write_text(project_dir / "questions.md", render_questions(deduped_questions))
+        write_text(project_dir / "questions.md", render_questions(question_records, answers))
+        write_text(
+            project_dir / "answers-template.md",
+            render_answers_template(question_records, answers),
+        )
         write_text(project_dir / "conflicts.md", render_conflicts(conflicts))
 
 
 def save_index_and_sync(root: Path, data: dict[str, Any]) -> None:
+    update_dispatch_metadata(data)
     save_index(root, data)
     sync_projects(root, data)
 
@@ -1183,9 +1433,47 @@ def monitor_state(root: Path) -> tuple[str, str | None]:
     return "idle", heartbeat
 
 
+def start_run_process(run: dict[str, Any]) -> None:
+    stdout_path = Path(run["stdout_path"])
+    stderr_path = Path(run["stderr_log"])
+    runner_path = Path(run["runner_path"])
+    run_dir = Path(run["run_dir"])
+    stdout_fh = stdout_path.open("w", encoding="utf-8")
+    stderr_fh = stderr_path.open("w", encoding="utf-8")
+    process = subprocess.Popen(
+        ["/bin/bash", str(runner_path)],
+        stdout=stdout_fh,
+        stderr=stderr_fh,
+        cwd=str(run["cwd"]),
+        start_new_session=True,
+    )
+    stdout_fh.close()
+    stderr_fh.close()
+    run["pid"] = process.pid
+    run["status"] = "running"
+    run["dispatch_state"] = "running"
+    run["blocked_on"] = []
+    run["launched_at"] = utc_now()
+    run["started_epoch"] = epoch_now()
+    write_text(run_dir / "state.txt", "running\n")
+
+
+def launch_ready_runs(root: Path, index: dict[str, Any]) -> None:
+    update_dispatch_metadata(index)
+    for run in sorted(index["runs"], key=run_sort_key):
+        if str(run.get("status") or "") not in PRELAUNCH_STATUSES:
+            continue
+        dispatch_state = str(run.get("dispatch_state") or "")
+        if dispatch_state == "blocked":
+            run["status"] = "blocked"
+            continue
+        start_run_process(run)
+    update_dispatch_metadata(index)
+
+
 def run_has_provider_artifacts(run: dict[str, Any]) -> bool:
     status = str(run.get("status") or "")
-    if status in {"dry-run", "prepared"}:
+    if status in {"dry-run", "prepared", "blocked"}:
         return False
     run_dir = Path(run["run_dir"])
     stdout_path = Path(run["stdout_path"])
@@ -1254,9 +1542,14 @@ def print_run_summary(run: dict[str, Any]) -> None:
     exit_text = str(exit_code) if exit_code is not None else "-"
     task_text = str(run.get("task_id") or "-")
     summary_text = short_summary(str(run.get("summary") or "-"), max_chars=42)
+    dispatch_state = str(run.get("dispatch_state") or run.get("status") or "-")
+    blocked_on = normalize_str_list(run.get("blocked_on"), "blocked_on")
+    if blocked_on:
+        dispatch_state = f"{dispatch_state}:{','.join(blocked_on[:2])}"
     print(
         f"{run['run_id']:<30} {run['status']:<10} provider={run.get('provider', DEFAULT_PROVIDER):<6} "
         f"pid={run.get('pid') or '-':<8} exit={exit_text:<4} task={task_text:<18} "
+        f"dispatch={dispatch_state:<18} "
         f"session={session_id} summary={summary_text}"
     )
 
@@ -1357,9 +1650,10 @@ def materialize_run(
         "thread_id": None,
         "pid": None,
         "exit_code": None,
-        "launched_at": utc_now(),
+        "created_at": utc_now(),
+        "launched_at": None,
         "finished_at": None,
-        "started_epoch": epoch_now(),
+        "started_epoch": None,
         "sandbox": options.sandbox,
         "model": options.model,
         "profile": options.profile,
@@ -1375,25 +1669,13 @@ def materialize_run(
         "images": [str(path) for path in options.images],
         "owned_paths": list(options.owned_paths),
         "depends_on": list(options.depends_on),
+        "dispatch_state": "dry-run" if options.dry_run else "ready",
+        "blocked_on": [],
     }
 
-    if not options.dry_run:
-        stdout_fh = stdout_path.open("w", encoding="utf-8")
-        stderr_fh = stderr_path.open("w", encoding="utf-8")
-        process = subprocess.Popen(
-            ["/bin/bash", str(runner_path)],
-            stdout=stdout_fh,
-            stderr=stderr_fh,
-            cwd=str(options.cd),
-            start_new_session=True,
-        )
-        stdout_fh.close()
-        stderr_fh.close()
-        run["pid"] = process.pid
-        run["status"] = "running"
-        write_text(state_path, "running\n")
-
     index["runs"].append(run)
+    if not options.dry_run:
+        launch_ready_runs(root, index)
     save_index_and_sync(root, index)
     ensure_monitor(root, index)
     print_run_summary(run)
@@ -1521,7 +1803,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         index = load_index(root)
         for run in index["runs"]:
             refresh_run(run)
+        launch_ready_runs(root, index)
         save_index_and_sync(root, index)
+        ensure_monitor(root, index)
         runs = index["runs"]
         if args.project:
             project_filter = args.project.strip().lower()
@@ -1551,7 +1835,9 @@ def cmd_show(args: argparse.Namespace) -> int:
         index = load_index(root)
         run = resolve_run(index, args.run)
         refresh_run(run)
+        launch_ready_runs(root, index)
         save_index_and_sync(root, index)
+        ensure_monitor(root, index)
         last_message = read_text_if_exists(Path(run["last_message_path"]))
     print(json.dumps(run, ensure_ascii=True, indent=2, sort_keys=True))
     if last_message:
@@ -1566,7 +1852,9 @@ def cmd_tail(args: argparse.Namespace) -> int:
         index = load_index(root)
         run = resolve_run(index, args.run)
         refresh_run(run)
+        launch_ready_runs(root, index)
         save_index_and_sync(root, index)
+        ensure_monitor(root, index)
         path = Path(run["stderr_log"] if args.stderr else run["stdout_jsonl"])
     if not path.exists():
         print(f"missing log: {path}", file=sys.stderr)
@@ -1583,7 +1871,9 @@ def cmd_resume_cmd(args: argparse.Namespace) -> int:
         index = load_index(root)
         run = resolve_run(index, args.run)
         refresh_run(run)
+        launch_ready_runs(root, index)
         save_index_and_sync(root, index)
+        ensure_monitor(root, index)
         command = provider_for_run(run).build_resume_command(run, args.exec)
     print(command)
     return 0
@@ -1607,7 +1897,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         targets = [resolve_run(index, args.run)] if args.run else index["runs"]
         for run in targets:
             refresh_run(run)
+        launch_ready_runs(root, index)
         save_index_and_sync(root, index)
+        ensure_monitor(root, index)
     for run in targets:
         print_run_summary(run)
     return 0
@@ -1646,6 +1938,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
                 index = load_index(root)
                 for run in index["runs"]:
                     refresh_run(run)
+                launch_ready_runs(root, index)
                 save_index_and_sync(root, index)
                 write_text(heartbeat_path, utc_now() + "\n")
                 if not index_has_active_runs(index):

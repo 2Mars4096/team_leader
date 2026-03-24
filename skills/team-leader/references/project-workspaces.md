@@ -15,6 +15,8 @@ The manager keeps these files current:
 - `tasks.md`: task-oriented ledger
 - `manager-summary.md`: concise aggregate snapshot
 - `questions.md`: human-facing questions and blockers
+- `answers.md`: human-edited answers keyed by question id
+- `answers-template.md`: copy-ready answer lines for open questions
 - `conflicts.md`: owned-path overlap risk
 - `reports/<run-id>.md`: one markdown report per child run
 
@@ -39,14 +41,15 @@ Treat the markdown files as the control surface:
 - read `dashboard.md` first for live progress
 - read `tasks.md` for assignment state
 - read `questions.md` before asking the human anything
+- read `answers.md` after the human responds
 - read `conflicts.md` before launching overlapping writers
 - read `reports/<run-id>.md` when a specific child needs closer review
 
-While children are active, the manager refreshes these files automatically in the background.
+While children are active, the manager refreshes these files automatically in the background. Tasks with `--depends-on` stay blocked until their prerequisites complete, then the manager launches the next wave automatically.
 
 ## Conflict Caveat
 
-`conflicts.md` detects overlap from declared ownership. It does not automatically merge conflicting file edits.
+`conflicts.md` detects overlap from declared ownership. Conflict resolution stays with the manager; it does not auto-merge conflicting file edits.
 
 If two write runs touch the same area, the current safe behavior is:
 
