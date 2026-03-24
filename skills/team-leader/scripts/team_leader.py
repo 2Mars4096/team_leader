@@ -30,6 +30,7 @@ DEFAULT_PROVIDER = "codex"
 DEFAULT_ROOT_NAME = ".team-leader"
 LEGACY_ROOT_NAMES = (".agent-subsessions", ".codex-subsessions")
 LEGACY_ROOTS_LABEL = ", ".join(f"./{name}" for name in LEGACY_ROOT_NAMES)
+CHILD_RUN_ENV = "TEAM_LEADER_CHILD_RUN"
 QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
 ANSWER_LINE_RE = re.compile(r"^\s*[-*+]\s*`?([a-z0-9][a-z0-9-]*)`?\s*:\s*(.+?)\s*$", re.IGNORECASE)
 PRELAUNCH_STATUSES = {"prepared", "blocked"}
@@ -510,6 +511,17 @@ def quote_command(parts: list[str]) -> str:
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def child_prompt_guard(prompt_text: str) -> str:
+    lines = [
+        "You are a child Codex session launched by team-leader.",
+        "Do not invoke team-leader, do not start nested team-leader-managed sessions, and do not recursively delegate back into this same manager.",
+        "If you believe more delegation or replanning is needed, report that need in your response for the parent manager to handle.",
+        "",
+        prompt_text.strip(),
+    ]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def delete_if_exists(path: Path) -> None:
@@ -1700,6 +1712,7 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             "Rules:",
             "- First decide whether the brief is clear enough to launch workers safely.",
             "- If the brief is missing key repo/spec context or important constraints, ask at most 3 concise questions under a `Questions For Humans` heading and do not emit a launch plan in the same response.",
+            "- Do not invoke team-leader or create nested team-leader-managed sessions from inside this child session.",
             "- Use as few child sessions as necessary.",
             "- Split writers by disjoint file ownership whenever possible.",
             "- Prefer read-only research or review children if write boundaries are unclear.",
@@ -3219,8 +3232,11 @@ def read_pid_file(path: Path) -> int | None:
 
 def index_has_active_runs(index: dict[str, Any]) -> bool:
     for run in index["runs"]:
-        if str(run.get("status") or "") == "running":
+        status = str(run.get("status") or "")
+        if status == "running":
             return True
+        if status in TERMINAL_STATUSES:
+            continue
         if pid_alive(run.get("pid")):
             return True
     return False
@@ -3319,14 +3335,19 @@ def refresh_run(run: dict[str, Any]) -> None:
     finished_at = read_text_if_exists(run_dir / "finished_at.txt")
     if state:
         run["status"] = state.strip()
+        if str(run.get("status") or "") in TERMINAL_STATUSES:
+            run["pid"] = None
     elif pid_alive(run.get("pid")):
         run["status"] = "running"
     elif run.get("status") == "running":
         run["status"] = "exited"
+        run["pid"] = None
     if exit_code and exit_code.strip().lstrip("-").isdigit():
         run["exit_code"] = int(exit_code.strip())
     if finished_at:
         run["finished_at"] = finished_at.strip()
+    if str(run.get("status") or "") in TERMINAL_STATUSES:
+        run["pid"] = None
     if run_has_provider_artifacts(run) and not get_session_id(run):
         session_id = provider_for_run(run).detect_session_id(run)
         if session_id:
@@ -3358,6 +3379,7 @@ def build_runner_script(
         [
             "#!/usr/bin/env bash",
             "set -uo pipefail",
+            f"export {CHILD_RUN_ENV}=1",
             f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {shlex.quote(str(started_path))}",
             f"printf '%s\\n' running > {shlex.quote(str(state_path))}",
             f"{cmd} < {shlex.quote(str(prompt_path))}",
@@ -3659,7 +3681,7 @@ def materialize_run(
     finished_path = run_dir / "finished_at.txt"
     runner_path = run_dir / "runner.sh"
 
-    write_text(prompt_path, options.prompt_text)
+    write_text(prompt_path, child_prompt_guard(options.prompt_text))
 
     command = adapter.build_exec_command(
         prompt_path=prompt_path,
@@ -4231,6 +4253,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if os.environ.get(CHILD_RUN_ENV) == "1":
+            raise RuntimeError(
+                "nested team-leader invocation is disabled inside a team-leader child session. "
+                "Report delegation or replanning needs back to the parent manager instead."
+            )
         return int(args.func(args))
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
