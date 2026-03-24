@@ -7,11 +7,13 @@ description: Use when a user wants Codex to launch, track, resume, cancel, or co
 
 ## Overview
 
-This skill manages real child Codex sessions driven by `codex exec` and `codex resume`.
+This skill manages real child sessions through a provider adapter layer, with `codex` implemented first via `codex exec` and `codex resume`.
 
 Treat a subsession as a full Codex worker with its own thread, context window, tool use, and follow-up lifecycle. This is more flexible than a lightweight in-process subagent because a child session can keep working independently, be resumed later, and itself act as a manager when useful.
 
-Use the control script in `scripts/codex_subsession_manager.py` instead of ad hoc shell fragments. It stores a local `.codex-subsessions/` registry with prompts, commands, logs, last messages, PIDs, and detected thread IDs.
+Use the control script in `scripts/codex_subsession_manager.py` instead of ad hoc shell fragments. It stores a local `.agent-subsessions/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. If an older `.codex-subsessions/` directory already exists, the script will keep using it.
+
+Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
 
 ## When To Use
 
@@ -40,7 +42,7 @@ Subsessions in this skill are separate Codex sessions:
 python3 scripts/codex_subsession_manager.py init
 ```
 
-This creates `.codex-subsessions/` in the current working directory.
+This creates `.agent-subsessions/` in the current working directory unless a legacy `.codex-subsessions/` directory already exists.
 
 ### 2. Dispatch a child run
 
@@ -48,6 +50,7 @@ Use a direct prompt:
 
 ```bash
 python3 scripts/codex_subsession_manager.py dispatch \
+  --provider codex \
   --name api-audit \
   --full-auto \
   --sandbox read-only \
@@ -58,13 +61,14 @@ Use a prompt file for longer instructions:
 
 ```bash
 python3 scripts/codex_subsession_manager.py dispatch \
+  --provider codex \
   --name ui-refactor \
   --full-auto \
   --sandbox workspace-write \
   --prompt-file /tmp/ui-refactor-prompt.md
 ```
 
-Each run gets its own directory under `.codex-subsessions/runs/`.
+Each run gets its own directory under `.agent-subsessions/runs/`.
 
 ### 3. Track progress
 
@@ -74,7 +78,7 @@ python3 scripts/codex_subsession_manager.py show 20260324-120000-ui-refactor
 python3 scripts/codex_subsession_manager.py tail 20260324-120000-ui-refactor
 ```
 
-`status` refreshes run metadata, including completion state and detected thread IDs.
+`status` refreshes run metadata, including completion state and detected session IDs.
 
 ### 4. Resume the child later
 
@@ -84,7 +88,7 @@ Print a ready-to-run resume command:
 python3 scripts/codex_subsession_manager.py resume-cmd 20260324-120000-ui-refactor
 ```
 
-This prints an interactive `codex resume <thread-id>` command anchored to the original working directory.
+This prints an interactive provider resume command anchored to the original working directory. For the current Codex adapter, that command is `codex resume <thread-id>`.
 
 For non-interactive follow-up:
 
@@ -108,7 +112,7 @@ For multiple children, create a JSON manifest and dispatch in one command:
 python3 scripts/codex_subsession_manager.py batch --file references/example_manifest.json --dry-run
 ```
 
-Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions.
+Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions. Use `python3 scripts/codex_subsession_manager.py providers` to inspect the adapters currently available in the script.
 
 ## Prompting Guidance
 
@@ -128,11 +132,12 @@ When running multiple writers in parallel, assign disjoint file ownership. If th
 - Prefer `--sandbox workspace-write --full-auto` for normal autonomous implementation children
 - Use `--add-dir` for extra writable paths outside the main repo root
 - Use `--skip-git-repo-check` if a child must run outside a Git repository
-- Use `attach-thread` if auto-detection misses a thread ID and you need a stable resume handle
-- Use `reconcile` to backfill thread IDs after runs finish
+- Use `attach-session` if auto-detection misses a session ID and you need a stable resume handle
+- Use `attach-thread` as a Codex-specific compatibility alias
+- Use `reconcile` to backfill session IDs after runs finish
 
 ## Guardrails
 
 - Each child session consumes normal Codex usage. Use only as many concurrent children as the task justifies.
 - Do not run concurrent writers against the same files unless the user explicitly accepts merge risk.
-- This skill manages child Codex sessions, not arbitrary background jobs. Keep the workflow centered on `codex exec` and `codex resume`.
+- This skill manages child provider sessions, not arbitrary background jobs. Keep the current workflow centered on real CLI session primitives rather than custom task shims.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -20,6 +21,10 @@ UUID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
 )
+INDEX_VERSION = 2
+DEFAULT_PROVIDER = "codex"
+GENERIC_ROOT_NAME = ".agent-subsessions"
+LEGACY_ROOT_NAME = ".codex-subsessions"
 
 
 def utc_now() -> str:
@@ -45,7 +50,14 @@ def resolve_path(raw: str | Path) -> Path:
 
 
 def default_root() -> Path:
-    return Path.cwd() / ".codex-subsessions"
+    cwd = Path.cwd()
+    generic = cwd / GENERIC_ROOT_NAME
+    legacy = cwd / LEGACY_ROOT_NAME
+    if generic.exists():
+        return generic
+    if legacy.exists():
+        return legacy
+    return generic
 
 
 def index_path(root: Path) -> Path:
@@ -56,10 +68,172 @@ def ensure_root(root: Path) -> None:
     (root / "runs").mkdir(parents=True, exist_ok=True)
 
 
+@dataclass(frozen=True)
+class DispatchOptions:
+    provider: str
+    name: str | None
+    prompt_text: str
+    cd: Path
+    sandbox: str | None
+    model: str | None
+    profile: str | None
+    add_dirs: list[Path]
+    configs: list[str]
+    enables: list[str]
+    disables: list[str]
+    images: list[Path]
+    search: bool
+    skip_git_repo_check: bool
+    ephemeral: bool
+    full_auto: bool
+    dangerous: bool
+    dry_run: bool
+
+
+@dataclass(frozen=True)
+class ProviderAdapter:
+    name: str
+    session_label: str
+    bin_env_var: str
+    default_bin: str
+
+    def resolved_bin(self) -> str:
+        return os.environ.get(self.bin_env_var, self.default_bin)
+
+    def build_exec_command(
+        self,
+        *,
+        prompt_path: Path,
+        last_message_path: Path,
+        options: DispatchOptions,
+    ) -> list[str]:
+        raise NotImplementedError
+
+    def detect_session_id(self, run: dict[str, Any]) -> str | None:
+        raise NotImplementedError
+
+    def build_resume_command(self, run: dict[str, Any], exec_mode: bool) -> str:
+        raise NotImplementedError
+
+
+class CodexProvider(ProviderAdapter):
+    def __init__(self) -> None:
+        super().__init__(
+            name="codex",
+            session_label="thread",
+            bin_env_var="CODEX_BIN",
+            default_bin="codex",
+        )
+
+    def build_exec_command(
+        self,
+        *,
+        prompt_path: Path,
+        last_message_path: Path,
+        options: DispatchOptions,
+    ) -> list[str]:
+        command = [
+            self.resolved_bin(),
+            "exec",
+            "--json",
+            "--output-last-message",
+            str(last_message_path),
+            "--cd",
+            str(options.cd),
+        ]
+        if options.sandbox:
+            command.extend(["--sandbox", options.sandbox])
+        if options.model:
+            command.extend(["--model", options.model])
+        if options.profile:
+            command.extend(["--profile", options.profile])
+        for add_dir in options.add_dirs:
+            command.extend(["--add-dir", str(add_dir)])
+        for config in options.configs:
+            command.extend(["--config", config])
+        for feature in options.enables:
+            command.extend(["--enable", feature])
+        for feature in options.disables:
+            command.extend(["--disable", feature])
+        for image in options.images:
+            command.extend(["--image", str(image)])
+        if options.search:
+            command.append("--search")
+        if options.skip_git_repo_check:
+            command.append("--skip-git-repo-check")
+        if options.ephemeral:
+            command.append("--ephemeral")
+        if options.full_auto:
+            command.append("--full-auto")
+        if options.dangerous:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        command.append("-")
+        return command
+
+    def detect_session_id(self, run: dict[str, Any]) -> str | None:
+        stdout_path = Path(run["stdout_path"])
+        json_candidates = read_jsonl_candidates(stdout_path)
+        if json_candidates:
+            return json_candidates[0]
+        known = known_thread_ids()
+        for candidate in infer_thread_ids_from_logs(int(run["started_epoch"])):
+            if candidate in known:
+                return candidate
+        candidates = infer_thread_ids_from_logs(int(run["started_epoch"]))
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def build_resume_command(self, run: dict[str, Any], exec_mode: bool) -> str:
+        session_id = get_session_id(run)
+        if not session_id:
+            raise RuntimeError("run has no detected session_id; use reconcile or attach-session first")
+        cwd = shlex.quote(run["cwd"])
+        if exec_mode:
+            return f"cd {cwd} && codex exec resume {shlex.quote(session_id)} -"
+        return f"cd {cwd} && codex resume {shlex.quote(session_id)}"
+
+
+PROVIDERS: dict[str, ProviderAdapter] = {
+    DEFAULT_PROVIDER: CodexProvider(),
+}
+
+
+def get_provider(name: str | None) -> ProviderAdapter:
+    provider_name = (name or DEFAULT_PROVIDER).strip().lower()
+    adapter = PROVIDERS.get(provider_name)
+    if adapter is None:
+        supported = ", ".join(sorted(PROVIDERS))
+        raise RuntimeError(
+            f"unsupported provider: {provider_name}. supported providers: {supported}"
+        )
+    return adapter
+
+
+def provider_for_run(run: dict[str, Any]) -> ProviderAdapter:
+    return get_provider(str(run.get("provider") or DEFAULT_PROVIDER))
+
+
+def get_session_id(run: dict[str, Any]) -> str | None:
+    session_id = run.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    thread_id = run.get("thread_id")
+    if isinstance(thread_id, str) and thread_id.strip():
+        return thread_id.strip()
+    return None
+
+
+def set_session_id(run: dict[str, Any], session_id: str | None) -> None:
+    run["session_id"] = session_id
+    if str(run.get("provider") or DEFAULT_PROVIDER) == "codex":
+        run["thread_id"] = session_id
+
+
 def load_index(root: Path) -> dict[str, Any]:
     path = index_path(root)
     if not path.exists():
-        return {"version": 1, "runs": []}
+        return {"version": INDEX_VERSION, "runs": []}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -69,12 +243,20 @@ def load_index(root: Path) -> dict[str, Any]:
     runs = data.get("runs")
     if not isinstance(runs, list):
         data["runs"] = []
-    data.setdefault("version", 1)
+    data.setdefault("version", INDEX_VERSION)
+    for run in data["runs"]:
+        if not isinstance(run, dict):
+            continue
+        run.setdefault("provider", DEFAULT_PROVIDER)
+        run.setdefault("stdout_path", run.get("stdout_jsonl"))
+        if get_session_id(run):
+            set_session_id(run, get_session_id(run))
     return data
 
 
 def save_index(root: Path, data: dict[str, Any]) -> None:
     ensure_root(root)
+    data["version"] = INDEX_VERSION
     index_path(root).write_text(
         json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -221,83 +403,10 @@ def refresh_run(run: dict[str, Any]) -> None:
         run["exit_code"] = int(exit_code.strip())
     if finished_at:
         run["finished_at"] = finished_at.strip()
-    if not run.get("thread_id"):
-        thread_id = detect_thread_id(run)
-        if thread_id:
-            run["thread_id"] = thread_id
-
-
-def detect_thread_id(run: dict[str, Any]) -> str | None:
-    stdout_path = Path(run["stdout_jsonl"])
-    json_candidates = read_jsonl_candidates(stdout_path)
-    if json_candidates:
-        return json_candidates[0]
-    known = known_thread_ids()
-    for candidate in infer_thread_ids_from_logs(int(run["started_epoch"])):
-        if candidate in known:
-            return candidate
-    candidates = infer_thread_ids_from_logs(int(run["started_epoch"]))
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
-
-
-def build_codex_command(
-    *,
-    prompt_path: Path,
-    last_message_path: Path,
-    cd: Path,
-    sandbox: str | None,
-    model: str | None,
-    profile: str | None,
-    add_dirs: list[Path],
-    configs: list[str],
-    enables: list[str],
-    disables: list[str],
-    images: list[Path],
-    search: bool,
-    skip_git_repo_check: bool,
-    ephemeral: bool,
-    full_auto: bool,
-    dangerous: bool,
-) -> list[str]:
-    command = [
-        os.environ.get("CODEX_BIN", "codex"),
-        "exec",
-        "--json",
-        "--output-last-message",
-        str(last_message_path),
-        "--cd",
-        str(cd),
-    ]
-    if sandbox:
-        command.extend(["--sandbox", sandbox])
-    if model:
-        command.extend(["--model", model])
-    if profile:
-        command.extend(["--profile", profile])
-    for add_dir in add_dirs:
-        command.extend(["--add-dir", str(add_dir)])
-    for config in configs:
-        command.extend(["--config", config])
-    for feature in enables:
-        command.extend(["--enable", feature])
-    for feature in disables:
-        command.extend(["--disable", feature])
-    for image in images:
-        command.extend(["--image", str(image)])
-    if search:
-        command.append("--search")
-    if skip_git_repo_check:
-        command.append("--skip-git-repo-check")
-    if ephemeral:
-        command.append("--ephemeral")
-    if full_auto:
-        command.append("--full-auto")
-    if dangerous:
-        command.append("--dangerously-bypass-approvals-and-sandbox")
-    command.append("-")
-    return command
+    if not get_session_id(run):
+        session_id = provider_for_run(run).detect_session_id(run)
+        if session_id:
+            set_session_id(run, session_id)
 
 
 def build_runner_script(
@@ -332,12 +441,12 @@ def build_runner_script(
 
 
 def print_run_summary(run: dict[str, Any]) -> None:
-    thread = run.get("thread_id") or "-"
+    session_id = get_session_id(run) or "-"
     exit_code = run.get("exit_code")
     exit_text = str(exit_code) if exit_code is not None else "-"
     print(
-        f"{run['run_id']:<30} {run['status']:<10} pid={run.get('pid') or '-':<8} "
-        f"exit={exit_text:<4} thread={thread}"
+        f"{run['run_id']:<30} {run['status']:<10} provider={run.get('provider', DEFAULT_PROVIDER):<6} "
+        f"pid={run.get('pid') or '-':<8} exit={exit_text:<4} session={session_id}"
     )
 
 
@@ -350,30 +459,25 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_providers(_args: argparse.Namespace) -> int:
+    for name in sorted(PROVIDERS):
+        adapter = PROVIDERS[name]
+        suffix = " (default)" if name == DEFAULT_PROVIDER else ""
+        print(
+            f"{adapter.name}{suffix}: session_label={adapter.session_label} "
+            f"bin_env={adapter.bin_env_var} default_bin={adapter.default_bin}"
+        )
+    return 0
+
+
 def materialize_run(
     root: Path,
     index: dict[str, Any],
-    *,
-    name: str | None,
-    prompt_text: str,
-    cd: Path,
-    sandbox: str | None,
-    model: str | None,
-    profile: str | None,
-    add_dirs: list[Path],
-    configs: list[str],
-    enables: list[str],
-    disables: list[str],
-    images: list[Path],
-    search: bool,
-    skip_git_repo_check: bool,
-    ephemeral: bool,
-    full_auto: bool,
-    dangerous: bool,
-    dry_run: bool,
+    options: DispatchOptions,
 ) -> dict[str, Any]:
     ensure_root(root)
-    run_id = make_run_id({run["run_id"] for run in index["runs"]}, name)
+    adapter = get_provider(options.provider)
+    run_id = make_run_id({run["run_id"] for run in index["runs"]}, options.name)
     run_dir = root / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
@@ -387,25 +491,12 @@ def materialize_run(
     finished_path = run_dir / "finished_at.txt"
     runner_path = run_dir / "runner.sh"
 
-    write_text(prompt_path, prompt_text)
+    write_text(prompt_path, options.prompt_text)
 
-    command = build_codex_command(
+    command = adapter.build_exec_command(
         prompt_path=prompt_path,
         last_message_path=last_message_path,
-        cd=cd,
-        sandbox=sandbox,
-        model=model,
-        profile=profile,
-        add_dirs=add_dirs,
-        configs=configs,
-        enables=enables,
-        disables=disables,
-        images=images,
-        search=search,
-        skip_git_repo_check=skip_git_repo_check,
-        ephemeral=ephemeral,
-        full_auto=full_auto,
-        dangerous=dangerous,
+        options=options,
     )
 
     write_text(
@@ -424,44 +515,47 @@ def materialize_run(
 
     run = {
         "run_id": run_id,
-        "name": name or run_id,
-        "status": "dry-run" if dry_run else "prepared",
+        "name": options.name or run_id,
+        "provider": adapter.name,
+        "status": "dry-run" if options.dry_run else "prepared",
         "run_dir": str(run_dir),
-        "cwd": str(cd),
+        "cwd": str(options.cd),
         "prompt_path": str(prompt_path),
+        "stdout_path": str(stdout_path),
         "stdout_jsonl": str(stdout_path),
         "stderr_log": str(stderr_path),
         "last_message_path": str(last_message_path),
         "runner_path": str(runner_path),
+        "session_id": None,
         "thread_id": None,
         "pid": None,
         "exit_code": None,
         "launched_at": utc_now(),
         "finished_at": None,
         "started_epoch": epoch_now(),
-        "sandbox": sandbox,
-        "model": model,
-        "profile": profile,
-        "search": search,
-        "skip_git_repo_check": skip_git_repo_check,
-        "ephemeral": ephemeral,
-        "full_auto": full_auto,
-        "dangerous": dangerous,
-        "add_dirs": [str(path) for path in add_dirs],
-        "configs": list(configs),
-        "enables": list(enables),
-        "disables": list(disables),
-        "images": [str(path) for path in images],
+        "sandbox": options.sandbox,
+        "model": options.model,
+        "profile": options.profile,
+        "search": options.search,
+        "skip_git_repo_check": options.skip_git_repo_check,
+        "ephemeral": options.ephemeral,
+        "full_auto": options.full_auto,
+        "dangerous": options.dangerous,
+        "add_dirs": [str(path) for path in options.add_dirs],
+        "configs": list(options.configs),
+        "enables": list(options.enables),
+        "disables": list(options.disables),
+        "images": [str(path) for path in options.images],
     }
 
-    if not dry_run:
+    if not options.dry_run:
         stdout_fh = stdout_path.open("w", encoding="utf-8")
         stderr_fh = stderr_path.open("w", encoding="utf-8")
         process = subprocess.Popen(
             ["/bin/bash", str(runner_path)],
             stdout=stdout_fh,
             stderr=stderr_fh,
-            cwd=str(cd),
+            cwd=str(options.cd),
             start_new_session=True,
         )
         stdout_fh.close()
@@ -486,23 +580,26 @@ def parse_prompt(args: argparse.Namespace) -> str:
 
 def common_dispatch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     return {
-        "name": args.name,
-        "prompt_text": parse_prompt(args),
-        "cd": resolve_path(args.cd) if args.cd else Path.cwd(),
-        "sandbox": args.sandbox,
-        "model": args.model,
-        "profile": args.profile,
-        "add_dirs": [resolve_path(path) for path in args.add_dir],
-        "configs": list(args.config),
-        "enables": list(args.enable),
-        "disables": list(args.disable),
-        "images": [resolve_path(path) for path in args.image],
-        "search": bool(args.search),
-        "skip_git_repo_check": bool(args.skip_git_repo_check),
-        "ephemeral": bool(args.ephemeral),
-        "full_auto": bool(args.full_auto),
-        "dangerous": bool(args.dangerous),
-        "dry_run": bool(args.dry_run),
+        "options": DispatchOptions(
+            provider=args.provider,
+            name=args.name,
+            prompt_text=parse_prompt(args),
+            cd=resolve_path(args.cd) if args.cd else Path.cwd(),
+            sandbox=args.sandbox,
+            model=args.model,
+            profile=args.profile,
+            add_dirs=[resolve_path(path) for path in args.add_dir],
+            configs=list(args.config),
+            enables=list(args.enable),
+            disables=list(args.disable),
+            images=[resolve_path(path) for path in args.image],
+            search=bool(args.search),
+            skip_git_repo_check=bool(args.skip_git_repo_check),
+            ephemeral=bool(args.ephemeral),
+            full_auto=bool(args.full_auto),
+            dangerous=bool(args.dangerous),
+            dry_run=bool(args.dry_run),
+        ),
     }
 
 
@@ -553,6 +650,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
         temp_args.name = spec.get("name", args.name)
         temp_args.prompt = prompt
         temp_args.prompt_file = prompt_file
+        temp_args.provider = spec.get("provider", args.provider)
         temp_args.cd = spec.get("cd", args.cd)
         temp_args.sandbox = spec.get("sandbox", args.sandbox)
         temp_args.model = spec.get("model", args.model)
@@ -626,24 +724,17 @@ def cmd_resume_cmd(args: argparse.Namespace) -> int:
     run = resolve_run(index, args.run)
     refresh_run(run)
     save_index(root, index)
-    thread_id = run.get("thread_id")
-    if not thread_id:
-        raise RuntimeError("run has no detected thread_id; use reconcile or attach-thread first")
-    cwd = shlex.quote(run["cwd"])
-    if args.exec:
-        print(f"cd {cwd} && codex exec resume {shlex.quote(thread_id)} -")
-    else:
-        print(f"cd {cwd} && codex resume {shlex.quote(thread_id)}")
+    print(provider_for_run(run).build_resume_command(run, args.exec))
     return 0
 
 
-def cmd_attach_thread(args: argparse.Namespace) -> int:
+def cmd_attach_session(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     index = load_index(root)
     run = resolve_run(index, args.run)
-    run["thread_id"] = args.thread_id
+    set_session_id(run, args.session_id)
     save_index(root, index)
-    print(f"{run['run_id']} -> {args.thread_id}")
+    print(f"{run['run_id']} -> {args.session_id}")
     return 0
 
 
@@ -679,88 +770,103 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 
 def add_common_run_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--root", help="Controller root directory (default: ./.codex-subsessions)")
+    parser.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
+    parser.add_argument(
+        "--provider",
+        choices=sorted(PROVIDERS),
+        default=DEFAULT_PROVIDER,
+        help="CLI provider adapter. Currently codex is implemented; the control plane is shaped for future providers.",
+    )
     parser.add_argument("--name", help="Human-friendly run label")
-    parser.add_argument("--prompt", help="Prompt text for the child Codex session")
+    parser.add_argument("--prompt", help="Prompt text for the child session")
     parser.add_argument("--prompt-file", help="Path to a prompt file for the child session")
-    parser.add_argument("--cd", help="Working directory for the child Codex session")
+    parser.add_argument("--cd", help="Working directory for the child session")
     parser.add_argument(
         "--sandbox",
         choices=["read-only", "workspace-write", "danger-full-access"],
-        help="Codex sandbox mode for the child session",
+        help="Sandbox mode for the child session. This currently maps directly to Codex.",
     )
-    parser.add_argument("--model", help="Codex model override")
-    parser.add_argument("--profile", help="Codex config profile override")
+    parser.add_argument("--model", help="Provider model override")
+    parser.add_argument("--profile", help="Provider profile override")
     parser.add_argument("--add-dir", action="append", default=[], help="Additional writable directory")
-    parser.add_argument("--config", action="append", default=[], help="Pass through codex --config")
-    parser.add_argument("--enable", action="append", default=[], help="Pass through codex --enable")
-    parser.add_argument("--disable", action="append", default=[], help="Pass through codex --disable")
+    parser.add_argument("--config", action="append", default=[], help="Pass through provider --config")
+    parser.add_argument("--enable", action="append", default=[], help="Pass through provider --enable")
+    parser.add_argument("--disable", action="append", default=[], help="Pass through provider --disable")
     parser.add_argument("--image", action="append", default=[], help="Image path to attach")
-    parser.add_argument("--search", action="store_true", help="Enable Codex live web search")
+    parser.add_argument("--search", action="store_true", help="Enable provider live web search where supported")
     parser.add_argument(
         "--skip-git-repo-check",
         action="store_true",
-        help="Allow Codex child sessions outside a Git repository",
+        help="Allow child sessions outside a Git repository where supported",
     )
-    parser.add_argument("--ephemeral", action="store_true", help="Run child without persisting Codex session files")
-    parser.add_argument("--full-auto", action="store_true", help="Run child with Codex full-auto mode")
+    parser.add_argument("--ephemeral", action="store_true", help="Run child without persisting provider session files")
+    parser.add_argument("--full-auto", action="store_true", help="Run child with provider full-auto mode")
     parser.add_argument(
         "--dangerous",
         action="store_true",
-        help="Run child with Codex dangerous no-sandbox mode",
+        help="Run child with provider dangerous no-sandbox mode",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Create the run directory but do not launch Codex")
+    parser.add_argument("--dry-run", action="store_true", help="Create the run directory but do not launch the provider CLI")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manage real Codex child sessions as subsessions.",
+        description="Manage real child sessions as subsessions, with a Codex provider implemented first.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     init_p = sub.add_parser("init", help="Initialize the controller directory")
-    init_p.add_argument("--root", help="Controller root directory (default: ./.codex-subsessions)")
+    init_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
     init_p.set_defaults(func=cmd_init)
 
-    dispatch_p = sub.add_parser("dispatch", help="Dispatch one Codex child session")
+    providers_p = sub.add_parser("providers", help="List supported provider adapters")
+    providers_p.set_defaults(func=cmd_providers)
+
+    dispatch_p = sub.add_parser("dispatch", help="Dispatch one child session")
     add_common_run_options(dispatch_p)
     dispatch_p.set_defaults(func=cmd_dispatch)
 
-    batch_p = sub.add_parser("batch", help="Dispatch multiple Codex child sessions from a JSON manifest")
+    batch_p = sub.add_parser("batch", help="Dispatch multiple child sessions from a JSON manifest")
     add_common_run_options(batch_p)
     batch_p.add_argument("--file", required=True, help="Path to a JSON manifest")
     batch_p.set_defaults(func=cmd_batch)
 
     status_p = sub.add_parser("status", help="Show tracked runs")
-    status_p.add_argument("--root", help="Controller root directory (default: ./.codex-subsessions)")
+    status_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
     status_p.add_argument("--json", action="store_true", help="Print JSON instead of a table")
     status_p.set_defaults(func=cmd_status)
 
     show_p = sub.add_parser("show", help="Show one run and its last message")
     show_p.add_argument("run", help="Run id or unique prefix")
-    show_p.add_argument("--root", help="Controller root directory (default: ./.codex-subsessions)")
+    show_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
     show_p.set_defaults(func=cmd_show)
 
     tail_p = sub.add_parser("tail", help="Tail stdout or stderr for one run")
     tail_p.add_argument("run", help="Run id or unique prefix")
-    tail_p.add_argument("--root", help="Controller root directory (default: ./.codex-subsessions)")
+    tail_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
     tail_p.add_argument("-n", "--lines", type=int, default=20, help="Number of lines to print")
     tail_p.add_argument("--stderr", action="store_true", help="Show stderr instead of stdout JSONL")
     tail_p.set_defaults(func=cmd_tail)
 
-    resume_p = sub.add_parser("resume-cmd", help="Print a shell-ready resume command")
+    resume_p = sub.add_parser("resume-cmd", help="Print a shell-ready provider resume command")
     resume_p.add_argument("run", help="Run id or unique prefix")
-    resume_p.add_argument("--root", help="Controller root directory (default: ./.codex-subsessions)")
-    resume_p.add_argument("--exec", action="store_true", help="Print a non-interactive codex exec resume command")
+    resume_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
+    resume_p.add_argument("--exec", action="store_true", help="Print a non-interactive provider resume command")
     resume_p.set_defaults(func=cmd_resume_cmd)
 
-    attach_p = sub.add_parser("attach-thread", help="Manually attach a Codex thread id to a run")
+    attach_p = sub.add_parser("attach-session", help="Manually attach a provider session id to a run")
     attach_p.add_argument("run", help="Run id or unique prefix")
-    attach_p.add_argument("thread_id", help="Codex thread/session id")
-    attach_p.add_argument("--root", help="Controller root directory (default: ./.codex-subsessions)")
-    attach_p.set_defaults(func=cmd_attach_thread)
+    attach_p.add_argument("session_id", help="Provider session id")
+    attach_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
+    attach_p.set_defaults(func=cmd_attach_session)
 
-    reconcile_p = sub.add_parser("reconcile", help="Refresh run statuses and infer missing thread ids")
+    attach_thread_p = sub.add_parser("attach-thread", help="Backward-compatible alias for Codex thread ids")
+    attach_thread_p.add_argument("run", help="Run id or unique prefix")
+    attach_thread_p.add_argument("session_id", help="Codex thread id")
+    attach_thread_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
+    attach_thread_p.set_defaults(func=cmd_attach_session)
+
+    reconcile_p = sub.add_parser("reconcile", help="Refresh run statuses and infer missing session ids")
     reconcile_p.add_argument("run", nargs="?", help="Optional run id or unique prefix")
     reconcile_p.add_argument("--root", help="Controller root directory (default: ./.codex-subsessions)")
     reconcile_p.set_defaults(func=cmd_reconcile)

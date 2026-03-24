@@ -1,12 +1,14 @@
 {
   "runs": [
     {
+      "provider": "codex",
       "name": "schema-audit",
       "sandbox": "read-only",
       "full_auto": true,
       "prompt": "Audit the schema and migration flow for correctness risks. Do not edit files. Return findings only."
     },
     {
+      "provider": "codex",
       "name": "ui-owner",
       "sandbox": "workspace-write",
       "full_auto": true,

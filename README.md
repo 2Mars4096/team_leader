@@ -1,10 +1,12 @@
 # codexd
 
-Codex skills for running real Codex child sessions as managed subsessions.
+Codex-first skills for running real child CLI sessions as managed subsessions.
 
 ## Skill
 
 - `skills/codex-subsession-manager`
+
+The current implementation ships with a `codex` provider adapter and a control plane that is structured so later adapters can target other CLIs without changing the run registry format.
 
 ## Install After Pushing
 
