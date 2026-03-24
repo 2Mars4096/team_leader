@@ -799,11 +799,95 @@ def collect_question_records(runs: list[dict[str, Any]]) -> list[dict[str, str]]
     return question_records
 
 
+def project_stage_snapshot(
+    runs: list[dict[str, Any]],
+    question_records: list[dict[str, str]],
+    answers: dict[str, str],
+    conflicts: list[dict[str, str]],
+) -> dict[str, str]:
+    counts = run_status_counts(runs)
+    active = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("status") or "") == "running"
+    ]
+    blocked = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("dispatch_state") or "") == "blocked"
+    ]
+    failed = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("status") or "") == "failed"
+    ]
+    open_questions = unanswered_questions(question_records, answers)
+    total = len(runs)
+    progress = (
+        f"{counts['completed']}/{total} completed, "
+        f"{counts['running']} running, {len(blocked)} blocked, "
+        f"{len(open_questions)} open questions"
+    )
+    if conflicts:
+        current_stage = "resolve-conflicts"
+        stage_reason = f"{len(conflicts)} ownership overlap risk(s) detected"
+        next_action = "Narrow write ownership or convert one child into a reviewer"
+        focus = f"{conflicts[0]['left_task']} vs {conflicts[0]['right_task']}"
+    elif open_questions:
+        current_stage = "waiting-for-human"
+        first_question = open_questions[0]
+        stage_reason = f"{len(open_questions)} human decision(s) still open"
+        next_action = f"Answer `{first_question['id']}` for `{first_question['task_id']}`"
+        focus = short_summary(first_question["text"], max_chars=96)
+    elif active:
+        current_stage = "running-children"
+        first_active = active[0]
+        live_note = latest_live_note(first_active)
+        stage_reason = f"{len(active)} child session(s) currently active"
+        next_action = f"Monitor `{first_active.get('task_id') or first_active['run_id']}` until it finishes"
+        focus = short_summary(
+            live_note or str(first_active.get("summary") or "-"),
+            max_chars=96,
+        )
+    elif blocked:
+        first_blocked = blocked[0]
+        current_stage = "waiting-on-dependencies"
+        stage_reason = f"{len(blocked)} task(s) blocked on prerequisites"
+        next_action = (
+            f"Wait for {format_inline_list(normalize_str_list(first_blocked.get('blocked_on'), 'blocked_on'))}"
+        )
+        focus = str(first_blocked.get("summary") or "-")
+    elif failed:
+        first_failed = failed[0]
+        current_stage = "review-failures"
+        stage_reason = f"{len(failed)} run(s) failed"
+        next_action = f"Inspect `{first_failed['run_id']}` with `show` or `tail`"
+        focus = str(first_failed.get("summary") or "-")
+    elif total > 0 and counts["completed"] == total:
+        current_stage = "completed"
+        stage_reason = "All tracked runs finished successfully"
+        next_action = "Review `manager-summary.md` and decide the next batch"
+        focus = "All current tasks are complete"
+    else:
+        current_stage = "idle"
+        stage_reason = "No active child sessions right now"
+        next_action = "Dispatch the next task batch"
+        focus = "Waiting for manager input"
+    return {
+        "current_stage": current_stage,
+        "stage_reason": stage_reason,
+        "next_action": next_action,
+        "focus": focus,
+        "progress": progress,
+    }
+
+
 def render_project_overview(project_name: str, project_dir: Path, runs: list[dict[str, Any]]) -> str:
     counts = run_status_counts(runs)
     cwd_values = sorted({str(run.get("cwd") or "-") for run in runs})
     watcher_state, watcher_heartbeat = monitor_state(project_dir.parent.parent)
     blocked_count = sum(1 for run in runs if str(run.get("dispatch_state") or "") == "blocked")
+    question_records = collect_question_records(runs)
+    answers = load_answers(project_dir)
+    conflicts = detect_conflict_risks(runs)
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts)
     watcher_line = f"- Manager watcher: `{watcher_state}`"
     if watcher_heartbeat:
         watcher_line += f" (last heartbeat `{watcher_heartbeat}`)"
@@ -817,6 +901,11 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             "",
             f"- Updated: `{utc_now()}`",
             f"- Project folder: `{project_dir}`",
+            f"- Current stage: `{stage['current_stage']}`",
+            f"- Stage reason: {stage['stage_reason']}",
+            f"- Next action: {stage['next_action']}",
+            f"- Current focus: {stage['focus']}",
+            f"- Progress: {stage['progress']}",
             watcher_line,
             f"- Working directories: {format_inline_list(cwd_values)}",
             f"- Total tracked runs: `{len(runs)}`",
@@ -890,6 +979,7 @@ def render_dashboard(
     blocked: list[dict[str, Any]] = []
     open_questions = unanswered_questions(question_records, answers)
     answered = answered_questions(question_records, answers)
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts)
     for run in sorted(runs, key=run_sort_key):
         rows.append(
             [
@@ -915,6 +1005,11 @@ def render_dashboard(
         f"# {project_name} Dashboard",
         "",
         f"- Updated: `{utc_now()}`",
+        f"- Current stage: `{stage['current_stage']}`",
+        f"- Stage reason: {stage['stage_reason']}",
+        f"- Next action: {stage['next_action']}",
+        f"- Current focus: {stage['focus']}",
+        f"- Progress: {stage['progress']}",
         f"- Manager watcher: `{watcher_state}`",
         f"- Running: `{counts['running']}`",
         f"- Completed: `{counts['completed']}`",
@@ -1024,10 +1119,16 @@ def render_manager_summary(
         run for run in sorted(runs, key=run_sort_key)
         if str(run.get("dispatch_state") or "") == "blocked"
     ]
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts)
     lines = [
         f"# {project_name} Manager Summary",
         "",
         f"- Updated: `{utc_now()}`",
+        f"- Current stage: `{stage['current_stage']}`",
+        f"- Stage reason: {stage['stage_reason']}",
+        f"- Next action: {stage['next_action']}",
+        f"- Current focus: {stage['focus']}",
+        f"- Progress: {stage['progress']}",
         f"- Total runs: `{len(runs)}`",
         f"- Blocked: `{len(blocked)}`",
         f"- Running: `{counts['running']}`",
@@ -1212,6 +1313,7 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
     open_questions = unanswered_questions(question_records, answers)
     answered = answered_questions(question_records, answers)
     conflicts = detect_conflict_risks(runs)
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts)
     active = [
         run for run in sorted(runs, key=run_sort_key)
         if str(run.get("status") or "") == "running"
@@ -1225,6 +1327,11 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"workspace={project_dir}",
         f"landing_page={project_dir / 'README.md'}",
         f"dashboard={project_dir / 'dashboard.md'}",
+        f"current_stage={stage['current_stage']}",
+        f"stage_reason={stage['stage_reason']}",
+        f"next_action={stage['next_action']}",
+        f"current_focus={stage['focus']}",
+        f"progress={stage['progress']}",
     ]
     watcher_line = f"watcher={watcher_state}"
     if watcher_heartbeat:

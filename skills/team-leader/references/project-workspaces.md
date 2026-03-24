@@ -53,7 +53,7 @@ If you want to stay inside Codex instead of opening the folder, run:
 
 `python3 scripts/team_leader.py status --project <project>`
 
-That prints the same high-signal view directly in the terminal, plus exact file paths for the workspace, landing page, and dashboard.
+That prints the same high-signal view directly in the terminal, including the current stage, stage reason, next action, current focus, and exact file paths for the workspace, landing page, and dashboard.
 
 ## Conflict Caveat
 

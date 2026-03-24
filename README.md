@@ -25,7 +25,7 @@ The default landing page for each project is `.team-leader/projects/<project>/RE
 
 While child sessions are running, the manager refreshes those markdown files automatically in the background. Tasks with `depends_on` are held automatically until their prerequisites complete, then the manager launches the next wave on its own.
 
-From Codex itself, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary. That prints the workspace path, landing page path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
+From Codex itself, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary. That prints the current stage, stage reason, next action, current focus, workspace path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
 
 ## Install After Pushing
 

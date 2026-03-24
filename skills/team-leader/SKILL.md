@@ -111,7 +111,7 @@ For a Codex-native view without opening folders, prefer:
 python3 scripts/team_leader.py status --project payments-migration
 ```
 
-That prints the workspace path, landing page path, dashboard path, watcher state, active runs, blocked runs, open questions, recent answers, and conflict hints directly in the terminal.
+That prints the current stage, stage reason, next action, current focus, workspace path, landing page path, dashboard path, watcher state, active runs, blocked runs, open questions, recent answers, and conflict hints directly in the terminal.
 
 For project-linked runs, the manager also updates:
 
