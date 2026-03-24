@@ -10,10 +10,12 @@ The current implementation ships with a `codex` provider adapter and a control p
 
 The controller keeps provider-specific behavior at the adapter boundary: option validation, command construction, session-id detection, and resume command generation. That keeps the run registry and batch manifest format stable when a later `claude`, `cursor`, or other CLI adapter is added.
 
-Project-linked runs maintain a central markdown workspace under `.team-leader/projects/<project>/` so the manager can track dashboards, collected child reports, human questions, and conflict-risk notes without manually stitching together terminal output. Older `.agent-subsessions` and `.codex-subsessions` roots are still recognized automatically.
+Project-linked runs maintain a central markdown workspace under `.team-leader/projects/<project>/` so the manager can track the project brief, planner output, dashboards, collected child reports, human questions, and conflict-risk notes without manually stitching together terminal output. Older `.agent-subsessions` and `.codex-subsessions` roots are still recognized automatically.
 
 The default landing page for each project is `.team-leader/projects/<project>/README.md`. From there:
 
+- `brief.md` records the project goal, repo paths, spec paths, notes, and constraints
+- `launch-plan.md` shows the latest planner-produced child-session launch plan
 - `dashboard.md` shows live run progress, active child notes, and watcher status
 - `tasks.md` shows assignment state and summary titles
 - `manager-summary.md` shows the latest manager aggregation
@@ -23,7 +25,13 @@ The default landing page for each project is `.team-leader/projects/<project>/RE
 - `conflicts.md` shows overlap risk between writers
 - `reports/<run-id>.md` stores one markdown report per child session
 
-While child sessions are running, the manager refreshes those markdown files automatically in the background. Tasks with `depends_on` are held automatically until their prerequisites complete, then the manager launches the next wave on its own.
+While child sessions are running, the manager refreshes those markdown files automatically in the background. Tasks with `depends_on` are held automatically until their prerequisites complete, then the manager launches the next wave on its own. The new default flow is:
+
+1. record the goal, repo paths, and specs with `intake`
+2. run `orchestrate`
+3. let the planner child produce a launch plan
+4. let the manager auto-dispatch worker children from that plan
+5. answer only the questions that really need a human
 
 From Codex itself, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary. That prints the current stage, stage reason, next action, current focus, workspace path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
 

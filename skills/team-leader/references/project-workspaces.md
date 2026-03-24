@@ -13,6 +13,8 @@ The default controller root is now `.team-leader/`. Older `.agent-subsessions/` 
 The manager keeps these files current:
 
 - `README.md`: default landing page and file map
+- `brief.md`: project goal, repo paths, spec paths, notes, and constraints
+- `launch-plan.md`: latest planner-produced child launch plan
 - `dashboard.md`: live run table, watcher status, and recent output preview
 - `tasks.md`: task-oriented ledger
 - `manager-summary.md`: concise aggregate snapshot
@@ -24,7 +26,12 @@ The manager keeps these files current:
 
 ## Recommended Metadata
 
-For every meaningful child run, set:
+For manager-first planning, start with:
+
+- `intake --project ... --goal ...`
+- `orchestrate --project ...`
+
+For directly-dispatched child runs, set:
 
 - `--project`
 - `--task-id`
@@ -40,6 +47,8 @@ Without that metadata, the dashboard is still usable, but the task ledger and co
 Treat the markdown files as the control surface:
 
 - read `README.md` first as the default landing page
+- read `brief.md` to understand the captured goal and constraints
+- read `launch-plan.md` to see what the manager-planner most recently proposed
 - read `dashboard.md` first for live progress
 - read `tasks.md` for assignment state
 - read `questions.md` before asking the human anything
@@ -48,6 +57,14 @@ Treat the markdown files as the control surface:
 - read `reports/<run-id>.md` when a specific child needs closer review
 
 While children are active, the manager refreshes these files automatically in the background. Tasks with `--depends-on` stay blocked until their prerequisites complete, then the manager launches the next wave automatically.
+
+When the user only knows the goal and a few paths, the intended flow is:
+
+1. capture the goal and context in `brief.md`
+2. run `orchestrate`
+3. let the manager-planner produce `launch-plan.md`
+4. let the manager auto-dispatch worker children from that plan
+5. answer only the questions that surface in `questions.md`
 
 If you want to stay inside Codex instead of opening the folder, run:
 

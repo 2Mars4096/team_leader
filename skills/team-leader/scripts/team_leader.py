@@ -33,6 +33,13 @@ QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
 ANSWER_LINE_RE = re.compile(r"^\s*[-*+]\s*`?([a-z0-9][a-z0-9-]*)`?\s*:\s*(.+?)\s*$", re.IGNORECASE)
 PRELAUNCH_STATUSES = {"prepared", "blocked"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "exited"}
+PROJECT_BRIEF_FILE = "brief.json"
+PROJECT_BRIEF_MD = "brief.md"
+PROJECT_PLAN_FILE = "launch-plan.json"
+PROJECT_PLAN_MD = "launch-plan.md"
+PLANNER_TASK_PREFIX = "manager-plan"
+PLANNER_ROLE = "manager"
+PLANNER_SOURCE = "team-leader-planner"
 
 
 def utc_now() -> str:
@@ -379,6 +386,10 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("depends_on", [])
         run.setdefault("dispatch_state", None)
         run.setdefault("blocked_on", [])
+        run.setdefault("planner_source", None)
+        run.setdefault("plan_applied_at", None)
+        run.setdefault("plan_apply_error", None)
+        run.setdefault("planned_run_ids", [])
         if get_session_id(run):
             set_session_id(run, get_session_id(run))
     return data
@@ -488,6 +499,229 @@ def format_short_timestamp(value: str | None) -> str:
     if len(value) >= 19:
         return value[:19] + "Z" if value.endswith("Z") else value[:19]
     return value
+
+
+def unique_preserve_order(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = value.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def project_workspace_dir(root: Path, project_name: str, slug: str | None = None) -> Path:
+    return root / "projects" / (slug or project_slug(project_name))
+
+
+def project_brief_path(project_dir: Path) -> Path:
+    return project_dir / PROJECT_BRIEF_FILE
+
+
+def project_brief_md_path(project_dir: Path) -> Path:
+    return project_dir / PROJECT_BRIEF_MD
+
+
+def project_launch_plan_path(project_dir: Path) -> Path:
+    return project_dir / PROJECT_PLAN_FILE
+
+
+def project_launch_plan_md_path(project_dir: Path) -> Path:
+    return project_dir / PROJECT_PLAN_MD
+
+
+def default_project_brief(project_name: str) -> dict[str, Any]:
+    return {
+        "project": project_name,
+        "goal": None,
+        "repo_paths": [],
+        "spec_paths": [],
+        "notes": [],
+        "constraints": [],
+        "updated_at": utc_now(),
+    }
+
+
+def load_project_brief(project_dir: Path, project_name: str | None = None) -> dict[str, Any] | None:
+    path = project_brief_path(project_dir)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid project brief: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"invalid project brief: {path}")
+    brief = default_project_brief(project_name or str(payload.get("project") or project_dir.name))
+    brief["project"] = str(payload.get("project") or brief["project"])
+    brief["goal"] = normalize_optional_text(payload.get("goal"))
+    brief["repo_paths"] = unique_preserve_order(
+        [str(resolve_path(item)) for item in normalize_str_list(payload.get("repo_paths"), "repo_paths")]
+    )
+    brief["spec_paths"] = unique_preserve_order(
+        [str(resolve_path(item)) for item in normalize_str_list(payload.get("spec_paths"), "spec_paths")]
+    )
+    brief["notes"] = unique_preserve_order(normalize_str_list(payload.get("notes"), "notes"))
+    brief["constraints"] = unique_preserve_order(normalize_str_list(payload.get("constraints"), "constraints"))
+    brief["updated_at"] = normalize_optional_text(payload.get("updated_at")) or utc_now()
+    return brief
+
+
+def save_project_brief(project_dir: Path, brief: dict[str, Any]) -> None:
+    brief = dict(brief)
+    brief["updated_at"] = utc_now()
+    write_text(
+        project_brief_path(project_dir),
+        json.dumps(brief, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+    )
+    write_text(project_brief_md_path(project_dir), render_project_brief(brief))
+
+
+def merge_project_brief(
+    existing: dict[str, Any] | None,
+    *,
+    project_name: str,
+    goal: str | None = None,
+    repo_paths: list[str] | None = None,
+    spec_paths: list[str] | None = None,
+    notes: list[str] | None = None,
+    constraints: list[str] | None = None,
+) -> dict[str, Any]:
+    brief = dict(existing or default_project_brief(project_name))
+    brief["project"] = project_name
+    if goal is not None:
+        brief["goal"] = goal
+    brief["repo_paths"] = unique_preserve_order(
+        normalize_str_list(brief.get("repo_paths"), "repo_paths")
+        + [str(resolve_path(item)) for item in (repo_paths or [])]
+    )
+    brief["spec_paths"] = unique_preserve_order(
+        normalize_str_list(brief.get("spec_paths"), "spec_paths")
+        + [str(resolve_path(item)) for item in (spec_paths or [])]
+    )
+    brief["notes"] = unique_preserve_order(
+        normalize_str_list(brief.get("notes"), "notes") + [item for item in (notes or []) if item]
+    )
+    brief["constraints"] = unique_preserve_order(
+        normalize_str_list(brief.get("constraints"), "constraints")
+        + [item for item in (constraints or []) if item]
+    )
+    brief["updated_at"] = utc_now()
+    return brief
+
+
+def render_project_brief(brief: dict[str, Any]) -> str:
+    goal = normalize_optional_text(brief.get("goal"))
+    repo_paths = normalize_str_list(brief.get("repo_paths"), "repo_paths")
+    spec_paths = normalize_str_list(brief.get("spec_paths"), "spec_paths")
+    notes = normalize_str_list(brief.get("notes"), "notes")
+    constraints = normalize_str_list(brief.get("constraints"), "constraints")
+    lines = [
+        f"# {brief.get('project') or 'Project'} Brief",
+        "",
+        f"- Updated: `{normalize_optional_text(brief.get('updated_at')) or utc_now()}`",
+        "",
+        "## Goal",
+        "",
+        goal or "_No goal recorded yet._",
+        "",
+        "## Repo Paths",
+        "",
+    ]
+    if not repo_paths:
+        lines.append("_No repo paths recorded yet._")
+    else:
+        for item in repo_paths:
+            lines.append(f"- `{item}`")
+    lines.extend(["", "## Spec Paths", ""])
+    if not spec_paths:
+        lines.append("_No spec paths recorded yet._")
+    else:
+        for item in spec_paths:
+            lines.append(f"- `{item}`")
+    lines.extend(["", "## Constraints", ""])
+    if not constraints:
+        lines.append("_No constraints recorded yet._")
+    else:
+        for item in constraints:
+            lines.append(f"- {item}")
+    lines.extend(["", "## Notes", ""])
+    if not notes:
+        lines.append("_No notes recorded yet._")
+    else:
+        for item in notes:
+            lines.append(f"- {item}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def read_project_launch_plan(project_dir: Path) -> dict[str, Any] | None:
+    path = project_launch_plan_path(project_dir)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid launch plan file: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"invalid launch plan file: {path}")
+    return payload
+
+
+def save_project_launch_plan(project_dir: Path, payload: dict[str, Any]) -> None:
+    write_text(
+        project_launch_plan_path(project_dir),
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+    )
+    write_text(project_launch_plan_md_path(project_dir), render_project_launch_plan(payload))
+
+
+def render_project_launch_plan(payload: dict[str, Any]) -> str:
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    lines = [
+        "# Launch Plan",
+        "",
+        f"- Updated: `{normalize_optional_text(payload.get('updated_at')) or utc_now()}`",
+        f"- Source run: `{normalize_optional_text(payload.get('source_run_id')) or '-'}`",
+        f"- Applied at: `{normalize_optional_text(payload.get('applied_at')) or '-'}`",
+        "",
+        "## Summary",
+        "",
+        normalize_optional_text(payload.get("plan_summary")) or "_No plan summary._",
+        "",
+        "## Planned Runs",
+        "",
+    ]
+    if not runs:
+        lines.append("_No launch plan captured yet._")
+        lines.append("")
+        return "\n".join(lines)
+    rows: list[list[str]] = []
+    for item in runs:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            [
+                str(item.get("task_id") or "-"),
+                short_summary(normalize_optional_text(item.get("summary")), max_chars=48),
+                str(item.get("role") or "-"),
+                str(item.get("sandbox") or "-"),
+                format_inline_list(normalize_str_list(item.get("depends_on"), "depends_on")),
+                format_inline_list(normalize_str_list(item.get("owned_paths"), "owned_paths")),
+            ]
+        )
+    lines.extend(
+        [
+            markdown_table(["task", "summary", "role", "sandbox", "depends_on", "owned_paths"], rows or [["-", "-", "-", "-", "-", "-"]]),
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def run_status_counts(runs: list[dict[str, Any]]) -> dict[str, int]:
@@ -619,6 +853,213 @@ def extract_questions(text: str | None) -> list[str]:
     return unique
 
 
+def run_is_planner(run: dict[str, Any]) -> bool:
+    task_id = normalize_optional_text(run.get("task_id")) or ""
+    if task_id.startswith(PLANNER_TASK_PREFIX):
+        return True
+    role = normalize_optional_text(run.get("role")) or ""
+    return role.lower() == PLANNER_ROLE and normalize_optional_text(run.get("planner_source")) == PLANNER_SOURCE
+
+
+def project_runs(index: dict[str, Any], project_name: str) -> list[dict[str, Any]]:
+    project_filter = project_name.strip().lower()
+    return [
+        run
+        for run in index["runs"]
+        if project_filter
+        in {
+            str(run.get("project") or "").strip().lower(),
+            str(run.get("project_slug") or "").strip().lower(),
+        }
+    ]
+
+
+def latest_project_planner_run(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    planners = [run for run in runs if run_is_planner(run)]
+    if not planners:
+        return None
+    return sorted(planners, key=run_sort_key)[-1]
+
+
+def extract_json_objects(text: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE):
+        raw = match.group(1).strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            candidates.append(payload)
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            candidates.append(payload)
+    return candidates
+
+
+def normalize_plan_item(item: dict[str, Any]) -> dict[str, Any]:
+    prompt = item.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise RuntimeError("launch plan item must include a non-empty prompt")
+    normalized = {
+        "task_id": normalize_optional_text(item.get("task_id")),
+        "name": normalize_optional_text(item.get("name")),
+        "role": normalize_optional_text(item.get("role")) or "research",
+        "summary": normalize_optional_text(item.get("summary")) or derive_summary(prompt),
+        "cwd": normalize_optional_text(item.get("cwd")),
+        "sandbox": normalize_optional_text(item.get("sandbox")),
+        "owned_paths": normalize_str_list(item.get("owned_paths"), "owned_paths"),
+        "depends_on": normalize_str_list(item.get("depends_on"), "depends_on"),
+        "prompt": prompt.strip(),
+        "search": bool(item.get("search")),
+        "skip_git_repo_check": bool(item.get("skip_git_repo_check")),
+        "full_auto": bool(item.get("full_auto")),
+        "dangerous": bool(item.get("dangerous")),
+    }
+    if not normalized["task_id"]:
+        raise RuntimeError("launch plan item must include task_id")
+    return normalized
+
+
+def extract_launch_plan(text: str | None) -> dict[str, Any] | None:
+    if not text:
+        return None
+    for payload in extract_json_objects(text):
+        runs = payload.get("runs")
+        if not isinstance(runs, list):
+            continue
+        normalized_runs: list[dict[str, Any]] = []
+        try:
+            for item in runs:
+                if not isinstance(item, dict):
+                    raise RuntimeError("launch plan runs entries must be objects")
+                normalized_runs.append(normalize_plan_item(item))
+        except RuntimeError:
+            continue
+        return {
+            "plan_summary": normalize_optional_text(payload.get("plan_summary")) or "Manager-generated launch plan",
+            "runs": normalized_runs,
+        }
+    return None
+
+
+def project_default_cwd(brief: dict[str, Any] | None) -> Path:
+    if brief:
+        repo_paths = normalize_str_list(brief.get("repo_paths"), "repo_paths")
+        if repo_paths:
+            return resolve_path(repo_paths[0])
+    return Path.cwd()
+
+
+def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project_dir: Path, existing_runs: list[dict[str, Any]]) -> str:
+    goal = normalize_optional_text(brief.get("goal")) or "No goal recorded yet."
+    repo_paths = normalize_str_list(brief.get("repo_paths"), "repo_paths")
+    spec_paths = normalize_str_list(brief.get("spec_paths"), "spec_paths")
+    notes = normalize_str_list(brief.get("notes"), "notes")
+    constraints = normalize_str_list(brief.get("constraints"), "constraints")
+    previous_workers = [run for run in existing_runs if not run_is_planner(run)]
+    lines = [
+        f"You are the manager-planner for the project `{project_name}`.",
+        "",
+        "Your job is to inspect the project brief and produce the next safe child-session launch plan for team-leader.",
+        "",
+        f"Project brief path: `{project_brief_md_path(project_dir)}`",
+        f"Project workspace path: `{project_dir}`",
+        "",
+        "Project goal:",
+        goal,
+        "",
+        "Repo paths:",
+    ]
+    if repo_paths:
+        for item in repo_paths:
+            lines.append(f"- `{item}`")
+    else:
+        lines.append("- none recorded")
+    lines.extend(["", "Spec paths:"])
+    if spec_paths:
+        for item in spec_paths:
+            lines.append(f"- `{item}`")
+    else:
+        lines.append("- none recorded")
+    lines.extend(["", "Constraints:"])
+    if constraints:
+        for item in constraints:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- none recorded")
+    lines.extend(["", "Notes:"])
+    if notes:
+        for item in notes:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- none recorded")
+    lines.extend(["", "Existing tracked runs:"])
+    if previous_workers:
+        for run in previous_workers[-10:]:
+            lines.append(
+                f"- task={run.get('task_id') or run['run_id']} status={run.get('status') or '-'} summary={run.get('summary') or '-'}"
+            )
+    else:
+        lines.append("- none")
+    lines.extend(
+        [
+            "",
+            "Rules:",
+            "- Use as few child sessions as necessary.",
+            "- Split writers by disjoint file ownership whenever possible.",
+            "- Prefer read-only research or review children if write boundaries are unclear.",
+            "- If a human decision is required, ask concise questions under a `Questions For Humans` heading.",
+            "- If you have enough information, emit exactly one JSON code block with a launch plan.",
+            "",
+            "Launch plan JSON schema:",
+            "```json",
+            "{",
+            '  "plan_summary": "one short summary",',
+            '  "runs": [',
+            "    {",
+            '      "task_id": "stable-task-id",',
+            '      "name": "short-run-name",',
+            '      "role": "research|implementation|reviewer|manager",',
+            '      "summary": "one-line summary",',
+            '      "cwd": "/absolute/or/project-relative/path",',
+            '      "sandbox": "read-only|workspace-write",',
+            '      "owned_paths": ["relative/path"],',
+            '      "depends_on": ["other-task-id"],',
+            '      "search": false,',
+            '      "skip_git_repo_check": false,',
+            '      "full_auto": true,',
+            '      "dangerous": false,',
+            '      "prompt": "full child prompt text"',
+            "    }",
+            "  ]",
+            "}",
+            "```",
+            "",
+            "The child prompts must be ready to run as-is. Do not output shell commands. Do not leave TODO placeholders in the JSON.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def answers_updated_after(project_dir: Path, timestamp: str | None) -> bool:
+    answers_path = project_dir / "answers.md"
+    if not answers_path.exists():
+        return False
+    if not timestamp:
+        return True
+    try:
+        cutoff = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return True
+    return answers_path.stat().st_mtime > cutoff
+
+
 def question_id_for(run: dict[str, Any], text: str) -> str:
     payload = f"{run['run_id']}\n{text}".encode("utf-8")
     digest = hashlib.sha1(payload).hexdigest()[:10]
@@ -722,12 +1163,6 @@ def detect_conflict_risks(runs: list[dict[str, Any]]) -> list[dict[str, str]]:
                 }
             )
     return conflicts
-
-
-def project_workspace_dir(root: Path, project_name: str, slug: str | None = None) -> Path:
-    return root / "projects" / (slug or project_slug(project_name))
-
-
 def dependency_pool(index: dict[str, Any], run: dict[str, Any]) -> list[dict[str, Any]]:
     project_slug_value = normalize_optional_text(run.get("project_slug"))
     pool = [candidate for candidate in index["runs"] if candidate is not run]
@@ -804,6 +1239,7 @@ def project_stage_snapshot(
     question_records: list[dict[str, str]],
     answers: dict[str, str],
     conflicts: list[dict[str, str]],
+    brief: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     counts = run_status_counts(runs)
     active = [
@@ -865,10 +1301,15 @@ def project_stage_snapshot(
         stage_reason = "All tracked runs finished successfully"
         next_action = "Review `manager-summary.md` and decide the next batch"
         focus = "All current tasks are complete"
+    elif brief and normalize_optional_text(brief.get("goal")):
+        current_stage = "ready-for-planning"
+        stage_reason = "Project brief exists but no child runs are active yet"
+        next_action = "Run `orchestrate` to let the manager create the first child batch"
+        focus = short_summary(normalize_optional_text(brief.get("goal")), max_chars=96)
     else:
         current_stage = "idle"
         stage_reason = "No active child sessions right now"
-        next_action = "Dispatch the next task batch"
+        next_action = "Record the project goal with `intake`, then run `orchestrate`"
         focus = "Waiting for manager input"
     return {
         "current_stage": current_stage,
@@ -887,7 +1328,9 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
     question_records = collect_question_records(runs)
     answers = load_answers(project_dir)
     conflicts = detect_conflict_risks(runs)
-    stage = project_stage_snapshot(runs, question_records, answers, conflicts)
+    brief = load_project_brief(project_dir, project_name)
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief)
+    goal = normalize_optional_text(brief.get("goal")) if brief else None
     watcher_line = f"- Manager watcher: `{watcher_state}`"
     if watcher_heartbeat:
         watcher_line += f" (last heartbeat `{watcher_heartbeat}`)"
@@ -901,6 +1344,9 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             "",
             f"- Updated: `{utc_now()}`",
             f"- Project folder: `{project_dir}`",
+            f"- Brief file: `{project_brief_md_path(project_dir)}`",
+            f"- Launch plan: `{project_launch_plan_md_path(project_dir)}`",
+            f"- Goal: {goal or '_No goal recorded yet._'}",
             f"- Current stage: `{stage['current_stage']}`",
             f"- Stage reason: {stage['stage_reason']}",
             f"- Next action: {stage['next_action']}",
@@ -917,6 +1363,8 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             "",
             "## Files",
             "",
+            "- `brief.md`: project goal, repo paths, spec paths, notes, and constraints",
+            "- `launch-plan.md`: latest planner-produced child launch plan",
             "- `dashboard.md`: live run table, active notes, questions, and conflict alerts",
             "- `tasks.md`: task-oriented ledger with summaries and ownership",
             "- `manager-summary.md`: concise manager snapshot",
@@ -962,13 +1410,15 @@ def render_task_ledger(runs: list[dict[str, Any]]) -> str:
 
 def render_dashboard(
     project_name: str,
+    project_dir: Path | None,
     runs: list[dict[str, Any]],
     conflicts: list[dict[str, str]],
     question_records: list[dict[str, str]],
     answers: dict[str, str],
 ) -> str:
     counts = run_status_counts(runs)
-    project_dir = project_root(Path(runs[0]["run_dir"]).parent.parent, runs[0]) if runs else None
+    if project_dir is None and runs:
+        project_dir = project_root(Path(runs[0]["run_dir"]).parent.parent, runs[0])
     watcher_state = "idle"
     watcher_heartbeat = None
     if project_dir is not None:
@@ -979,7 +1429,10 @@ def render_dashboard(
     blocked: list[dict[str, Any]] = []
     open_questions = unanswered_questions(question_records, answers)
     answered = answered_questions(question_records, answers)
-    stage = project_stage_snapshot(runs, question_records, answers, conflicts)
+    brief = load_project_brief(project_dir, project_name) if project_dir else None
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief)
+    goal = normalize_optional_text(brief.get("goal")) if brief else None
+    launch_plan = read_project_launch_plan(project_dir) if project_dir else None
     for run in sorted(runs, key=run_sort_key):
         rows.append(
             [
@@ -1005,6 +1458,7 @@ def render_dashboard(
         f"# {project_name} Dashboard",
         "",
         f"- Updated: `{utc_now()}`",
+        f"- Goal: {goal or '_No goal recorded yet._'}",
         f"- Current stage: `{stage['current_stage']}`",
         f"- Stage reason: {stage['stage_reason']}",
         f"- Next action: {stage['next_action']}",
@@ -1016,6 +1470,22 @@ def render_dashboard(
         f"- Failed: `{counts['failed']}`",
         f"- Cancelled: `{counts['cancelled']}`",
         "",
+        "## Planner Output",
+        "",
+    ]
+    if launch_plan:
+        lines.extend(
+            [
+                f"- Source run: `{normalize_optional_text(launch_plan.get('source_run_id')) or '-'}`",
+                f"- Applied at: `{normalize_optional_text(launch_plan.get('applied_at')) or '-'}`",
+                f"- Summary: {normalize_optional_text(launch_plan.get('plan_summary')) or '-'}",
+                "",
+            ]
+        )
+    else:
+        lines.extend(["_No planner launch plan captured yet._", "",])
+    lines.extend(
+        [
         "## Run Table",
         "",
         markdown_table(
@@ -1025,7 +1495,8 @@ def render_dashboard(
         "",
         "## Active Runs",
         "",
-    ]
+        ]
+    )
     if watcher_heartbeat:
         lines.insert(3, f"- Last watcher heartbeat: `{watcher_heartbeat}`")
     if not active:
@@ -1107,6 +1578,7 @@ def render_dashboard(
 
 def render_manager_summary(
     project_name: str,
+    project_dir: Path | None,
     runs: list[dict[str, Any]],
     conflicts: list[dict[str, str]],
     question_records: list[dict[str, str]],
@@ -1119,11 +1591,17 @@ def render_manager_summary(
         run for run in sorted(runs, key=run_sort_key)
         if str(run.get("dispatch_state") or "") == "blocked"
     ]
-    stage = project_stage_snapshot(runs, question_records, answers, conflicts)
+    if project_dir is None and runs:
+        project_dir = project_root(Path(runs[0]["run_dir"]).parent.parent, runs[0])
+    brief = load_project_brief(project_dir, project_name) if project_dir else None
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief)
+    goal = normalize_optional_text(brief.get("goal")) if brief else None
+    launch_plan = read_project_launch_plan(project_dir) if project_dir else None
     lines = [
         f"# {project_name} Manager Summary",
         "",
         f"- Updated: `{utc_now()}`",
+        f"- Goal: {goal or '_No goal recorded yet._'}",
         f"- Current stage: `{stage['current_stage']}`",
         f"- Stage reason: {stage['stage_reason']}",
         f"- Next action: {stage['next_action']}",
@@ -1136,9 +1614,24 @@ def render_manager_summary(
         f"- Failed: `{counts['failed']}`",
         f"- Cancelled: `{counts['cancelled']}`",
         "",
-        "## Human Attention",
+        "## Planner State",
         "",
     ]
+    if not launch_plan:
+        lines.append("_No planner launch plan captured yet._")
+    else:
+        lines.extend(
+            [
+                f"- Source run: `{normalize_optional_text(launch_plan.get('source_run_id')) or '-'}`",
+                f"- Applied at: `{normalize_optional_text(launch_plan.get('applied_at')) or '-'}`",
+                f"- Summary: {normalize_optional_text(launch_plan.get('plan_summary')) or '-'}",
+            ]
+        )
+    lines.extend([
+        "",
+        "## Human Attention",
+        "",
+    ])
     if not open_questions and not conflicts:
         lines.append("_No human questions or conflict alerts detected._")
     else:
@@ -1302,9 +1795,7 @@ def render_conflicts(conflicts: list[dict[str, str]]) -> str:
 
 
 def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[str, Any]]) -> str:
-    if not runs:
-        return ""
-    slug = str(runs[0].get("project_slug") or project_slug(project_name))
+    slug = str(runs[0].get("project_slug") or project_slug(project_name)) if runs else project_slug(project_name)
     project_dir = project_workspace_dir(root, project_name, slug)
     watcher_state, watcher_heartbeat = monitor_state(root)
     counts = run_status_counts(runs)
@@ -1313,7 +1804,9 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
     open_questions = unanswered_questions(question_records, answers)
     answered = answered_questions(question_records, answers)
     conflicts = detect_conflict_risks(runs)
-    stage = project_stage_snapshot(runs, question_records, answers, conflicts)
+    brief = load_project_brief(project_dir, project_name)
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief)
+    launch_plan = read_project_launch_plan(project_dir)
     active = [
         run for run in sorted(runs, key=run_sort_key)
         if str(run.get("status") or "") == "running"
@@ -1327,6 +1820,9 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"workspace={project_dir}",
         f"landing_page={project_dir / 'README.md'}",
         f"dashboard={project_dir / 'dashboard.md'}",
+        f"brief={project_brief_md_path(project_dir)}",
+        f"launch_plan={project_launch_plan_md_path(project_dir)}",
+        f"goal={normalize_optional_text(brief.get('goal')) if brief else '-'}",
         f"current_stage={stage['current_stage']}",
         f"stage_reason={stage['stage_reason']}",
         f"next_action={stage['next_action']}",
@@ -1342,6 +1838,15 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"running:{counts['running']} blocked:{len(blocked)} completed:{counts['completed']} "
         f"failed:{counts['failed']} cancelled:{counts['cancelled']}"
     )
+    lines.extend(["", "planner:"])
+    if not launch_plan:
+        lines.append("- none")
+    else:
+        lines.append(
+            f"- source_run={normalize_optional_text(launch_plan.get('source_run_id')) or '-'} "
+            f"applied_at={normalize_optional_text(launch_plan.get('applied_at')) or '-'} "
+            f"summary={short_summary(normalize_optional_text(launch_plan.get('plan_summary')), max_chars=80)}"
+        )
     lines.extend(["", "active_runs:"])
     if not active:
         lines.append("- none")
@@ -1429,48 +1934,208 @@ def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list
     return question_records
 
 
-def sync_projects(root: Path, index: dict[str, Any]) -> None:
+def known_projects(root: Path, index: dict[str, Any]) -> dict[str, str]:
     grouped: dict[str, dict[str, Any]] = {}
     for run in index["runs"]:
         project_name = normalize_optional_text(run.get("project"))
         if not project_name:
             continue
         slug = str(run.get("project_slug") or project_slug(project_name))
-        payload = grouped.setdefault(slug, {"name": project_name, "runs": []})
-        payload["runs"].append(run)
-    for slug, payload in grouped.items():
-        project_name = str(payload["name"])
-        runs = sorted(payload["runs"], key=run_sort_key)
-        project_dir = ensure_project_workspace(root, project_name, slug)
-        question_records = write_project_reports(project_dir, runs)
-        answers_path = project_dir / "answers.md"
-        if not answers_path.exists():
-            write_text(answers_path, render_answers_stub())
-        answers = load_answers(project_dir)
-        conflicts = detect_conflict_risks(runs)
-        delete_if_exists(project_dir / "project.md")
-        write_text(project_dir / "README.md", render_project_overview(project_name, project_dir, runs))
-        write_text(project_dir / "tasks.md", render_task_ledger(runs))
-        write_text(
-            project_dir / "dashboard.md",
-            render_dashboard(project_name, runs, conflicts, question_records, answers),
+        grouped[slug] = {"name": project_name}
+    projects_dir = root / "projects"
+    if projects_dir.exists():
+        for project_dir in projects_dir.iterdir():
+            if not project_dir.is_dir():
+                continue
+            slug = project_dir.name
+            if slug in grouped:
+                continue
+            brief = load_project_brief(project_dir)
+            if brief:
+                grouped[slug] = {"name": str(brief.get("project") or slug)}
+    return {slug: str(payload["name"]) for slug, payload in grouped.items()}
+
+
+def sync_one_project(root: Path, project_name: str, slug: str, runs: list[dict[str, Any]]) -> None:
+    project_dir = ensure_project_workspace(root, project_name, slug)
+    brief = load_project_brief(project_dir, project_name)
+    if brief:
+        write_text(project_brief_md_path(project_dir), render_project_brief(brief))
+    if not project_launch_plan_md_path(project_dir).exists():
+        write_text(project_launch_plan_md_path(project_dir), render_project_launch_plan({}))
+    question_records = write_project_reports(project_dir, runs)
+    answers_path = project_dir / "answers.md"
+    if not answers_path.exists():
+        write_text(answers_path, render_answers_stub())
+    answers = load_answers(project_dir)
+    conflicts = detect_conflict_risks(runs)
+    delete_if_exists(project_dir / "project.md")
+    write_text(project_dir / "README.md", render_project_overview(project_name, project_dir, runs))
+    write_text(project_dir / "tasks.md", render_task_ledger(runs))
+    write_text(
+        project_dir / "dashboard.md",
+        render_dashboard(project_name, project_dir, runs, conflicts, question_records, answers),
+    )
+    write_text(
+        project_dir / "manager-summary.md",
+        render_manager_summary(project_name, project_dir, runs, conflicts, question_records, answers),
+    )
+    write_text(project_dir / "questions.md", render_questions(question_records, answers))
+    write_text(
+        project_dir / "answers-template.md",
+        render_answers_template(question_records, answers),
+    )
+    write_text(project_dir / "conflicts.md", render_conflicts(conflicts))
+
+
+def sync_projects(root: Path, index: dict[str, Any]) -> None:
+    projects = known_projects(root, index)
+    for slug, project_name in sorted(projects.items()):
+        runs = sorted(
+            [
+                run
+                for run in index["runs"]
+                if normalize_optional_text(run.get("project_slug")) == slug
+            ],
+            key=run_sort_key,
         )
-        write_text(
-            project_dir / "manager-summary.md",
-            render_manager_summary(project_name, runs, conflicts, question_records, answers),
-        )
-        write_text(project_dir / "questions.md", render_questions(question_records, answers))
-        write_text(
-            project_dir / "answers-template.md",
-            render_answers_template(question_records, answers),
-        )
-        write_text(project_dir / "conflicts.md", render_conflicts(conflicts))
+        sync_one_project(root, project_name, slug, runs)
 
 
 def save_index_and_sync(root: Path, data: dict[str, Any]) -> None:
     update_dispatch_metadata(data)
     save_index(root, data)
     sync_projects(root, data)
+
+
+def next_planner_task_id(runs: list[dict[str, Any]]) -> str:
+    count = sum(1 for run in runs if run_is_planner(run))
+    return f"{PLANNER_TASK_PREFIX}-{count + 1}"
+
+
+def infer_plan_sandbox(item: dict[str, Any]) -> str | None:
+    sandbox = normalize_optional_text(item.get("sandbox"))
+    if sandbox:
+        return sandbox
+    role = (normalize_optional_text(item.get("role")) or "").lower()
+    if item.get("owned_paths") or role in {"implementation", "implementer", "writer", "owner", "manager"}:
+        return "workspace-write"
+    return "read-only"
+
+
+def project_extra_add_dirs(default_cd: Path, brief: dict[str, Any] | None) -> list[Path]:
+    if not brief:
+        return []
+    extras: list[Path] = []
+    for item in normalize_str_list(brief.get("repo_paths"), "repo_paths"):
+        path = resolve_path(item)
+        if path == default_cd:
+            continue
+        extras.append(path)
+    return extras
+
+
+def dispatch_options_from_plan_item(
+    item: dict[str, Any],
+    *,
+    project_name: str,
+    brief: dict[str, Any] | None,
+    planner_run: dict[str, Any],
+) -> DispatchOptions:
+    cwd_raw = normalize_optional_text(item.get("cwd"))
+    if cwd_raw:
+        candidate = Path(cwd_raw)
+        cd = resolve_path(candidate) if candidate.is_absolute() else resolve_path(project_default_cwd(brief) / candidate)
+    else:
+        cd = project_default_cwd(brief)
+    add_dirs = project_extra_add_dirs(cd, brief)
+    add_dirs.extend(resolve_path(path) for path in normalize_str_list(planner_run.get("add_dirs"), "add_dirs"))
+    add_dirs = [path for idx, path in enumerate(add_dirs) if path not in add_dirs[:idx]]
+    sandbox = infer_plan_sandbox(item)
+    return DispatchOptions(
+        provider=str(planner_run.get("provider") or DEFAULT_PROVIDER),
+        name=normalize_optional_text(item.get("name")) or normalize_optional_text(item.get("task_id")),
+        project=project_name,
+        task_id=normalize_optional_text(item.get("task_id")),
+        role=normalize_optional_text(item.get("role")),
+        summary=normalize_optional_text(item.get("summary")),
+        prompt_text=str(item["prompt"]),
+        cd=cd,
+        sandbox=sandbox,
+        model=normalize_optional_text(planner_run.get("model")),
+        profile=normalize_optional_text(planner_run.get("profile")),
+        add_dirs=add_dirs,
+        configs=normalize_str_list(planner_run.get("configs"), "configs"),
+        enables=normalize_str_list(planner_run.get("enables"), "enables"),
+        disables=normalize_str_list(planner_run.get("disables"), "disables"),
+        images=[resolve_path(path) for path in normalize_str_list(planner_run.get("images"), "images")],
+        search=bool(item.get("search")) or bool(planner_run.get("search")),
+        skip_git_repo_check=bool(item.get("skip_git_repo_check")) or bool(planner_run.get("skip_git_repo_check")),
+        ephemeral=bool(planner_run.get("ephemeral")),
+        full_auto=bool(item.get("full_auto")) or bool(planner_run.get("full_auto")),
+        dangerous=bool(item.get("dangerous")) or bool(planner_run.get("dangerous")),
+        dry_run=False,
+        owned_paths=normalize_str_list(item.get("owned_paths"), "owned_paths"),
+        depends_on=normalize_str_list(item.get("depends_on"), "depends_on"),
+    )
+
+
+def apply_planner_run(root: Path, index: dict[str, Any], run: dict[str, Any]) -> list[str]:
+    if run.get("plan_applied_at") or run.get("plan_apply_error"):
+        return normalize_str_list(run.get("planned_run_ids"), "planned_run_ids")
+    project_name = normalize_optional_text(run.get("project"))
+    if not project_name:
+        run["plan_apply_error"] = "planner run has no project"
+        return []
+    project_dir = project_workspace_dir(root, project_name, str(run.get("project_slug") or project_slug(project_name)))
+    brief = load_project_brief(project_dir, project_name)
+    plan = extract_launch_plan(last_message_for_run(run))
+    if not plan:
+        run["plan_apply_error"] = "no-launch-plan-found"
+        payload = {
+            "source_run_id": run["run_id"],
+            "plan_summary": "Planner finished without a parseable launch plan",
+            "runs": [],
+            "applied_at": None,
+            "updated_at": utc_now(),
+        }
+        save_project_launch_plan(project_dir, payload)
+        return []
+    planned_ids: list[str] = []
+    existing_task_ids = {normalize_optional_text(item.get("task_id")) for item in index["runs"]}
+    normalized_runs: list[dict[str, Any]] = []
+    for item in plan["runs"]:
+        normalized_runs.append(dict(item))
+        task_id = normalize_optional_text(item.get("task_id"))
+        if task_id and task_id in existing_task_ids:
+            continue
+        options = dispatch_options_from_plan_item(item, project_name=project_name, brief=brief, planner_run=run)
+        child = materialize_run(root, index, options, announce=False)
+        planned_ids.append(str(child["run_id"]))
+        existing_task_ids.add(normalize_optional_text(child.get("task_id")))
+    run["plan_applied_at"] = utc_now()
+    run["plan_apply_error"] = None
+    run["planned_run_ids"] = planned_ids
+    save_project_launch_plan(
+        project_dir,
+        {
+            "source_run_id": run["run_id"],
+            "plan_summary": plan["plan_summary"],
+            "runs": normalized_runs,
+            "applied_at": run["plan_applied_at"],
+            "updated_at": utc_now(),
+        },
+    )
+    return planned_ids
+
+
+def apply_planner_outputs(root: Path, index: dict[str, Any]) -> None:
+    for run in sorted(index["runs"], key=run_sort_key):
+        if not run_is_planner(run):
+            continue
+        if str(run.get("status") or "") != "completed":
+            continue
+        apply_planner_run(root, index, run)
 
 
 def read_text_if_exists(path: Path) -> str | None:
@@ -1710,6 +2375,15 @@ def refresh_run(run: dict[str, Any]) -> None:
             set_session_id(run, session_id)
 
 
+def refresh_index_state(root: Path, index: dict[str, Any]) -> None:
+    for run in index["runs"]:
+        refresh_run(run)
+    apply_planner_outputs(root, index)
+    launch_ready_runs(root, index)
+    save_index_and_sync(root, index)
+    ensure_monitor(root, index)
+
+
 def build_runner_script(
     *,
     command: list[str],
@@ -1789,10 +2463,124 @@ def cmd_providers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_intake(args: argparse.Namespace) -> int:
+    root = resolve_path(args.root) if args.root else default_root()
+    project_name = args.project.strip()
+    with root_lock(root):
+        index = load_index(root)
+        project_dir = ensure_project_workspace(root, project_name, project_slug(project_name))
+        brief = merge_project_brief(
+            load_project_brief(project_dir, project_name),
+            project_name=project_name,
+            goal=normalize_optional_text(args.goal),
+            repo_paths=list(args.repo_path),
+            spec_paths=list(args.spec_path),
+            notes=list(args.note),
+            constraints=list(args.constraint),
+        )
+        if not normalize_optional_text(brief.get("goal")):
+            raise RuntimeError("project brief still has no goal; provide --goal")
+        save_project_brief(project_dir, brief)
+        save_index_and_sync(root, index)
+    print(f"project={project_name}")
+    print(f"workspace={project_dir}")
+    print(f"brief={project_brief_md_path(project_dir)}")
+    return 0
+
+
+def cmd_orchestrate(args: argparse.Namespace) -> int:
+    root = resolve_path(args.root) if args.root else default_root()
+    project_name = args.project.strip()
+    with root_lock(root):
+        index = load_index(root)
+        refresh_index_state(root, index)
+        project_dir = ensure_project_workspace(root, project_name, project_slug(project_name))
+        brief = merge_project_brief(
+            load_project_brief(project_dir, project_name),
+            project_name=project_name,
+            goal=normalize_optional_text(args.goal),
+            repo_paths=list(args.repo_path),
+            spec_paths=list(args.spec_path),
+            notes=list(args.note),
+            constraints=list(args.constraint),
+        )
+        if not normalize_optional_text(brief.get("goal")):
+            raise RuntimeError("project brief still has no goal; provide --goal")
+        save_project_brief(project_dir, brief)
+        runs = project_runs(index, project_name)
+        question_records = collect_question_records(runs)
+        answers = load_answers(project_dir)
+        open_questions = unanswered_questions(question_records, answers)
+        latest_planner = latest_project_planner_run(runs)
+        if latest_planner:
+            refresh_run(latest_planner)
+        if latest_planner and str(latest_planner.get("status") or "") in {"running", "prepared", "blocked"} and not args.replan:
+            save_index_and_sync(root, index)
+            ensure_monitor(root, index)
+            print(render_project_cli_summary(root, project_name, project_runs(index, project_name)))
+            return 0
+        if open_questions and not args.replan:
+            save_index_and_sync(root, index)
+            ensure_monitor(root, index)
+            print(render_project_cli_summary(root, project_name, project_runs(index, project_name)))
+            return 0
+        worker_runs = [run for run in runs if not run_is_planner(run)]
+        if latest_planner and worker_runs and not args.replan:
+            save_index_and_sync(root, index)
+            ensure_monitor(root, index)
+            print(render_project_cli_summary(root, project_name, project_runs(index, project_name)))
+            return 0
+        if latest_planner and not args.replan and not answers_updated_after(project_dir, normalize_optional_text(latest_planner.get("finished_at"))):
+            if latest_planner.get("plan_applied_at") or latest_planner.get("plan_apply_error"):
+                save_index_and_sync(root, index)
+                ensure_monitor(root, index)
+                print(render_project_cli_summary(root, project_name, project_runs(index, project_name)))
+                return 0
+        add_dirs = project_extra_add_dirs(project_default_cwd(brief), brief)
+        add_dirs.extend(resolve_path(path) for path in args.add_dir)
+        add_dirs = [path for idx, path in enumerate(add_dirs) if path not in add_dirs[:idx]]
+        planner_options = DispatchOptions(
+            provider=args.provider,
+            name=next_planner_task_id(runs),
+            project=project_name,
+            task_id=next_planner_task_id(runs),
+            role=PLANNER_ROLE,
+            summary=f"Plan and assign the next child sessions for {project_name}",
+            prompt_text=planner_prompt_for_project(project_name, brief, project_dir, runs),
+            cd=resolve_path(args.cd) if args.cd else project_default_cwd(brief),
+            sandbox=args.sandbox or "read-only",
+            model=args.model,
+            profile=args.profile,
+            add_dirs=add_dirs,
+            configs=list(args.config),
+            enables=list(args.enable),
+            disables=list(args.disable),
+            images=[resolve_path(path) for path in args.image],
+            search=bool(args.search),
+            skip_git_repo_check=bool(args.skip_git_repo_check),
+            ephemeral=bool(args.ephemeral),
+            full_auto=True,
+            dangerous=bool(args.dangerous),
+            dry_run=bool(args.dry_run),
+            owned_paths=[],
+            depends_on=[],
+        )
+        materialize_run(
+            root,
+            index,
+            planner_options,
+            extra_fields={"planner_source": PLANNER_SOURCE},
+        )
+    return 0
+
+
 def materialize_run(
     root: Path,
     index: dict[str, Any],
     options: DispatchOptions,
+    *,
+    announce: bool = True,
+    extra_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ensure_root(root)
     adapter = get_provider(options.provider)
@@ -1876,15 +2664,22 @@ def materialize_run(
         "depends_on": list(options.depends_on),
         "dispatch_state": "dry-run" if options.dry_run else "ready",
         "blocked_on": [],
+        "planner_source": None,
+        "plan_applied_at": None,
+        "plan_apply_error": None,
+        "planned_run_ids": [],
     }
+    if extra_fields:
+        run.update(extra_fields)
 
     index["runs"].append(run)
     if not options.dry_run:
         launch_ready_runs(root, index)
     save_index_and_sync(root, index)
     ensure_monitor(root, index)
-    print_run_summary(run)
-    if options.project:
+    if announce:
+        print_run_summary(run)
+    if announce and options.project:
         project_dir = project_workspace_dir(root, options.project, run.get("project_slug"))
         print(f"workspace={project_dir}")
         print(f"landing_page={project_dir / 'README.md'}")
@@ -2012,11 +2807,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     project_name: str | None = None
     with root_lock(root):
         index = load_index(root)
-        for run in index["runs"]:
-            refresh_run(run)
-        launch_ready_runs(root, index)
-        save_index_and_sync(root, index)
-        ensure_monitor(root, index)
+        refresh_index_state(root, index)
         runs = index["runs"]
         if args.project:
             project_filter = args.project.strip().lower()
@@ -2029,12 +2820,18 @@ def cmd_status(args: argparse.Namespace) -> int:
                     str(run.get("project_slug") or "").strip().lower(),
                 }
             ]
+            project_name = args.project
             if runs:
                 project_name = str(runs[0].get("project") or runs[0].get("project_slug") or args.project)
     if args.json:
         print(json.dumps(runs, ensure_ascii=True, indent=2))
         return 0
     if not runs:
+        if project_name:
+            project_dir = project_workspace_dir(root, project_name, project_slug(project_name))
+            if project_brief_path(project_dir).exists() or project_launch_plan_md_path(project_dir).exists():
+                print(render_project_cli_summary(root, project_name, []))
+                return 0
         print("no runs")
         return 0
     if project_name:
@@ -2050,11 +2847,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     with root_lock(root):
         index = load_index(root)
+        refresh_index_state(root, index)
         run = resolve_run(index, args.run)
-        refresh_run(run)
-        launch_ready_runs(root, index)
-        save_index_and_sync(root, index)
-        ensure_monitor(root, index)
         last_message = read_text_if_exists(Path(run["last_message_path"]))
     print(json.dumps(run, ensure_ascii=True, indent=2, sort_keys=True))
     if last_message:
@@ -2067,11 +2861,8 @@ def cmd_tail(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     with root_lock(root):
         index = load_index(root)
+        refresh_index_state(root, index)
         run = resolve_run(index, args.run)
-        refresh_run(run)
-        launch_ready_runs(root, index)
-        save_index_and_sync(root, index)
-        ensure_monitor(root, index)
         path = Path(run["stderr_log"] if args.stderr else run["stdout_jsonl"])
     if not path.exists():
         print(f"missing log: {path}", file=sys.stderr)
@@ -2086,11 +2877,8 @@ def cmd_resume_cmd(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     with root_lock(root):
         index = load_index(root)
+        refresh_index_state(root, index)
         run = resolve_run(index, args.run)
-        refresh_run(run)
-        launch_ready_runs(root, index)
-        save_index_and_sync(root, index)
-        ensure_monitor(root, index)
         command = provider_for_run(run).build_resume_command(run, args.exec)
     print(command)
     return 0
@@ -2111,12 +2899,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     with root_lock(root):
         index = load_index(root)
+        refresh_index_state(root, index)
         targets = [resolve_run(index, args.run)] if args.run else index["runs"]
-        for run in targets:
-            refresh_run(run)
-        launch_ready_runs(root, index)
-        save_index_and_sync(root, index)
-        ensure_monitor(root, index)
     for run in targets:
         print_run_summary(run)
     return 0
@@ -2153,10 +2937,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         while True:
             with root_lock(root):
                 index = load_index(root)
-                for run in index["runs"]:
-                    refresh_run(run)
-                launch_ready_runs(root, index)
-                save_index_and_sync(root, index)
+                refresh_index_state(root, index)
                 write_text(heartbeat_path, utc_now() + "\n")
                 if not index_has_active_runs(index):
                     break
@@ -2214,6 +2995,41 @@ def add_common_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="Create the run directory but do not launch the provider CLI")
 
 
+def add_project_capture_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
+    parser.add_argument("--project", required=True, help="Project name")
+    parser.add_argument("--goal", help="High-level project goal")
+    parser.add_argument("--repo-path", action="append", default=[], help="Relevant repo or working directory path")
+    parser.add_argument("--spec-path", action="append", default=[], help="Relevant spec, design, or reference path")
+    parser.add_argument("--note", action="append", default=[], help="Additional project note or Q/A context")
+    parser.add_argument("--constraint", action="append", default=[], help="Constraint the planner should respect")
+
+
+def add_orchestrate_options(parser: argparse.ArgumentParser) -> None:
+    add_project_capture_options(parser)
+    parser.add_argument(
+        "--provider",
+        choices=sorted(PROVIDERS),
+        default=DEFAULT_PROVIDER,
+        help="CLI provider adapter to use for the manager planner child",
+    )
+    parser.add_argument("--cd", help="Working directory for the planner child")
+    parser.add_argument("--sandbox", help="Sandbox mode for the planner child")
+    parser.add_argument("--model", help="Provider model override")
+    parser.add_argument("--profile", help="Provider profile override")
+    parser.add_argument("--add-dir", action="append", default=[], help="Additional directory to expose to the planner child")
+    parser.add_argument("--config", action="append", default=[], help="Pass through provider --config")
+    parser.add_argument("--enable", action="append", default=[], help="Pass through provider --enable")
+    parser.add_argument("--disable", action="append", default=[], help="Pass through provider --disable")
+    parser.add_argument("--image", action="append", default=[], help="Image path to attach where supported")
+    parser.add_argument("--search", action="store_true", help="Enable provider live web search where supported")
+    parser.add_argument("--skip-git-repo-check", action="store_true", help="Allow planner child outside a Git repository where supported")
+    parser.add_argument("--ephemeral", action="store_true", help="Run planner child without persisting provider session files")
+    parser.add_argument("--dangerous", action="store_true", help="Run planner child with provider dangerous no-sandbox mode")
+    parser.add_argument("--dry-run", action="store_true", help="Create the planner run directory but do not launch the provider CLI")
+    parser.add_argument("--replan", action="store_true", help="Force a fresh manager-planner run even if a prior plan exists")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Manage real child sessions as subsessions, with a Codex provider implemented first.",
@@ -2227,6 +3043,14 @@ def build_parser() -> argparse.ArgumentParser:
     providers_p = sub.add_parser("providers", help="List supported provider adapters")
     providers_p.add_argument("--json", action="store_true", help="Print provider metadata as JSON")
     providers_p.set_defaults(func=cmd_providers)
+
+    intake_p = sub.add_parser("intake", help="Record or update a project brief from goal, paths, and notes")
+    add_project_capture_options(intake_p)
+    intake_p.set_defaults(func=cmd_intake)
+
+    orchestrate_p = sub.add_parser("orchestrate", help="Use the manager to plan and launch child runs from a project brief")
+    add_orchestrate_options(orchestrate_p)
+    orchestrate_p.set_defaults(func=cmd_orchestrate)
 
     dispatch_p = sub.add_parser("dispatch", help="Dispatch one child session")
     add_common_run_options(dispatch_p)

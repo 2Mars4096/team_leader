@@ -13,7 +13,7 @@ Treat a subsession as a full Codex worker with its own thread, context window, t
 
 Use the control script in `scripts/team_leader.py` instead of ad hoc shell fragments. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
-When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
+When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
 
 Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
 
@@ -48,7 +48,32 @@ python3 scripts/team_leader.py init
 
 This creates `.team-leader/` in the current working directory unless an older compatible root already exists.
 
-### 2. Dispatch a child run
+### 2. Record a project goal and context
+
+When the user can only give you the project goal, a few constraints, and some paths, start here:
+
+```bash
+python3 scripts/team_leader.py intake \
+  --project checkout-refactor \
+  --goal "Refactor checkout to simplify the flow and reduce payment failures." \
+  --repo-path /path/to/repo \
+  --spec-path /path/to/spec.md \
+  --constraint "Keep the current API stable for mobile clients" \
+  --note "The user can answer a few human questions, but does not want to hand-author worker tasks."
+```
+
+That creates or updates `.team-leader/projects/<project>/brief.md`.
+
+### 3. Let the manager plan the child sessions
+
+```bash
+python3 scripts/team_leader.py orchestrate \
+  --project checkout-refactor
+```
+
+`orchestrate` launches a manager-planner child when needed. That planner inspects `brief.md`, the repo paths, and any spec paths, then emits a machine-readable launch plan. The manager parses that plan and auto-dispatches child sessions from it. If the planner instead raises human questions, they land in `questions.md` and `answers-template.md`.
+
+### 4. Dispatch a child run directly when needed
 
 Use a direct prompt:
 
@@ -95,7 +120,7 @@ python3 scripts/team_leader.py dispatch \
 
 That project link is what enables automatic markdown aggregation, progress visualization, and dependency-aware next-wave launching.
 
-### 3. Track progress
+### 5. Track progress
 
 ```bash
 python3 scripts/team_leader.py status
@@ -116,6 +141,8 @@ That prints the current stage, stage reason, next action, current focus, workspa
 For project-linked runs, the manager also updates:
 
 - `projects/<project>/README.md`
+- `projects/<project>/brief.md`
+- `projects/<project>/launch-plan.md`
 - `projects/<project>/dashboard.md`
 - `projects/<project>/tasks.md`
 - `projects/<project>/manager-summary.md`
@@ -125,7 +152,7 @@ For project-linked runs, the manager also updates:
 - `projects/<project>/conflicts.md`
 - `projects/<project>/reports/<run-id>.md`
 
-### 4. Resume the child later
+### 6. Resume the child later
 
 Print a ready-to-run resume command:
 
@@ -141,7 +168,7 @@ For non-interactive follow-up:
 python3 scripts/team_leader.py resume-cmd 20260324-120000-ui-refactor --exec
 ```
 
-### 5. Cancel when needed
+### 7. Cancel when needed
 
 ```bash
 python3 scripts/team_leader.py cancel 20260324-120000-ui-refactor
@@ -158,6 +185,18 @@ python3 scripts/team_leader.py batch --file references/example_manifest.json --d
 ```
 
 Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions. Read `references/project-workspaces.md` when you want the central-folder workflow and automatic markdown collection behavior. Use `python3 scripts/team_leader.py providers` to inspect the adapters currently available in the script, or `providers --json` when you need machine-readable provider capability details.
+
+## Recommended Manager-First Flow
+
+When the user gives only the goal and a few pieces of context:
+
+1. run `intake` to capture the project brief
+2. run `orchestrate` to launch the manager-planner child
+3. monitor with `status --project <project>`
+4. answer anything in `questions.md`
+5. rerun `orchestrate --project <project>` if the planner needs a fresh round after new human answers
+
+That keeps the “who should do what?” decision inside the manager instead of forcing the user to enumerate child sessions manually.
 
 ## Prompting Guidance
 
@@ -179,6 +218,7 @@ Populate `--owned-path` when a child is allowed to write. The project workspace 
 
 - Prefer `--sandbox read-only` for research-only children
 - Prefer `--sandbox workspace-write --full-auto` for normal autonomous implementation children
+- Prefer `intake` + `orchestrate` when the user has only a project goal, paths, and a few constraints
 - Prefer linking every meaningful child to `--project`, `--task-id`, `--summary`, and `--role` so the markdown dashboard remains useful
 - Use `--depends-on` when a task should wait for another task to complete; the manager now keeps blocked tasks parked and launches them automatically when their prerequisites finish
 - Use `--add-dir` for extra writable paths outside the main repo root
@@ -187,7 +227,7 @@ Populate `--owned-path` when a child is allowed to write. The project workspace 
 - Use `attach-thread` as a Codex-specific compatibility alias
 - Use `reconcile` to backfill session IDs after runs finish
 - When adding another CLI later, preserve the registry and run commands; only add a new adapter and keep provider branching out of the shared lifecycle code
-- Use `README.md` as the default landing page for a project workspace, then open `dashboard.md` for live progress, `tasks.md` for assignment state, `questions.md` for escalation, `answers.md` for human responses, and `manager-summary.md` for the latest aggregate snapshot
+- Use `README.md` as the default landing page for a project workspace, then check `brief.md` for the captured goal and `launch-plan.md` for the latest manager plan before moving into `dashboard.md`, `tasks.md`, `questions.md`, `answers.md`, and `manager-summary.md`
 
 ## Guardrails
 
