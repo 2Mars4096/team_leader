@@ -3,6 +3,7 @@
     {
       "project": "payments-migration",
       "task_id": "schema-audit",
+      "summary": "Audit the migration schema before UI work starts",
       "role": "reviewer",
       "owned_paths": [
         "db/schema",
@@ -20,6 +21,7 @@
     {
       "project": "payments-migration",
       "task_id": "ui-owner",
+      "summary": "Own the UI cleanup for the payments screen",
       "role": "implementation",
       "owned_paths": [
         "frontend/payments"

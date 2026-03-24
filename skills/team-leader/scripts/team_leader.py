@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 import re
@@ -70,6 +72,18 @@ def ensure_root(root: Path) -> None:
     (root / "projects").mkdir(parents=True, exist_ok=True)
 
 
+@contextmanager
+def root_lock(root: Path) -> Any:
+    ensure_root(root)
+    lock_path = root / ".lock"
+    with lock_path.open("a+", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 @dataclass(frozen=True)
 class DispatchOptions:
     provider: str
@@ -77,6 +91,7 @@ class DispatchOptions:
     project: str | None
     task_id: str | None
     role: str | None
+    summary: str | None
     prompt_text: str
     cd: Path
     sandbox: str | None
@@ -352,6 +367,7 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("project_slug", None)
         run.setdefault("task_id", None)
         run.setdefault("role", None)
+        run.setdefault("summary", None)
         run.setdefault("owned_paths", [])
         run.setdefault("depends_on", [])
         if get_session_id(run):
@@ -387,6 +403,11 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def delete_if_exists(path: Path) -> None:
+    if path.exists():
+        path.unlink()
+
+
 def normalize_optional_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -407,6 +428,32 @@ def normalize_str_list(value: Any, field_name: str) -> list[str]:
         if text:
             result.append(text)
     return result
+
+
+def derive_summary(prompt_text: str) -> str:
+    for raw_line in prompt_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        line = re.sub(r"^(goal|objective|summary|task)\s*:\s*", "", line, flags=re.IGNORECASE)
+        line = line.strip(" -")
+        if not line:
+            continue
+        if len(line) > 96:
+            return line[:93].rstrip() + "..."
+        return line
+    return "Child session work"
+
+
+def short_summary(value: str | None, max_chars: int = 52) -> str:
+    if not value:
+        return "-"
+    text = value.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
 
 
 def project_slug(project_name: str) -> str:
@@ -637,14 +684,21 @@ def ensure_project_workspace(root: Path, project_name: str, slug: str) -> Path:
 def render_project_overview(project_name: str, project_dir: Path, runs: list[dict[str, Any]]) -> str:
     counts = run_status_counts(runs)
     cwd_values = sorted({str(run.get("cwd") or "-") for run in runs})
+    watcher_state, watcher_heartbeat = monitor_state(project_dir.parent.parent)
+    watcher_line = f"- Manager watcher: `{watcher_state}`"
+    if watcher_heartbeat:
+        watcher_line += f" (last heartbeat `{watcher_heartbeat}`)"
     return "\n".join(
         [
             f"# {project_name}",
+            "",
+            "Start here with `dashboard.md` for live progress. While children are active, the manager keeps these markdown files refreshed in the background. Use `manager-summary.md` for the latest manager synthesis and `questions.md` for anything the human needs to answer.",
             "",
             "## Metadata",
             "",
             f"- Updated: `{utc_now()}`",
             f"- Project folder: `{project_dir}`",
+            watcher_line,
             f"- Working directories: {format_inline_list(cwd_values)}",
             f"- Total tracked runs: `{len(runs)}`",
             f"- Running: `{counts['running']}`",
@@ -654,8 +708,8 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             "",
             "## Files",
             "",
-            "- `dashboard.md`: live run table and recent output previews",
-            "- `tasks.md`: task-oriented ledger",
+            "- `dashboard.md`: live run table, active notes, questions, and conflict alerts",
+            "- `tasks.md`: task-oriented ledger with summaries and ownership",
             "- `manager-summary.md`: concise manager snapshot",
             "- `questions.md`: human-facing questions and blockers",
             "- `conflicts.md`: ownership overlap and conflict-risk notes",
@@ -671,6 +725,7 @@ def render_task_ledger(runs: list[dict[str, Any]]) -> str:
         rows.append(
             [
                 str(run.get("task_id") or run["run_id"]),
+                str(run.get("summary") or "-"),
                 str(run.get("role") or "-"),
                 str(run.get("status") or "-"),
                 str(run["run_id"]),
@@ -684,8 +739,8 @@ def render_task_ledger(runs: list[dict[str, Any]]) -> str:
             "# Task Ledger",
             "",
             markdown_table(
-                ["task", "role", "status", "run", "depends_on", "owned_paths", "session"],
-                rows or [["-", "-", "-", "-", "-", "-", "-"]],
+                ["task", "summary", "role", "status", "run", "depends_on", "owned_paths", "session"],
+                rows or [["-", "-", "-", "-", "-", "-", "-", "-"]],
             ),
             "",
         ]
@@ -694,6 +749,11 @@ def render_task_ledger(runs: list[dict[str, Any]]) -> str:
 
 def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: list[dict[str, str]], questions: list[str]) -> str:
     counts = run_status_counts(runs)
+    project_dir = project_root(Path(runs[0]["run_dir"]).parent.parent, runs[0]) if runs else None
+    watcher_state = "idle"
+    watcher_heartbeat = None
+    if project_dir is not None:
+        watcher_state, watcher_heartbeat = monitor_state(project_dir.parent.parent)
     rows: list[list[str]] = []
     active: list[dict[str, Any]] = []
     completed: list[dict[str, Any]] = []
@@ -702,6 +762,7 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
             [
                 str(run["run_id"]),
                 str(run.get("task_id") or "-"),
+                short_summary(str(run.get("summary") or "-")),
                 str(run.get("role") or "-"),
                 str(run.get("status") or "-"),
                 str(run.get("session_id") or "-"),
@@ -718,6 +779,7 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
         f"# {project_name} Dashboard",
         "",
         f"- Updated: `{utc_now()}`",
+        f"- Manager watcher: `{watcher_state}`",
         f"- Running: `{counts['running']}`",
         f"- Completed: `{counts['completed']}`",
         f"- Failed: `{counts['failed']}`",
@@ -726,13 +788,15 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
         "## Run Table",
         "",
         markdown_table(
-            ["run", "task", "role", "status", "session", "owned_paths", "launched"],
-            rows or [["-", "-", "-", "-", "-", "-", "-"]],
+            ["run", "task", "summary", "role", "status", "session", "owned_paths", "launched"],
+            rows or [["-", "-", "-", "-", "-", "-", "-", "-"]],
         ),
         "",
         "## Active Runs",
         "",
     ]
+    if watcher_heartbeat:
+        lines.insert(3, f"- Last watcher heartbeat: `{watcher_heartbeat}`")
     if not active:
         lines.append("_No active runs._")
     else:
@@ -743,6 +807,7 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
                     f"### {run['run_id']}",
                     "",
                     f"- Task: `{run.get('task_id') or '-'}`",
+                    f"- Summary: {run.get('summary') or '-'}",
                     f"- Role: `{run.get('role') or '-'}`",
                     f"- Session: `{run.get('session_id') or '-'}`",
                     f"- Owned paths: {format_inline_list(relative_owned_paths(run))}",
@@ -759,6 +824,8 @@ def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: l
             lines.extend(
                 [
                     f"### {run['run_id']}",
+                    "",
+                    f"_Summary: {run.get('summary') or '-'}_",
                     "",
                     preview_text(last_message_for_run(run)),
                     "",
@@ -818,6 +885,8 @@ def render_manager_summary(project_name: str, runs: list[dict[str, Any]], confli
             lines.extend(
                 [
                     f"### {run['run_id']} ({run.get('status') or '-'})",
+                    "",
+                    f"_Summary: {run.get('summary') or '-'}_",
                     "",
                     preview_text(last_message_for_run(run), max_lines=5, max_chars=500),
                     "",
@@ -879,6 +948,7 @@ def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list
                 f"# {run['run_id']}",
                 "",
                 f"- Task: `{run.get('task_id') or run['run_id']}`",
+                f"- Summary: {run.get('summary') or '-'}",
                 f"- Role: `{run.get('role') or '-'}`",
                 f"- Status: `{run.get('status') or '-'}`",
                 f"- Session: `{run.get('session_id') or '-'}`",
@@ -928,7 +998,8 @@ def sync_projects(root: Path, index: dict[str, Any]) -> None:
                 continue
             seen.add(question)
             deduped_questions.append(question)
-        write_text(project_dir / "project.md", render_project_overview(project_name, project_dir, runs))
+        delete_if_exists(project_dir / "project.md")
+        write_text(project_dir / "README.md", render_project_overview(project_name, project_dir, runs))
         write_text(project_dir / "tasks.md", render_task_ledger(runs))
         write_text(
             project_dir / "dashboard.md",
@@ -1053,6 +1124,65 @@ def pid_alive(pid: int | None) -> bool:
         return False
 
 
+def monitor_pid_path(root: Path) -> Path:
+    return root / "monitor.pid"
+
+
+def monitor_heartbeat_path(root: Path) -> Path:
+    return root / "monitor.heartbeat"
+
+
+def read_pid_file(path: Path) -> int | None:
+    value = read_text_if_exists(path)
+    if not value:
+        return None
+    text = value.strip()
+    if not text.isdigit():
+        return None
+    return int(text)
+
+
+def index_has_active_runs(index: dict[str, Any]) -> bool:
+    for run in index["runs"]:
+        if str(run.get("status") or "") == "running":
+            return True
+        if pid_alive(run.get("pid")):
+            return True
+    return False
+
+
+def ensure_monitor(root: Path, index: dict[str, Any]) -> None:
+    if not index_has_active_runs(index):
+        return
+    pid_path = monitor_pid_path(root)
+    current_pid = read_pid_file(pid_path)
+    if current_pid and pid_alive(current_pid):
+        return
+    delete_if_exists(pid_path)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "monitor",
+            "--root",
+            str(root),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=str(root),
+        start_new_session=True,
+    )
+    write_text(pid_path, f"{process.pid}\n")
+
+
+def monitor_state(root: Path) -> tuple[str, str | None]:
+    pid = read_pid_file(monitor_pid_path(root))
+    heartbeat = normalize_optional_text(read_text_if_exists(monitor_heartbeat_path(root)))
+    if pid and pid_alive(pid):
+        return "active", heartbeat
+    return "idle", heartbeat
+
+
 def run_has_provider_artifacts(run: dict[str, Any]) -> bool:
     status = str(run.get("status") or "")
     if status in {"dry-run", "prepared"}:
@@ -1122,17 +1252,20 @@ def print_run_summary(run: dict[str, Any]) -> None:
     session_id = get_session_id(run) or "-"
     exit_code = run.get("exit_code")
     exit_text = str(exit_code) if exit_code is not None else "-"
+    task_text = str(run.get("task_id") or "-")
+    summary_text = short_summary(str(run.get("summary") or "-"), max_chars=42)
     print(
         f"{run['run_id']:<30} {run['status']:<10} provider={run.get('provider', DEFAULT_PROVIDER):<6} "
-        f"pid={run.get('pid') or '-':<8} exit={exit_text:<4} session={session_id}"
+        f"pid={run.get('pid') or '-':<8} exit={exit_text:<4} task={task_text:<18} "
+        f"session={session_id} summary={summary_text}"
     )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
-    ensure_root(root)
-    data = load_index(root)
-    save_index_and_sync(root, data)
+    with root_lock(root):
+        data = load_index(root)
+        save_index_and_sync(root, data)
     print(root)
     return 0
 
@@ -1210,6 +1343,7 @@ def materialize_run(
         "project_slug": project_slug(options.project) if options.project else None,
         "task_id": options.task_id,
         "role": options.role,
+        "summary": options.summary or derive_summary(options.prompt_text),
         "status": "dry-run" if options.dry_run else "prepared",
         "run_dir": str(run_dir),
         "cwd": str(options.cd),
@@ -1261,6 +1395,7 @@ def materialize_run(
 
     index["runs"].append(run)
     save_index_and_sync(root, index)
+    ensure_monitor(root, index)
     print_run_summary(run)
     return run
 
@@ -1281,6 +1416,7 @@ def common_dispatch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             project=normalize_optional_text(args.project),
             task_id=normalize_optional_text(args.task_id),
             role=normalize_optional_text(args.role),
+            summary=normalize_optional_text(args.summary),
             prompt_text=parse_prompt(args),
             cd=resolve_path(args.cd) if args.cd else Path.cwd(),
             sandbox=args.sandbox,
@@ -1305,8 +1441,9 @@ def common_dispatch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
-    index = load_index(root)
-    materialize_run(root, index, **common_dispatch_kwargs(args))
+    with root_lock(root):
+        index = load_index(root)
+        materialize_run(root, index, **common_dispatch_kwargs(args))
     return 0
 
 
@@ -1340,60 +1477,63 @@ def merged_prompt_spec(spec: dict[str, Any]) -> tuple[str | None, str | None]:
 
 def cmd_batch(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
-    index = load_index(root)
     manifest_path = resolve_path(args.file)
     specs = load_manifest(manifest_path)
 
-    for spec in specs:
-        prompt, prompt_file = merged_prompt_spec(spec)
-        temp_args = argparse.Namespace(**vars(args))
-        temp_args.name = spec.get("name", args.name)
-        temp_args.project = spec.get("project", args.project)
-        temp_args.task_id = spec.get("task_id", args.task_id)
-        temp_args.role = spec.get("role", args.role)
-        temp_args.prompt = prompt
-        temp_args.prompt_file = prompt_file
-        temp_args.provider = spec.get("provider", args.provider)
-        temp_args.cd = spec.get("cd", args.cd)
-        temp_args.sandbox = spec.get("sandbox", args.sandbox)
-        temp_args.model = spec.get("model", args.model)
-        temp_args.profile = spec.get("profile", args.profile)
-        temp_args.search = spec.get("search", args.search)
-        temp_args.skip_git_repo_check = spec.get(
-            "skip_git_repo_check", args.skip_git_repo_check
-        )
-        temp_args.ephemeral = spec.get("ephemeral", args.ephemeral)
-        temp_args.full_auto = spec.get("full_auto", args.full_auto)
-        temp_args.dangerous = spec.get("dangerous", args.dangerous)
-        temp_args.add_dir = spec.get("add_dirs", args.add_dir)
-        temp_args.config = spec.get("configs", args.config)
-        temp_args.enable = spec.get("enables", args.enable)
-        temp_args.disable = spec.get("disables", args.disable)
-        temp_args.image = spec.get("images", args.image)
-        temp_args.owned_path = spec.get("owned_paths", args.owned_path)
-        temp_args.depends_on = spec.get("depends_on", args.depends_on)
-        materialize_run(root, index, **common_dispatch_kwargs(temp_args))
+    with root_lock(root):
+        index = load_index(root)
+        for spec in specs:
+            prompt, prompt_file = merged_prompt_spec(spec)
+            temp_args = argparse.Namespace(**vars(args))
+            temp_args.name = spec.get("name", args.name)
+            temp_args.project = spec.get("project", args.project)
+            temp_args.task_id = spec.get("task_id", args.task_id)
+            temp_args.role = spec.get("role", args.role)
+            temp_args.summary = spec.get("summary", args.summary)
+            temp_args.prompt = prompt
+            temp_args.prompt_file = prompt_file
+            temp_args.provider = spec.get("provider", args.provider)
+            temp_args.cd = spec.get("cd", args.cd)
+            temp_args.sandbox = spec.get("sandbox", args.sandbox)
+            temp_args.model = spec.get("model", args.model)
+            temp_args.profile = spec.get("profile", args.profile)
+            temp_args.search = spec.get("search", args.search)
+            temp_args.skip_git_repo_check = spec.get(
+                "skip_git_repo_check", args.skip_git_repo_check
+            )
+            temp_args.ephemeral = spec.get("ephemeral", args.ephemeral)
+            temp_args.full_auto = spec.get("full_auto", args.full_auto)
+            temp_args.dangerous = spec.get("dangerous", args.dangerous)
+            temp_args.add_dir = spec.get("add_dirs", args.add_dir)
+            temp_args.config = spec.get("configs", args.config)
+            temp_args.enable = spec.get("enables", args.enable)
+            temp_args.disable = spec.get("disables", args.disable)
+            temp_args.image = spec.get("images", args.image)
+            temp_args.owned_path = spec.get("owned_paths", args.owned_path)
+            temp_args.depends_on = spec.get("depends_on", args.depends_on)
+            materialize_run(root, index, **common_dispatch_kwargs(temp_args))
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
-    index = load_index(root)
-    for run in index["runs"]:
-        refresh_run(run)
-    save_index_and_sync(root, index)
-    runs = index["runs"]
-    if args.project:
-        project_filter = args.project.strip().lower()
-        runs = [
-            run
-            for run in runs
-            if project_filter
-            in {
-                str(run.get("project") or "").strip().lower(),
-                str(run.get("project_slug") or "").strip().lower(),
-            }
-        ]
+    with root_lock(root):
+        index = load_index(root)
+        for run in index["runs"]:
+            refresh_run(run)
+        save_index_and_sync(root, index)
+        runs = index["runs"]
+        if args.project:
+            project_filter = args.project.strip().lower()
+            runs = [
+                run
+                for run in runs
+                if project_filter
+                in {
+                    str(run.get("project") or "").strip().lower(),
+                    str(run.get("project_slug") or "").strip().lower(),
+                }
+            ]
     if args.json:
         print(json.dumps(runs, ensure_ascii=True, indent=2))
         return 0
@@ -1407,12 +1547,13 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_show(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
-    index = load_index(root)
-    run = resolve_run(index, args.run)
-    refresh_run(run)
-    save_index_and_sync(root, index)
+    with root_lock(root):
+        index = load_index(root)
+        run = resolve_run(index, args.run)
+        refresh_run(run)
+        save_index_and_sync(root, index)
+        last_message = read_text_if_exists(Path(run["last_message_path"]))
     print(json.dumps(run, ensure_ascii=True, indent=2, sort_keys=True))
-    last_message = read_text_if_exists(Path(run["last_message_path"]))
     if last_message:
         print()
         print(last_message.rstrip())
@@ -1421,11 +1562,12 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 def cmd_tail(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
-    index = load_index(root)
-    run = resolve_run(index, args.run)
-    refresh_run(run)
-    save_index_and_sync(root, index)
-    path = Path(run["stderr_log"] if args.stderr else run["stdout_jsonl"])
+    with root_lock(root):
+        index = load_index(root)
+        run = resolve_run(index, args.run)
+        refresh_run(run)
+        save_index_and_sync(root, index)
+        path = Path(run["stderr_log"] if args.stderr else run["stdout_jsonl"])
     if not path.exists():
         print(f"missing log: {path}", file=sys.stderr)
         return 1
@@ -1437,52 +1579,83 @@ def cmd_tail(args: argparse.Namespace) -> int:
 
 def cmd_resume_cmd(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
-    index = load_index(root)
-    run = resolve_run(index, args.run)
-    refresh_run(run)
-    save_index_and_sync(root, index)
-    print(provider_for_run(run).build_resume_command(run, args.exec))
+    with root_lock(root):
+        index = load_index(root)
+        run = resolve_run(index, args.run)
+        refresh_run(run)
+        save_index_and_sync(root, index)
+        command = provider_for_run(run).build_resume_command(run, args.exec)
+    print(command)
     return 0
 
 
 def cmd_attach_session(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
-    index = load_index(root)
-    run = resolve_run(index, args.run)
-    set_session_id(run, args.session_id)
-    save_index_and_sync(root, index)
+    with root_lock(root):
+        index = load_index(root)
+        run = resolve_run(index, args.run)
+        set_session_id(run, args.session_id)
+        save_index_and_sync(root, index)
     print(f"{run['run_id']} -> {args.session_id}")
     return 0
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
-    index = load_index(root)
-    targets = [resolve_run(index, args.run)] if args.run else index["runs"]
+    with root_lock(root):
+        index = load_index(root)
+        targets = [resolve_run(index, args.run)] if args.run else index["runs"]
+        for run in targets:
+            refresh_run(run)
+        save_index_and_sync(root, index)
     for run in targets:
-        refresh_run(run)
         print_run_summary(run)
-    save_index_and_sync(root, index)
     return 0
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
-    index = load_index(root)
-    run = resolve_run(index, args.run)
-    refresh_run(run)
-    pid = run.get("pid")
-    if not pid or not pid_alive(pid):
-        raise RuntimeError("run is not currently alive")
-    sig = signal.SIGKILL if args.force else signal.SIGTERM
-    os.killpg(pid, sig)
-    run["status"] = "cancelled"
-    run["finished_at"] = utc_now()
-    run_dir = Path(run["run_dir"])
-    write_text(run_dir / "state.txt", "cancelled\n")
-    write_text(run_dir / "finished_at.txt", run["finished_at"] + "\n")
-    save_index_and_sync(root, index)
+    with root_lock(root):
+        index = load_index(root)
+        run = resolve_run(index, args.run)
+        refresh_run(run)
+        pid = run.get("pid")
+        if not pid or not pid_alive(pid):
+            raise RuntimeError("run is not currently alive")
+        sig = signal.SIGKILL if args.force else signal.SIGTERM
+        os.killpg(pid, sig)
+        run["status"] = "cancelled"
+        run["finished_at"] = utc_now()
+        run_dir = Path(run["run_dir"])
+        write_text(run_dir / "state.txt", "cancelled\n")
+        write_text(run_dir / "finished_at.txt", run["finished_at"] + "\n")
+        save_index_and_sync(root, index)
     print_run_summary(run)
+    return 0
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    root = resolve_path(args.root) if args.root else default_root()
+    pid_path = monitor_pid_path(root)
+    heartbeat_path = monitor_heartbeat_path(root)
+    current_pid = os.getpid()
+    write_text(pid_path, f"{current_pid}\n")
+    try:
+        while True:
+            with root_lock(root):
+                index = load_index(root)
+                for run in index["runs"]:
+                    refresh_run(run)
+                save_index_and_sync(root, index)
+                write_text(heartbeat_path, utc_now() + "\n")
+                if not index_has_active_runs(index):
+                    break
+            time.sleep(max(1, int(args.interval)))
+    finally:
+        with root_lock(root):
+            if read_pid_file(pid_path) == current_pid:
+                delete_if_exists(pid_path)
+                delete_if_exists(heartbeat_path)
     return 0
 
 
@@ -1498,6 +1671,7 @@ def add_common_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", help="Project name for automatic markdown aggregation and dashboards")
     parser.add_argument("--task-id", help="Stable task id inside the project workspace")
     parser.add_argument("--role", help="Worker role such as research, implementation, reviewer, or manager")
+    parser.add_argument("--summary", help="Short human-readable summary of what this child session is working on")
     parser.add_argument("--prompt", help="Prompt text for the child session")
     parser.add_argument("--prompt-file", help="Path to a prompt file for the child session")
     parser.add_argument("--cd", help="Working directory for the child session")
@@ -1599,6 +1773,11 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
     cancel_p.add_argument("--force", action="store_true", help="Use SIGKILL instead of SIGTERM")
     cancel_p.set_defaults(func=cmd_cancel)
+
+    monitor_p = sub.add_parser("monitor", help=argparse.SUPPRESS)
+    monitor_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
+    monitor_p.add_argument("--interval", type=int, default=2, help=argparse.SUPPRESS)
+    monitor_p.set_defaults(func=cmd_monitor)
 
     return parser
 

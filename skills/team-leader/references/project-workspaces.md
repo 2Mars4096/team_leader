@@ -10,8 +10,8 @@ Project-linked runs are synced into:
 
 The manager keeps these files current:
 
-- `project.md`: project metadata and file map
-- `dashboard.md`: live run table and recent output preview
+- `README.md`: default landing page and file map
+- `dashboard.md`: live run table, watcher status, and recent output preview
 - `tasks.md`: task-oriented ledger
 - `manager-summary.md`: concise aggregate snapshot
 - `questions.md`: human-facing questions and blockers
@@ -24,6 +24,7 @@ For every meaningful child run, set:
 
 - `--project`
 - `--task-id`
+- `--summary`
 - `--role`
 - `--owned-path` for any writer
 - `--depends-on` for tasks that should not start yet
@@ -34,11 +35,14 @@ Without that metadata, the dashboard is still usable, but the task ledger and co
 
 Treat the markdown files as the control surface:
 
+- read `README.md` first as the default landing page
 - read `dashboard.md` first for live progress
 - read `tasks.md` for assignment state
 - read `questions.md` before asking the human anything
 - read `conflicts.md` before launching overlapping writers
 - read `reports/<run-id>.md` when a specific child needs closer review
+
+While children are active, the manager refreshes these files automatically in the background.
 
 ## Conflict Caveat
 

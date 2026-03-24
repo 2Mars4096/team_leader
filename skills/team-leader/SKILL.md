@@ -1,9 +1,9 @@
 ---
-name: codex-subsession-manager
-description: Use when a user wants Codex to launch, track, resume, cancel, or coordinate real child Codex sessions as managed subsessions, especially when each child should keep full Codex capabilities rather than acting like a lightweight built-in subagent.
+name: team-leader
+description: Use when a user wants a team-leader style Codex manager that launches, tracks, reviews, and aggregates real child Codex sessions, especially when each child should keep full Codex capabilities rather than acting like a lightweight built-in subagent.
 ---
 
-# Codex Subsession Manager
+# Team Leader
 
 ## Overview
 
@@ -11,9 +11,9 @@ This skill manages real child sessions through a provider adapter layer, with `c
 
 Treat a subsession as a full Codex worker with its own thread, context window, tool use, and follow-up lifecycle. This is more flexible than a lightweight in-process subagent because a child session can keep working independently, be resumed later, and itself act as a manager when useful.
 
-Use the control script in `scripts/codex_subsession_manager.py` instead of ad hoc shell fragments. It stores a local `.agent-subsessions/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. If an older `.codex-subsessions/` directory already exists, the script will keep using it.
+Use the control script in `scripts/team_leader.py` instead of ad hoc shell fragments. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.agent-subsessions/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. If an older `.codex-subsessions/` directory already exists, the script will keep using it.
 
-When runs are linked to a project, the script also maintains a central markdown workspace under `.agent-subsessions/projects/<project>/` with a dashboard, task ledger, manager summary, questions for humans, conflict-risk notes, and one child report per run.
+When runs are linked to a project, the script also maintains a central markdown workspace under `.agent-subsessions/projects/<project>/` with a default `README.md` landing page, a live dashboard, task ledger, manager summary, questions for humans, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
 
 Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
 
@@ -43,7 +43,7 @@ Subsessions in this skill are separate Codex sessions:
 ### 1. Initialize the controller directory
 
 ```bash
-python3 scripts/codex_subsession_manager.py init
+python3 scripts/team_leader.py init
 ```
 
 This creates `.agent-subsessions/` in the current working directory unless a legacy `.codex-subsessions/` directory already exists.
@@ -53,9 +53,10 @@ This creates `.agent-subsessions/` in the current working directory unless a leg
 Use a direct prompt:
 
 ```bash
-python3 scripts/codex_subsession_manager.py dispatch \
+python3 scripts/team_leader.py dispatch \
   --provider codex \
   --name api-audit \
+  --summary "Audit the API layer for auth and caching risks" \
   --full-auto \
   --sandbox read-only \
   --prompt "Audit the API layer for auth and caching risks. Do not edit files. Return findings only."
@@ -64,9 +65,10 @@ python3 scripts/codex_subsession_manager.py dispatch \
 Use a prompt file for longer instructions:
 
 ```bash
-python3 scripts/codex_subsession_manager.py dispatch \
+python3 scripts/team_leader.py dispatch \
   --provider codex \
   --name ui-refactor \
+  --summary "Refactor the UI flow for the checkout screen" \
   --full-auto \
   --sandbox workspace-write \
   --prompt-file /tmp/ui-refactor-prompt.md
@@ -77,10 +79,11 @@ Each run gets its own directory under `.agent-subsessions/runs/`.
 For project-managed work, attach the run to a project and task id:
 
 ```bash
-python3 scripts/codex_subsession_manager.py dispatch \
+python3 scripts/team_leader.py dispatch \
   --provider codex \
   --project payments-migration \
   --task-id review-api \
+  --summary "Review API changes before implementation starts" \
   --role reviewer \
   --owned-path services/api \
   --depends-on plan-approved \
@@ -95,15 +98,16 @@ That project link is what enables automatic markdown aggregation and progress vi
 ### 3. Track progress
 
 ```bash
-python3 scripts/codex_subsession_manager.py status
-python3 scripts/codex_subsession_manager.py show 20260324-120000-ui-refactor
-python3 scripts/codex_subsession_manager.py tail 20260324-120000-ui-refactor
+python3 scripts/team_leader.py status
+python3 scripts/team_leader.py show 20260324-120000-ui-refactor
+python3 scripts/team_leader.py tail 20260324-120000-ui-refactor
 ```
 
-`status` refreshes run metadata, including completion state and detected session IDs.
+`status` refreshes run metadata, including completion state and detected session IDs. The project markdown workspace also refreshes automatically while children are running, so you do not have to poll manually just to keep `dashboard.md` current.
 
 For project-linked runs, the manager also updates:
 
+- `projects/<project>/README.md`
 - `projects/<project>/dashboard.md`
 - `projects/<project>/tasks.md`
 - `projects/<project>/manager-summary.md`
@@ -116,7 +120,7 @@ For project-linked runs, the manager also updates:
 Print a ready-to-run resume command:
 
 ```bash
-python3 scripts/codex_subsession_manager.py resume-cmd 20260324-120000-ui-refactor
+python3 scripts/team_leader.py resume-cmd 20260324-120000-ui-refactor
 ```
 
 This prints an interactive provider resume command anchored to the original working directory. For the current Codex adapter, that command is `codex resume <thread-id>`.
@@ -124,13 +128,13 @@ This prints an interactive provider resume command anchored to the original work
 For non-interactive follow-up:
 
 ```bash
-python3 scripts/codex_subsession_manager.py resume-cmd 20260324-120000-ui-refactor --exec
+python3 scripts/team_leader.py resume-cmd 20260324-120000-ui-refactor --exec
 ```
 
 ### 5. Cancel when needed
 
 ```bash
-python3 scripts/codex_subsession_manager.py cancel 20260324-120000-ui-refactor
+python3 scripts/team_leader.py cancel 20260324-120000-ui-refactor
 ```
 
 Use `--force` to send `SIGKILL` instead of `SIGTERM`.
@@ -140,16 +144,17 @@ Use `--force` to send `SIGKILL` instead of `SIGTERM`.
 For multiple children, create a JSON manifest and dispatch in one command:
 
 ```bash
-python3 scripts/codex_subsession_manager.py batch --file references/example_manifest.json --dry-run
+python3 scripts/team_leader.py batch --file references/example_manifest.json --dry-run
 ```
 
-Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions. Read `references/project-workspaces.md` when you want the central-folder workflow and automatic markdown collection behavior. Use `python3 scripts/codex_subsession_manager.py providers` to inspect the adapters currently available in the script, or `providers --json` when you need machine-readable provider capability details.
+Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions. Read `references/project-workspaces.md` when you want the central-folder workflow and automatic markdown collection behavior. Use `python3 scripts/team_leader.py providers` to inspect the adapters currently available in the script, or `providers --json` when you need machine-readable provider capability details.
 
 ## Prompting Guidance
 
 Every child prompt should include:
 
 - Objective: the concrete outcome
+- Summary title: one short line the manager can show in tables and dashboards
 - Scope: exact files, modules, or investigation area
 - Write boundary: whether the child may edit files, and if so which ones
 - Validation: tests, checks, or evidence expectations
@@ -163,14 +168,14 @@ Populate `--owned-path` when a child is allowed to write. The project workspace 
 
 - Prefer `--sandbox read-only` for research-only children
 - Prefer `--sandbox workspace-write --full-auto` for normal autonomous implementation children
-- Prefer linking every meaningful child to `--project`, `--task-id`, and `--role` so the markdown dashboard remains useful
+- Prefer linking every meaningful child to `--project`, `--task-id`, `--summary`, and `--role` so the markdown dashboard remains useful
 - Use `--add-dir` for extra writable paths outside the main repo root
 - Use `--skip-git-repo-check` if a child must run outside a Git repository
 - Use `attach-session` if auto-detection misses a session ID and you need a stable resume handle
 - Use `attach-thread` as a Codex-specific compatibility alias
 - Use `reconcile` to backfill session IDs after runs finish
 - When adding another CLI later, preserve the registry and run commands; only add a new adapter and keep provider branching out of the shared lifecycle code
-- Use the project markdown files as the manager-facing UI: `dashboard.md` for progress, `tasks.md` for assignment state, `questions.md` for escalation, and `manager-summary.md` for the latest aggregate snapshot
+- Use `README.md` as the default landing page for a project workspace, then open `dashboard.md` for live progress, `tasks.md` for assignment state, `questions.md` for escalation, and `manager-summary.md` for the latest aggregate snapshot
 
 ## Guardrails
 
