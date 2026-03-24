@@ -15,6 +15,8 @@ Use the control script in `scripts/codex_subsession_manager.py` instead of ad ho
 
 Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
 
+Keep provider-specific logic inside the adapter layer: option validation, launch command construction, session detection, and resume command generation. Read `references/provider-adapters.md` when you need to extend the script beyond Codex.
+
 ## When To Use
 
 - Launch one or more long-running Codex child sessions from a manager session
@@ -112,7 +114,7 @@ For multiple children, create a JSON manifest and dispatch in one command:
 python3 scripts/codex_subsession_manager.py batch --file references/example_manifest.json --dry-run
 ```
 
-Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions. Use `python3 scripts/codex_subsession_manager.py providers` to inspect the adapters currently available in the script.
+Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions. Use `python3 scripts/codex_subsession_manager.py providers` to inspect the adapters currently available in the script, or `providers --json` when you need machine-readable provider capability details.
 
 ## Prompting Guidance
 
@@ -135,6 +137,7 @@ When running multiple writers in parallel, assign disjoint file ownership. If th
 - Use `attach-session` if auto-detection misses a session ID and you need a stable resume handle
 - Use `attach-thread` as a Codex-specific compatibility alias
 - Use `reconcile` to backfill session IDs after runs finish
+- When adding another CLI later, preserve the registry and run commands; only add a new adapter and keep provider branching out of the shared lifecycle code
 
 ## Guardrails
 

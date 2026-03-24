@@ -8,6 +8,8 @@ Codex-first skills for running real child CLI sessions as managed subsessions.
 
 The current implementation ships with a `codex` provider adapter and a control plane that is structured so later adapters can target other CLIs without changing the run registry format.
 
+The controller keeps provider-specific behavior at the adapter boundary: option validation, command construction, session-id detection, and resume command generation. That keeps the run registry and batch manifest format stable when a later `claude`, `cursor`, or other CLI adapter is added.
+
 ## Install After Pushing
 
 ```bash

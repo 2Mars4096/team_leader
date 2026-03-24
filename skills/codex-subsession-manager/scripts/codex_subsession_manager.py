@@ -91,14 +91,88 @@ class DispatchOptions:
 
 
 @dataclass(frozen=True)
+class ProviderCapabilities:
+    sandbox_modes: tuple[str, ...] = ()
+    supports_search: bool = False
+    supports_skip_git_repo_check: bool = False
+    supports_ephemeral: bool = False
+    supports_full_auto: bool = False
+    supports_dangerous: bool = False
+    supports_model: bool = False
+    supports_profile: bool = False
+    supports_add_dir: bool = False
+    supports_config: bool = False
+    supports_enable_disable: bool = False
+    supports_images: bool = False
+    supports_exec_resume: bool = False
+
+
+@dataclass(frozen=True)
 class ProviderAdapter:
     name: str
     session_label: str
     bin_env_var: str
     default_bin: str
+    capabilities: ProviderCapabilities
 
     def resolved_bin(self) -> str:
         return os.environ.get(self.bin_env_var, self.default_bin)
+
+    def validate_options(self, options: DispatchOptions) -> None:
+        capabilities = self.capabilities
+        if options.sandbox:
+            if not capabilities.sandbox_modes:
+                raise RuntimeError(f"provider {self.name} does not support --sandbox")
+            if options.sandbox not in capabilities.sandbox_modes:
+                supported = ", ".join(capabilities.sandbox_modes)
+                raise RuntimeError(
+                    f"provider {self.name} does not support sandbox {options.sandbox!r}. "
+                    f"supported values: {supported}"
+                )
+        if options.model and not capabilities.supports_model:
+            raise RuntimeError(f"provider {self.name} does not support --model")
+        if options.profile and not capabilities.supports_profile:
+            raise RuntimeError(f"provider {self.name} does not support --profile")
+        if options.add_dirs and not capabilities.supports_add_dir:
+            raise RuntimeError(f"provider {self.name} does not support --add-dir")
+        if options.configs and not capabilities.supports_config:
+            raise RuntimeError(f"provider {self.name} does not support --config")
+        if (options.enables or options.disables) and not capabilities.supports_enable_disable:
+            raise RuntimeError(f"provider {self.name} does not support --enable/--disable")
+        if options.images and not capabilities.supports_images:
+            raise RuntimeError(f"provider {self.name} does not support --image")
+        if options.search and not capabilities.supports_search:
+            raise RuntimeError(f"provider {self.name} does not support --search")
+        if options.skip_git_repo_check and not capabilities.supports_skip_git_repo_check:
+            raise RuntimeError(f"provider {self.name} does not support --skip-git-repo-check")
+        if options.ephemeral and not capabilities.supports_ephemeral:
+            raise RuntimeError(f"provider {self.name} does not support --ephemeral")
+        if options.full_auto and not capabilities.supports_full_auto:
+            raise RuntimeError(f"provider {self.name} does not support --full-auto")
+        if options.dangerous and not capabilities.supports_dangerous:
+            raise RuntimeError(f"provider {self.name} does not support --dangerous")
+
+    def describe(self) -> dict[str, Any]:
+        capabilities = self.capabilities
+        return {
+            "name": self.name,
+            "session_label": self.session_label,
+            "bin_env_var": self.bin_env_var,
+            "default_bin": self.default_bin,
+            "supported_sandbox_modes": list(capabilities.sandbox_modes),
+            "supports_search": capabilities.supports_search,
+            "supports_skip_git_repo_check": capabilities.supports_skip_git_repo_check,
+            "supports_ephemeral": capabilities.supports_ephemeral,
+            "supports_full_auto": capabilities.supports_full_auto,
+            "supports_dangerous": capabilities.supports_dangerous,
+            "supports_model": capabilities.supports_model,
+            "supports_profile": capabilities.supports_profile,
+            "supports_add_dir": capabilities.supports_add_dir,
+            "supports_config": capabilities.supports_config,
+            "supports_enable_disable": capabilities.supports_enable_disable,
+            "supports_images": capabilities.supports_images,
+            "supports_exec_resume": capabilities.supports_exec_resume,
+        }
 
     def build_exec_command(
         self,
@@ -123,6 +197,21 @@ class CodexProvider(ProviderAdapter):
             session_label="thread",
             bin_env_var="CODEX_BIN",
             default_bin="codex",
+            capabilities=ProviderCapabilities(
+                sandbox_modes=("read-only", "workspace-write", "danger-full-access"),
+                supports_search=True,
+                supports_skip_git_repo_check=True,
+                supports_ephemeral=True,
+                supports_full_auto=True,
+                supports_dangerous=True,
+                supports_model=True,
+                supports_profile=True,
+                supports_add_dir=True,
+                supports_config=True,
+                supports_enable_disable=True,
+                supports_images=True,
+                supports_exec_resume=True,
+            ),
         )
 
     def build_exec_command(
@@ -188,10 +277,13 @@ class CodexProvider(ProviderAdapter):
         session_id = get_session_id(run)
         if not session_id:
             raise RuntimeError("run has no detected session_id; use reconcile or attach-session first")
+        if exec_mode and not self.capabilities.supports_exec_resume:
+            raise RuntimeError(f"provider {self.name} does not support non-interactive resume")
         cwd = shlex.quote(run["cwd"])
+        provider_bin = shlex.quote(self.resolved_bin())
         if exec_mode:
-            return f"cd {cwd} && codex exec resume {shlex.quote(session_id)} -"
-        return f"cd {cwd} && codex resume {shlex.quote(session_id)}"
+            return f"cd {cwd} && {provider_bin} exec resume {shlex.quote(session_id)} -"
+        return f"cd {cwd} && {provider_bin} resume {shlex.quote(session_id)}"
 
 
 PROVIDERS: dict[str, ProviderAdapter] = {
@@ -388,6 +480,19 @@ def pid_alive(pid: int | None) -> bool:
         return False
 
 
+def run_has_provider_artifacts(run: dict[str, Any]) -> bool:
+    status = str(run.get("status") or "")
+    if status in {"dry-run", "prepared"}:
+        return False
+    run_dir = Path(run["run_dir"])
+    stdout_path = Path(run["stdout_path"])
+    if stdout_path.exists():
+        return True
+    if (run_dir / "state.txt").exists():
+        return True
+    return bool(run.get("pid"))
+
+
 def refresh_run(run: dict[str, Any]) -> None:
     run_dir = Path(run["run_dir"])
     state = read_text_if_exists(run_dir / "state.txt")
@@ -403,7 +508,7 @@ def refresh_run(run: dict[str, Any]) -> None:
         run["exit_code"] = int(exit_code.strip())
     if finished_at:
         run["finished_at"] = finished_at.strip()
-    if not get_session_id(run):
+    if run_has_provider_artifacts(run) and not get_session_id(run):
         session_id = provider_for_run(run).detect_session_id(run)
         if session_id:
             set_session_id(run, session_id)
@@ -459,13 +564,23 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_providers(_args: argparse.Namespace) -> int:
+def cmd_providers(args: argparse.Namespace) -> int:
+    payload = []
     for name in sorted(PROVIDERS):
         adapter = PROVIDERS[name]
-        suffix = " (default)" if name == DEFAULT_PROVIDER else ""
+        record = adapter.describe()
+        record["default"] = name == DEFAULT_PROVIDER
+        payload.append(record)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+        return 0
+    for record in payload:
+        suffix = " (default)" if record["default"] else ""
+        sandboxes = ",".join(record["supported_sandbox_modes"]) or "-"
         print(
-            f"{adapter.name}{suffix}: session_label={adapter.session_label} "
-            f"bin_env={adapter.bin_env_var} default_bin={adapter.default_bin}"
+            f"{record['name']}{suffix}: session_label={record['session_label']} "
+            f"bin_env={record['bin_env_var']} default_bin={record['default_bin']} "
+            f"sandboxes={sandboxes} exec_resume={str(record['supports_exec_resume']).lower()}"
         )
     return 0
 
@@ -477,6 +592,7 @@ def materialize_run(
 ) -> dict[str, Any]:
     ensure_root(root)
     adapter = get_provider(options.provider)
+    adapter.validate_options(options)
     run_id = make_run_id({run["run_id"] for run in index["runs"]}, options.name)
     run_dir = root / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -783,16 +899,15 @@ def add_common_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cd", help="Working directory for the child session")
     parser.add_argument(
         "--sandbox",
-        choices=["read-only", "workspace-write", "danger-full-access"],
-        help="Sandbox mode for the child session. This currently maps directly to Codex.",
+        help="Sandbox mode for the child session. Values are validated by the selected provider adapter.",
     )
     parser.add_argument("--model", help="Provider model override")
     parser.add_argument("--profile", help="Provider profile override")
-    parser.add_argument("--add-dir", action="append", default=[], help="Additional writable directory")
+    parser.add_argument("--add-dir", action="append", default=[], help="Additional writable directory where supported")
     parser.add_argument("--config", action="append", default=[], help="Pass through provider --config")
     parser.add_argument("--enable", action="append", default=[], help="Pass through provider --enable")
     parser.add_argument("--disable", action="append", default=[], help="Pass through provider --disable")
-    parser.add_argument("--image", action="append", default=[], help="Image path to attach")
+    parser.add_argument("--image", action="append", default=[], help="Image path to attach where supported")
     parser.add_argument("--search", action="store_true", help="Enable provider live web search where supported")
     parser.add_argument(
         "--skip-git-repo-check",
@@ -820,6 +935,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_p.set_defaults(func=cmd_init)
 
     providers_p = sub.add_parser("providers", help="List supported provider adapters")
+    providers_p.add_argument("--json", action="store_true", help="Print provider metadata as JSON")
     providers_p.set_defaults(func=cmd_providers)
 
     dispatch_p = sub.add_parser("dispatch", help="Dispatch one child session")
@@ -868,12 +984,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     reconcile_p = sub.add_parser("reconcile", help="Refresh run statuses and infer missing session ids")
     reconcile_p.add_argument("run", nargs="?", help="Optional run id or unique prefix")
-    reconcile_p.add_argument("--root", help="Controller root directory (default: ./.codex-subsessions)")
+    reconcile_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
     reconcile_p.set_defaults(func=cmd_reconcile)
 
     cancel_p = sub.add_parser("cancel", help="Cancel a running child session")
     cancel_p.add_argument("run", help="Run id or unique prefix")
-    cancel_p.add_argument("--root", help="Controller root directory (default: ./.codex-subsessions)")
+    cancel_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
     cancel_p.add_argument("--force", action="store_true", help="Use SIGKILL instead of SIGTERM")
     cancel_p.set_defaults(func=cmd_cancel)
 
