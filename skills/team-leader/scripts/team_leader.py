@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import json
 import os
+import os.path
 import re
 import shlex
 import signal
@@ -371,6 +372,9 @@ class CodexProvider(ProviderAdapter):
         json_candidates = read_jsonl_candidates(stdout_path)
         if json_candidates:
             return json_candidates[0]
+        provider_bin = normalize_optional_text(run.get("provider_bin")) or self.resolved_bin()
+        if os.path.basename(provider_bin) != "codex":
+            return None
         known = known_thread_ids()
         for candidate in infer_thread_ids_from_logs(int(run["started_epoch"])):
             if candidate in known:
@@ -447,6 +451,7 @@ def load_index(root: Path) -> dict[str, Any]:
         if not isinstance(run, dict):
             continue
         run.setdefault("provider", DEFAULT_PROVIDER)
+        run.setdefault("provider_bin", None)
         run.setdefault("stdout_path", run.get("stdout_jsonl"))
         run.setdefault("project", None)
         run.setdefault("project_slug", None)
@@ -3680,6 +3685,7 @@ def materialize_run(
         "run_id": run_id,
         "name": options.name or run_id,
         "provider": adapter.name,
+        "provider_bin": adapter.resolved_bin(),
         "project": options.project,
         "project_slug": project_slug(options.project) if options.project else None,
         "task_id": options.task_id,
