@@ -3953,7 +3953,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_watch(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     project_name = args.project.strip()
-    use_alt_screen = sys.stdout.isatty() and not args.no_clear and not args.no_alt_screen
+    is_tty = sys.stdout.isatty()
+    should_clear = is_tty and not args.no_clear
+    use_alt_screen = should_clear and not args.no_alt_screen
     last_view: str | None = None
     if use_alt_screen:
         print("\033[?1049h\033[H", end="", flush=True)
@@ -3969,7 +3971,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 active = any(str(run.get("status") or "") == "running" for run in runs)
                 blocked = any(str(run.get("dispatch_state") or "") == "blocked" for run in runs)
             if view != last_view or args.once:
-                if not args.no_clear:
+                if should_clear:
                     print("\033[2J\033[H", end="")
                 print(view)
                 last_view = view
