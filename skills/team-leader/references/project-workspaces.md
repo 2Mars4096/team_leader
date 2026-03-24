@@ -8,6 +8,8 @@ Project-linked runs are synced into:
 
 `<controller-root>/projects/<project>/`
 
+The default controller root is now `.team-leader/`. Older `.agent-subsessions/` and `.codex-subsessions/` roots are still recognized automatically.
+
 The manager keeps these files current:
 
 - `README.md`: default landing page and file map
@@ -46,6 +48,12 @@ Treat the markdown files as the control surface:
 - read `reports/<run-id>.md` when a specific child needs closer review
 
 While children are active, the manager refreshes these files automatically in the background. Tasks with `--depends-on` stay blocked until their prerequisites complete, then the manager launches the next wave automatically.
+
+If you want to stay inside Codex instead of opening the folder, run:
+
+`python3 scripts/team_leader.py status --project <project>`
+
+That prints the same high-signal view directly in the terminal, plus exact file paths for the workspace, landing page, and dashboard.
 
 ## Conflict Caveat
 

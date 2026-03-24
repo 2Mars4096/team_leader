@@ -26,8 +26,9 @@ UUID_RE = re.compile(
 )
 INDEX_VERSION = 3
 DEFAULT_PROVIDER = "codex"
-GENERIC_ROOT_NAME = ".agent-subsessions"
-LEGACY_ROOT_NAME = ".codex-subsessions"
+DEFAULT_ROOT_NAME = ".team-leader"
+LEGACY_ROOT_NAMES = (".agent-subsessions", ".codex-subsessions")
+LEGACY_ROOTS_LABEL = ", ".join(f"./{name}" for name in LEGACY_ROOT_NAMES)
 QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
 ANSWER_LINE_RE = re.compile(r"^\s*[-*+]\s*`?([a-z0-9][a-z0-9-]*)`?\s*:\s*(.+?)\s*$", re.IGNORECASE)
 PRELAUNCH_STATUSES = {"prepared", "blocked"}
@@ -58,13 +59,14 @@ def resolve_path(raw: str | Path) -> Path:
 
 def default_root() -> Path:
     cwd = Path.cwd()
-    generic = cwd / GENERIC_ROOT_NAME
-    legacy = cwd / LEGACY_ROOT_NAME
-    if generic.exists():
-        return generic
-    if legacy.exists():
-        return legacy
-    return generic
+    default_path = cwd / DEFAULT_ROOT_NAME
+    if default_path.exists():
+        return default_path
+    for legacy_name in LEGACY_ROOT_NAMES:
+        legacy_path = cwd / legacy_name
+        if legacy_path.exists():
+            return legacy_path
+    return default_path
 
 
 def index_path(root: Path) -> Path:
@@ -722,6 +724,10 @@ def detect_conflict_risks(runs: list[dict[str, Any]]) -> list[dict[str, str]]:
     return conflicts
 
 
+def project_workspace_dir(root: Path, project_name: str, slug: str | None = None) -> Path:
+    return root / "projects" / (slug or project_slug(project_name))
+
+
 def dependency_pool(index: dict[str, Any], run: dict[str, Any]) -> list[dict[str, Any]]:
     project_slug_value = normalize_optional_text(run.get("project_slug"))
     pool = [candidate for candidate in index["runs"] if candidate is not run]
@@ -774,9 +780,23 @@ def update_dispatch_metadata(index: dict[str, Any]) -> None:
 
 
 def ensure_project_workspace(root: Path, project_name: str, slug: str) -> Path:
-    project_dir = root / "projects" / slug
+    project_dir = project_workspace_dir(root, project_name, slug)
     (project_dir / "reports").mkdir(parents=True, exist_ok=True)
     return project_dir
+
+
+def collect_question_records(runs: list[dict[str, Any]]) -> list[dict[str, str]]:
+    question_records: list[dict[str, str]] = []
+    seen_question_ids: set[str] = set()
+    for run in runs:
+        last_message = last_message_for_run(run)
+        for question_text in extract_questions(last_message):
+            record = build_question_record(run, question_text)
+            if record["id"] in seen_question_ids:
+                continue
+            seen_question_ids.add(record["id"])
+            question_records.append(record)
+    return question_records
 
 
 def render_project_overview(project_name: str, project_dir: Path, runs: list[dict[str, Any]]) -> str:
@@ -1180,20 +1200,98 @@ def render_conflicts(conflicts: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[str, Any]]) -> str:
+    if not runs:
+        return ""
+    slug = str(runs[0].get("project_slug") or project_slug(project_name))
+    project_dir = project_workspace_dir(root, project_name, slug)
+    watcher_state, watcher_heartbeat = monitor_state(root)
+    counts = run_status_counts(runs)
+    question_records = collect_question_records(runs)
+    answers = load_answers(project_dir)
+    open_questions = unanswered_questions(question_records, answers)
+    answered = answered_questions(question_records, answers)
+    conflicts = detect_conflict_risks(runs)
+    active = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("status") or "") == "running"
+    ]
+    blocked = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("dispatch_state") or "") == "blocked"
+    ]
+    lines = [
+        f"project={project_name}",
+        f"workspace={project_dir}",
+        f"landing_page={project_dir / 'README.md'}",
+        f"dashboard={project_dir / 'dashboard.md'}",
+    ]
+    watcher_line = f"watcher={watcher_state}"
+    if watcher_heartbeat:
+        watcher_line += f" heartbeat={watcher_heartbeat}"
+    lines.append(watcher_line)
+    lines.append(
+        "counts="
+        f"running:{counts['running']} blocked:{len(blocked)} completed:{counts['completed']} "
+        f"failed:{counts['failed']} cancelled:{counts['cancelled']}"
+    )
+    lines.extend(["", "active_runs:"])
+    if not active:
+        lines.append("- none")
+    else:
+        for run in active:
+            live_note = short_summary(latest_live_note(run), max_chars=80)
+            lines.append(
+                f"- {run.get('task_id') or run['run_id']}: {run.get('summary') or '-'}"
+            )
+            if live_note != "-":
+                lines.append(f"  note: {live_note}")
+    lines.extend(["", "blocked_runs:"])
+    if not blocked:
+        lines.append("- none")
+    else:
+        for run in blocked:
+            waiting_on = format_inline_list(normalize_str_list(run.get("blocked_on"), "blocked_on"))
+            lines.append(
+                f"- {run.get('task_id') or run['run_id']}: {run.get('summary') or '-'}"
+            )
+            lines.append(f"  waiting_on: {waiting_on}")
+    lines.extend(["", "open_questions:"])
+    if not open_questions:
+        lines.append("- none")
+    else:
+        for question in open_questions[:5]:
+            lines.append(
+                f"- {question['id']} [{question['task_id']}] {short_summary(question['text'], max_chars=90)}"
+            )
+    lines.extend(["", "recent_answers:"])
+    if not answered:
+        lines.append("- none")
+    else:
+        for question in answered[-5:]:
+            lines.append(
+                f"- {question['id']} [{question['task_id']}] {short_summary(answers[question['id']], max_chars=90)}"
+            )
+    lines.extend(["", "conflicts:"])
+    if not conflicts:
+        lines.append("- none")
+    else:
+        for conflict in conflicts:
+            lines.append(
+                f"- {conflict['left_task']} vs {conflict['right_task']} on {conflict['paths']}"
+            )
+    return "\n".join(lines)
+
+
 def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list[dict[str, str]]:
-    question_records: list[dict[str, str]] = []
-    seen_question_ids: set[str] = set()
+    question_records = collect_question_records(runs)
+    by_run: dict[str, list[dict[str, str]]] = {}
+    for record in question_records:
+        by_run.setdefault(record["run_id"], []).append(record)
     for run in runs:
         report_path = project_dir / "reports" / f"{run['run_id']}.md"
         last_message = last_message_for_run(run)
-        run_questions: list[dict[str, str]] = []
-        for question_text in extract_questions(last_message):
-            record = build_question_record(run, question_text)
-            run_questions.append(record)
-            if record["id"] in seen_question_ids:
-                continue
-            seen_question_ids.add(record["id"])
-            question_records.append(record)
+        run_questions = by_run.get(str(run["run_id"]), [])
         content = "\n".join(
             [
                 f"# {run['run_id']}",
@@ -1679,6 +1777,11 @@ def materialize_run(
     save_index_and_sync(root, index)
     ensure_monitor(root, index)
     print_run_summary(run)
+    if options.project:
+        project_dir = project_workspace_dir(root, options.project, run.get("project_slug"))
+        print(f"workspace={project_dir}")
+        print(f"landing_page={project_dir / 'README.md'}")
+        print(f"dashboard={project_dir / 'dashboard.md'}")
     return run
 
 
@@ -1799,6 +1902,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
+    project_name: str | None = None
     with root_lock(root):
         index = load_index(root)
         for run in index["runs"]:
@@ -1818,12 +1922,18 @@ def cmd_status(args: argparse.Namespace) -> int:
                     str(run.get("project_slug") or "").strip().lower(),
                 }
             ]
+            if runs:
+                project_name = str(runs[0].get("project") or runs[0].get("project_slug") or args.project)
     if args.json:
         print(json.dumps(runs, ensure_ascii=True, indent=2))
         return 0
     if not runs:
         print("no runs")
         return 0
+    if project_name:
+        print(render_project_cli_summary(root, project_name, runs))
+        print()
+        print("runs:")
     for run in runs:
         print_run_summary(run)
     return 0
@@ -1953,7 +2063,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 
 
 def add_common_run_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
+    parser.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
     parser.add_argument(
         "--provider",
         choices=sorted(PROVIDERS),
@@ -2004,7 +2114,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     init_p = sub.add_parser("init", help="Initialize the controller directory")
-    init_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
+    init_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
     init_p.set_defaults(func=cmd_init)
 
     providers_p = sub.add_parser("providers", help="List supported provider adapters")
@@ -2021,54 +2131,54 @@ def build_parser() -> argparse.ArgumentParser:
     batch_p.set_defaults(func=cmd_batch)
 
     status_p = sub.add_parser("status", help="Show tracked runs")
-    status_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
+    status_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
     status_p.add_argument("--project", help="Filter to one project name or project slug")
     status_p.add_argument("--json", action="store_true", help="Print JSON instead of a table")
     status_p.set_defaults(func=cmd_status)
 
     show_p = sub.add_parser("show", help="Show one run and its last message")
     show_p.add_argument("run", help="Run id or unique prefix")
-    show_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
+    show_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
     show_p.set_defaults(func=cmd_show)
 
     tail_p = sub.add_parser("tail", help="Tail stdout or stderr for one run")
     tail_p.add_argument("run", help="Run id or unique prefix")
-    tail_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
+    tail_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
     tail_p.add_argument("-n", "--lines", type=int, default=20, help="Number of lines to print")
     tail_p.add_argument("--stderr", action="store_true", help="Show stderr instead of stdout JSONL")
     tail_p.set_defaults(func=cmd_tail)
 
     resume_p = sub.add_parser("resume-cmd", help="Print a shell-ready provider resume command")
     resume_p.add_argument("run", help="Run id or unique prefix")
-    resume_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
+    resume_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
     resume_p.add_argument("--exec", action="store_true", help="Print a non-interactive provider resume command")
     resume_p.set_defaults(func=cmd_resume_cmd)
 
     attach_p = sub.add_parser("attach-session", help="Manually attach a provider session id to a run")
     attach_p.add_argument("run", help="Run id or unique prefix")
     attach_p.add_argument("session_id", help="Provider session id")
-    attach_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
+    attach_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
     attach_p.set_defaults(func=cmd_attach_session)
 
     attach_thread_p = sub.add_parser("attach-thread", help="Backward-compatible alias for Codex thread ids")
     attach_thread_p.add_argument("run", help="Run id or unique prefix")
     attach_thread_p.add_argument("session_id", help="Codex thread id")
-    attach_thread_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
+    attach_thread_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
     attach_thread_p.set_defaults(func=cmd_attach_session)
 
     reconcile_p = sub.add_parser("reconcile", help="Refresh run statuses and infer missing session ids")
     reconcile_p.add_argument("run", nargs="?", help="Optional run id or unique prefix")
-    reconcile_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
+    reconcile_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
     reconcile_p.set_defaults(func=cmd_reconcile)
 
     cancel_p = sub.add_parser("cancel", help="Cancel a running child session")
     cancel_p.add_argument("run", help="Run id or unique prefix")
-    cancel_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
+    cancel_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
     cancel_p.add_argument("--force", action="store_true", help="Use SIGKILL instead of SIGTERM")
     cancel_p.set_defaults(func=cmd_cancel)
 
     monitor_p = sub.add_parser("monitor", help=argparse.SUPPRESS)
-    monitor_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME}, with legacy {LEGACY_ROOT_NAME} support)")
+    monitor_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
     monitor_p.add_argument("--interval", type=int, default=2, help=argparse.SUPPRESS)
     monitor_p.set_defaults(func=cmd_monitor)
 

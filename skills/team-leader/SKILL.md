@@ -11,9 +11,9 @@ This skill manages real child sessions through a provider adapter layer, with `c
 
 Treat a subsession as a full Codex worker with its own thread, context window, tool use, and follow-up lifecycle. This is more flexible than a lightweight in-process subagent because a child session can keep working independently, be resumed later, and itself act as a manager when useful.
 
-Use the control script in `scripts/team_leader.py` instead of ad hoc shell fragments. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.agent-subsessions/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. If an older `.codex-subsessions/` directory already exists, the script will keep using it.
+Use the control script in `scripts/team_leader.py` instead of ad hoc shell fragments. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
-When runs are linked to a project, the script also maintains a central markdown workspace under `.agent-subsessions/projects/<project>/` with a default `README.md` landing page, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
+When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
 
 Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
 
@@ -46,7 +46,7 @@ Subsessions in this skill are separate Codex sessions:
 python3 scripts/team_leader.py init
 ```
 
-This creates `.agent-subsessions/` in the current working directory unless a legacy `.codex-subsessions/` directory already exists.
+This creates `.team-leader/` in the current working directory unless an older compatible root already exists.
 
 ### 2. Dispatch a child run
 
@@ -74,7 +74,7 @@ python3 scripts/team_leader.py dispatch \
   --prompt-file /tmp/ui-refactor-prompt.md
 ```
 
-Each run gets its own directory under `.agent-subsessions/runs/`.
+Each run gets its own directory under `.team-leader/runs/`.
 
 For project-managed work, attach the run to a project and task id:
 
@@ -104,6 +104,14 @@ python3 scripts/team_leader.py tail 20260324-120000-ui-refactor
 ```
 
 `status` refreshes run metadata, including completion state and detected session IDs. The project markdown workspace also refreshes automatically while children are running, so you do not have to poll manually just to keep `dashboard.md` current.
+
+For a Codex-native view without opening folders, prefer:
+
+```bash
+python3 scripts/team_leader.py status --project payments-migration
+```
+
+That prints the workspace path, landing page path, dashboard path, watcher state, active runs, blocked runs, open questions, recent answers, and conflict hints directly in the terminal.
 
 For project-linked runs, the manager also updates:
 

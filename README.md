@@ -10,9 +10,9 @@ The current implementation ships with a `codex` provider adapter and a control p
 
 The controller keeps provider-specific behavior at the adapter boundary: option validation, command construction, session-id detection, and resume command generation. That keeps the run registry and batch manifest format stable when a later `claude`, `cursor`, or other CLI adapter is added.
 
-Project-linked runs maintain a central markdown workspace under `.agent-subsessions/projects/<project>/` so the manager can track dashboards, collected child reports, human questions, and conflict-risk notes without manually stitching together terminal output.
+Project-linked runs maintain a central markdown workspace under `.team-leader/projects/<project>/` so the manager can track dashboards, collected child reports, human questions, and conflict-risk notes without manually stitching together terminal output. Older `.agent-subsessions` and `.codex-subsessions` roots are still recognized automatically.
 
-The default landing page for each project is `.agent-subsessions/projects/<project>/README.md`. From there:
+The default landing page for each project is `.team-leader/projects/<project>/README.md`. From there:
 
 - `dashboard.md` shows live run progress, active child notes, and watcher status
 - `tasks.md` shows assignment state and summary titles
@@ -24,6 +24,8 @@ The default landing page for each project is `.agent-subsessions/projects/<proje
 - `reports/<run-id>.md` stores one markdown report per child session
 
 While child sessions are running, the manager refreshes those markdown files automatically in the background. Tasks with `depends_on` are held automatically until their prerequisites complete, then the manager launches the next wave on its own.
+
+From Codex itself, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary. That prints the workspace path, landing page path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
 
 ## Install After Pushing
 
