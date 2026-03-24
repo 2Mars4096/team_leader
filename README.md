@@ -12,7 +12,7 @@ The controller keeps provider-specific behavior at the adapter boundary: option 
 
 Invoke the controller by script path, but keep your working directory at the target project unless you pass `--root` and `--cd` explicitly. The default `.team-leader/` root is derived from the current working directory, so running the controller from the installed skill directory is the wrong default.
 
-Project-linked runs maintain a central markdown workspace under `.team-leader/projects/<project>/` so the manager can track the project brief, planner output, dashboards, collected child reports, human questions, and conflict-risk notes without manually stitching together terminal output. Older `.agent-subsessions` and `.codex-subsessions` roots are still recognized automatically.
+Project-linked runs maintain a central markdown workspace under `.team-leader/projects/<project>/` so the manager can track the project brief, planner output, dashboards, collected child reports, human questions, and conflict-risk notes without manually stitching together terminal output. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. Older `.agent-subsessions` and `.codex-subsessions` roots are still recognized automatically.
 
 The default landing page for each project is `.team-leader/projects/<project>/README.md`. From there:
 
@@ -33,18 +33,31 @@ The project folder is persistent manager state. Reusing the same project name re
 While child sessions are running, the manager refreshes those markdown files automatically in the background. Tasks with `depends_on` are held automatically until their prerequisites complete, then the manager launches the next wave on its own. The new default flow is:
 
 1. record the goal, repo paths, and specs with `intake`
-2. run `orchestrate`
-3. let the planner child produce a launch plan
-4. let the manager auto-dispatch worker children from that plan
-5. answer only the questions that really need a human
+2. let the manager ask a short clarification round first when the brief is still thin
+3. run `orchestrate`
+4. let the planner child produce a launch plan
+5. let the manager auto-dispatch worker children from that plan
+6. answer only the questions that really need a human
+7. let validation failures trigger focused fixer/replan waves in `continuous` mode until delivery or the auto-fix budget is exhausted
 
-Projects can now set an autonomy mode:
+Projects can now set both an autonomy mode and a clarification mode:
+
+- `clarification_mode=auto`: the planner may ask a few targeted questions before launching workers
+- `clarification_mode=off`: skip that gate and plan immediately
+
+Projects can also cap automatic recovery work:
+
+- `max_auto_fix_rounds`: how many validation-failure recovery waves the manager may launch on its own
+
+Autonomy modes:
 
 - `manual`: you explicitly run `orchestrate`
 - `guided`: the manager runs validation commands and tracks delivery state, but does not auto-start new planner waves
 - `continuous`: once the brief is present, the manager can auto-start planner waves and keep pushing until validation and completion signals say the project is delivered, or the configured planner-round limit is reached
 
 From the target project root, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary in this repo. When the skill is installed elsewhere, call that installed script path while keeping the working directory anchored to the target project, or pass `--root` and `--cd` explicitly. That prints the current stage, stage reason, next action, current focus, workspace path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
+
+For a live terminal panel, use `python3 skills/team-leader/scripts/team_leader.py watch --project <project>`. That repeatedly refreshes the project summary plus per-run lines, including integration state and the latest child note.
 
 ## Install After Pushing
 

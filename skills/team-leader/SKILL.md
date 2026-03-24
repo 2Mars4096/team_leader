@@ -13,7 +13,7 @@ Treat a subsession as a full Codex worker with its own thread, context window, t
 
 Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragments. This path is relative to the skill itself, not the project root. In this repo that file is at `skills/team-leader/scripts/team_leader.py`, and when installed it lives under the Codex skills directory at `.../skills/team-leader/scripts/team_leader.py`. Keep your working directory at the target project unless you pass `--root` and `--cd` explicitly; do not `cd` into the skill directory just to run the controller, because the default `.team-leader/` root is derived from the current working directory. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
-When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
+When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. While any child is active, the manager refreshes those markdown files automatically in the background.
 
 That project workspace is persistent state, not a temp folder. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The only file intended for direct human edits is `answers.md`. For a clean restart, use a new project name.
 
@@ -75,6 +75,15 @@ Autonomy modes:
 - `guided`: the manager runs validation commands and tracks delivery status, but does not auto-start new planner waves
 - `continuous`: the manager may auto-start planner waves from the brief and keep pushing until validation/completion checks pass or the planner-round limit is reached
 
+Clarification modes:
+
+- `auto`: the planner may ask a few targeted human questions before launching workers
+- `off`: skip that gate and plan immediately
+
+Recovery limits:
+
+- `max_auto_fix_rounds`: caps how many validation-failure recovery waves the manager may launch on its own in `continuous` mode
+
 ### 3. Let the manager plan the child sessions
 
 ```bash
@@ -82,7 +91,7 @@ python3 scripts/team_leader.py orchestrate \
   --project checkout-refactor
 ```
 
-`orchestrate` launches a manager-planner child when needed. That planner inspects `brief.md`, the repo paths, and any spec paths, then emits a machine-readable launch plan. The manager parses that plan and auto-dispatches child sessions from it. If the planner instead raises human questions, they land in `questions.md` and `answers-template.md`.
+`orchestrate` launches a manager-planner child when needed. That planner inspects `brief.md`, the repo paths, and any spec paths, then either asks a concise clarification round or emits a machine-readable launch plan. The manager parses that plan and auto-dispatches child sessions from it. If the planner raises human questions, they land in `questions.md` and `answers-template.md`.
 
 ### 4. Dispatch a child run directly when needed
 
@@ -131,6 +140,8 @@ python3 scripts/team_leader.py dispatch \
 
 That project link is what enables automatic markdown aggregation, progress visualization, and dependency-aware next-wave launching.
 
+For writer children in Git repos, the manager now isolates each writer into its own worktree and integrates completed changes through the project integration worktree. Overlapping writers are serialized by the manager instead of writing into the same checkout at the same time.
+
 ### 5. Track progress
 
 ```bash
@@ -147,7 +158,15 @@ For a Codex-native view without opening folders, prefer:
 python3 scripts/team_leader.py status --project payments-migration
 ```
 
-That prints the current stage, stage reason, next action, current focus, workspace path, landing page path, dashboard path, watcher state, active runs, blocked runs, open questions, recent answers, and conflict hints directly in the terminal.
+That prints the current stage, stage reason, next action, current focus, workspace path, landing page path, dashboard path, watcher state, active runs, blocked runs, open questions, recent answers, conflict hints, and integration state directly in the terminal.
+
+For a live terminal view:
+
+```bash
+python3 scripts/team_leader.py watch --project payments-migration
+```
+
+Use `--once` for a single render or `--exit-when-settled` when you want the view to stop after the project has no running or blocked runs.
 
 For project-linked runs, the manager also updates:
 
@@ -213,9 +232,11 @@ That keeps the “who should do what?” decision inside the manager instead of 
 If you want more self-driving behavior, set:
 
 - `--autonomy-mode continuous`
+- `--clarification-mode auto`
 - one or more `--validation-command`
 - optionally `--completion-sentinel`
 - optionally `--max-planner-rounds`
+- optionally `--max-auto-fix-rounds`
 
 Then the manager can keep pushing toward delivery instead of stopping after one batch.
 
@@ -241,8 +262,10 @@ Populate `--owned-path` when a child is allowed to write. The project workspace 
 - Prefer `--sandbox workspace-write --full-auto` for normal autonomous implementation children
 - Prefer `intake` + `orchestrate` when the user has only a project goal, paths, and a few constraints
 - Prefer `guided` or `continuous` autonomy only when you also have meaningful validation commands or a clear completion signal
+- Prefer `clarification-mode auto` when the user gives only a goal and a few paths; let the planner ask the smallest useful question set first
 - Prefer linking every meaningful child to `--project`, `--task-id`, `--summary`, and `--role` so the markdown dashboard remains useful
 - Use `--depends-on` when a task should wait for another task to complete; the manager now keeps blocked tasks parked and launches them automatically when their prerequisites finish
+- Prefer the new `watch --project <project>` view when you want live progress without opening markdown files
 - Use `--add-dir` for extra writable paths outside the main repo root
 - Use `--skip-git-repo-check` if a child must run outside a Git repository
 - Use `attach-session` if auto-detection misses a session ID and you need a stable resume handle
@@ -254,6 +277,6 @@ Populate `--owned-path` when a child is allowed to write. The project workspace 
 ## Guardrails
 
 - Each child session consumes normal Codex usage. Use only as many concurrent children as the task justifies.
-- Do not run concurrent writers against the same files unless the user explicitly accepts merge risk.
-- `conflicts.md` reports overlap risk from declared ownership. Conflict resolution stays in the manager's domain; the tool does not auto-merge file edits.
+- The manager now isolates Git-backed writers into separate worktrees and integrates them through the project integration worktree, but it still does not auto-resolve arbitrary merge conflicts.
+- `conflicts.md` reports unresolved overlap or integration issues that still need manager or human judgment.
 - This skill manages child provider sessions, not arbitrary background jobs. Keep the current workflow centered on real CLI session primitives rather than custom task shims.

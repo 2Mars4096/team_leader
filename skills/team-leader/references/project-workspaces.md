@@ -27,6 +27,13 @@ The manager keeps these files current:
 - `conflicts.md`: owned-path overlap risk
 - `reports/<run-id>.md`: one markdown report per child run
 
+For Git-backed writer runs, the manager also uses:
+
+- per-run worktrees under `projects/<project>/worktrees/`
+- a shared integration worktree under `projects/<project>/integration/`
+
+Validation commands run in the integration worktree when one exists, so delivery gates evaluate the manager-owned combined result instead of a stale source checkout.
+
 This project folder is persistent manager state. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The intended human-edited file is `answers.md`. For a clean restart, use a new project name.
 
 ## Recommended Metadata
@@ -74,9 +81,11 @@ When the user only knows the goal and a few paths, the intended flow is:
 If you want more self-driving behavior, add delivery settings to the brief:
 
 - `autonomy_mode`: `manual`, `guided`, or `continuous`
+- `clarification_mode`: `auto` or `off`
 - `validation_commands`: shell commands that act as delivery gates
 - `completion_sentinel`: optional text marker that means “done”
 - `max_planner_rounds`: hard stop for automatic replanning
+- `max_auto_fix_rounds`: cap for automatic validation-failure recovery waves
 
 If you want to stay inside Codex instead of opening the folder, run:
 
@@ -84,12 +93,18 @@ If you want to stay inside Codex instead of opening the folder, run:
 
 That prints the same high-signal view directly in the terminal, including the current stage, stage reason, next action, current focus, and exact file paths for the workspace, landing page, and dashboard.
 
+For a live terminal view, use:
+
+`python3 scripts/team_leader.py watch --project <project>`
+
+Add `--once` for a single render or `--exit-when-settled` if you want it to stop after the project has no running or blocked runs.
+
 ## Conflict Caveat
 
-`conflicts.md` detects overlap from declared ownership. Conflict resolution stays with the manager; it does not auto-merge conflicting file edits.
+`conflicts.md` detects unresolved overlap from declared ownership plus integration issues from the manager’s worktree flow. Conflict resolution stays with the manager; it does not auto-merge arbitrary conflicting file edits.
 
 If two write runs touch the same area, the current safe behavior is:
 
-1. narrow ownership
-2. convert one child into a reviewer
-3. escalate the decision in `questions.md`
+1. isolate each writer in its own worktree
+2. let the manager serialize overlapping writers and integrate them into the project integration worktree
+3. if integration still fails, narrow ownership or escalate the decision in `questions.md`

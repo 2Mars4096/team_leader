@@ -43,6 +43,9 @@ PLANNER_TASK_PREFIX = "manager-plan"
 PLANNER_ROLE = "manager"
 PLANNER_SOURCE = "team-leader-planner"
 AUTONOMY_MODES = ("manual", "guided", "continuous")
+CLARIFICATION_MODES = ("auto", "off")
+INTEGRATION_READY_STATES = {"applied", "no-changes"}
+INTEGRATION_BLOCKING_STATES = {"pending", "conflict", "scope-violation", "apply-failed", "commit-failed"}
 
 
 def utc_now() -> str:
@@ -91,6 +94,58 @@ def default_root() -> Path:
         if legacy_path.exists():
             return legacy_path
     return default_path
+
+
+def git_run(args: list[str], *, cwd: Path, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        text=True,
+        input=input_text,
+        capture_output=True,
+        check=check,
+    )
+
+
+def git_toplevel(path: Path) -> Path | None:
+    try:
+        proc = git_run(["rev-parse", "--show-toplevel"], cwd=path)
+    except subprocess.CalledProcessError:
+        return None
+    value = proc.stdout.strip()
+    return resolve_path(value) if value else None
+
+
+def git_head(path: Path) -> str | None:
+    try:
+        proc = git_run(["rev-parse", "HEAD"], cwd=path)
+    except subprocess.CalledProcessError:
+        return None
+    value = proc.stdout.strip()
+    return value or None
+
+
+def git_has_tracked_changes(path: Path, base_ref: str) -> tuple[list[str], str]:
+    try:
+        changed = git_run(["diff", "--name-only", base_ref], cwd=path)
+        patch = git_run(["diff", "--binary", base_ref], cwd=path)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(exc.stderr.strip() or f"git diff failed in {path}") from exc
+    changed_paths = [line.strip() for line in changed.stdout.splitlines() if line.strip()]
+    return changed_paths, patch.stdout
+
+
+def path_within_owned_paths(path: str, owned_paths: list[str]) -> bool:
+    normalized = path.strip().strip("/")
+    if not normalized:
+        return False
+    for owned in owned_paths:
+        candidate = owned.strip().strip("/")
+        if not candidate:
+            continue
+        if path_overlaps(normalized, candidate):
+            return True
+    return False
 
 
 def index_path(root: Path) -> Path:
@@ -404,9 +459,21 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("dispatch_state", None)
         run.setdefault("blocked_on", [])
         run.setdefault("planner_source", None)
+        run.setdefault("planner_reason", None)
         run.setdefault("plan_applied_at", None)
         run.setdefault("plan_apply_error", None)
         run.setdefault("planned_run_ids", [])
+        run.setdefault("source_cwd", run.get("cwd"))
+        run.setdefault("source_repo_root", None)
+        run.setdefault("source_repo_rel_cwd", None)
+        run.setdefault("workspace_mode", "direct")
+        run.setdefault("worktree_path", None)
+        run.setdefault("workspace_base_ref", None)
+        run.setdefault("workspace_prepared_at", None)
+        run.setdefault("integration_state", None)
+        run.setdefault("integration_note", None)
+        run.setdefault("integration_updated_at", None)
+        run.setdefault("changed_paths", [])
         if get_session_id(run):
             set_session_id(run, get_session_id(run))
     return data
@@ -567,9 +634,11 @@ def default_project_brief(project_name: str) -> dict[str, Any]:
         "notes": [],
         "constraints": [],
         "autonomy_mode": "manual",
+        "clarification_mode": "auto",
         "validation_commands": [],
         "completion_sentinel": None,
         "max_planner_rounds": 3,
+        "max_auto_fix_rounds": 2,
         "updated_at": utc_now(),
     }
 
@@ -600,6 +669,11 @@ def load_project_brief(project_dir: Path, project_name: str | None = None) -> di
     if autonomy_mode not in AUTONOMY_MODES:
         autonomy_mode = "manual"
     brief["autonomy_mode"] = autonomy_mode
+    clarification_mode = normalize_optional_text(payload.get("clarification_mode")) or "auto"
+    clarification_mode = clarification_mode.lower()
+    if clarification_mode not in CLARIFICATION_MODES:
+        clarification_mode = "auto"
+    brief["clarification_mode"] = clarification_mode
     brief["validation_commands"] = unique_preserve_order(
         normalize_str_list(payload.get("validation_commands"), "validation_commands")
     )
@@ -610,6 +684,12 @@ def load_project_brief(project_dir: Path, project_name: str | None = None) -> di
     except (TypeError, ValueError):
         max_rounds = 3
     brief["max_planner_rounds"] = max(1, max_rounds)
+    max_auto_fix_rounds_raw = payload.get("max_auto_fix_rounds")
+    try:
+        max_auto_fix_rounds = int(max_auto_fix_rounds_raw)
+    except (TypeError, ValueError):
+        max_auto_fix_rounds = 2
+    brief["max_auto_fix_rounds"] = max(0, max_auto_fix_rounds)
     brief["updated_at"] = normalize_optional_text(payload.get("updated_at")) or utc_now()
     return brief
 
@@ -634,9 +714,11 @@ def merge_project_brief(
     notes: list[str] | None = None,
     constraints: list[str] | None = None,
     autonomy_mode: str | None = None,
+    clarification_mode: str | None = None,
     validation_commands: list[str] | None = None,
     completion_sentinel: str | None = None,
     max_planner_rounds: int | None = None,
+    max_auto_fix_rounds: int | None = None,
 ) -> dict[str, Any]:
     brief = dict(existing or default_project_brief(project_name))
     brief["project"] = project_name
@@ -662,6 +744,14 @@ def merge_project_brief(
         if mode not in AUTONOMY_MODES:
             raise RuntimeError(f"unsupported autonomy mode: {autonomy_mode}. supported values: {', '.join(AUTONOMY_MODES)}")
         brief["autonomy_mode"] = mode
+    if clarification_mode is not None:
+        mode = clarification_mode.strip().lower()
+        if mode not in CLARIFICATION_MODES:
+            raise RuntimeError(
+                f"unsupported clarification mode: {clarification_mode}. "
+                f"supported values: {', '.join(CLARIFICATION_MODES)}"
+            )
+        brief["clarification_mode"] = mode
     brief["validation_commands"] = unique_preserve_order(
         normalize_str_list(brief.get("validation_commands"), "validation_commands")
         + [item for item in (validation_commands or []) if item]
@@ -670,6 +760,8 @@ def merge_project_brief(
         brief["completion_sentinel"] = completion_sentinel
     if max_planner_rounds is not None:
         brief["max_planner_rounds"] = max(1, int(max_planner_rounds))
+    if max_auto_fix_rounds is not None:
+        brief["max_auto_fix_rounds"] = max(0, int(max_auto_fix_rounds))
     brief["updated_at"] = utc_now()
     return brief
 
@@ -682,8 +774,10 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     constraints = normalize_str_list(brief.get("constraints"), "constraints")
     validation_commands = normalize_str_list(brief.get("validation_commands"), "validation_commands")
     autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) or "manual"
+    clarification_mode = normalize_optional_text(brief.get("clarification_mode")) or "auto"
     completion_sentinel = normalize_optional_text(brief.get("completion_sentinel"))
     max_planner_rounds = brief.get("max_planner_rounds")
+    max_auto_fix_rounds = brief.get("max_auto_fix_rounds")
     lines = [
         f"# {brief.get('project') or 'Project'} Brief",
         "",
@@ -715,7 +809,9 @@ def render_project_brief(brief: dict[str, Any]) -> str:
             lines.append(f"- {item}")
     lines.extend(["", "## Delivery Policy", ""])
     lines.append(f"- Autonomy mode: `{autonomy_mode}`")
+    lines.append(f"- Clarification mode: `{clarification_mode}`")
     lines.append(f"- Max planner rounds: `{max_planner_rounds}`")
+    lines.append(f"- Max auto-fix rounds: `{max_auto_fix_rounds}`")
     lines.append(f"- Completion sentinel: `{completion_sentinel or '-'}`")
     lines.extend(["", "## Validation Commands", ""])
     if not validation_commands:
@@ -972,6 +1068,189 @@ def relative_owned_paths(run: dict[str, Any]) -> list[str]:
     return result
 
 
+def project_git_root_for_run(run: dict[str, Any]) -> Path | None:
+    raw = normalize_optional_text(run.get("source_repo_root"))
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def run_project_dir(root: Path, run: dict[str, Any]) -> Path | None:
+    project_name = normalize_optional_text(run.get("project"))
+    if not project_name:
+        return None
+    return project_workspace_dir(root, project_name, normalize_optional_text(run.get("project_slug")) or project_slug(project_name))
+
+
+def project_integration_dir(root: Path, run: dict[str, Any]) -> Path | None:
+    project_dir = run_project_dir(root, run)
+    if not project_dir:
+        return None
+    return project_dir / "integration"
+
+
+def project_integration_branch(run: dict[str, Any]) -> str:
+    slug = normalize_optional_text(run.get("project_slug")) or project_slug(normalize_optional_text(run.get("project")) or "project")
+    return f"team-leader/{slug}/integration"
+
+
+def run_worktree_branch(run: dict[str, Any]) -> str:
+    slug = normalize_optional_text(run.get("project_slug")) or project_slug(normalize_optional_text(run.get("project")) or "project")
+    return f"team-leader/{slug}/{run['run_id']}"
+
+
+def run_requires_workspace_isolation(run: dict[str, Any]) -> bool:
+    return str(run.get("workspace_mode") or "") == "worktree"
+
+
+def ensure_integration_workspace(root: Path, run: dict[str, Any]) -> Path:
+    repo_root = project_git_root_for_run(run)
+    if not repo_root:
+        raise RuntimeError("run has no source repo root for integration")
+    integration_dir = project_integration_dir(root, run)
+    if not integration_dir:
+        raise RuntimeError("run has no project integration directory")
+    if (integration_dir / ".git").exists():
+        return integration_dir
+    integration_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        git_run(
+            ["worktree", "add", "-B", project_integration_branch(run), str(integration_dir), "HEAD"],
+            cwd=repo_root,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(exc.stderr.strip() or f"failed to create integration worktree for {run['run_id']}") from exc
+    return integration_dir
+
+
+def prepare_run_workspace(root: Path, run: dict[str, Any]) -> None:
+    if not run_requires_workspace_isolation(run):
+        return
+    repo_root = project_git_root_for_run(run)
+    if not repo_root:
+        return
+    integration_dir = ensure_integration_workspace(root, run)
+    worktree_path_raw = normalize_optional_text(run.get("worktree_path"))
+    if not worktree_path_raw:
+        raise RuntimeError("run is missing worktree_path")
+    worktree_path = Path(worktree_path_raw)
+    if not (worktree_path / ".git").exists():
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            git_run(
+                ["worktree", "add", "-b", run_worktree_branch(run), str(worktree_path), project_integration_branch(run)],
+                cwd=repo_root,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(exc.stderr.strip() or f"failed to create worktree for {run['run_id']}") from exc
+    repo_rel_cwd = normalize_optional_text(run.get("source_repo_rel_cwd")) or "."
+    actual_cwd = worktree_path if repo_rel_cwd in {".", ""} else worktree_path / repo_rel_cwd
+    run["cwd"] = str(actual_cwd)
+    run["workspace_prepared_at"] = utc_now()
+    run["workspace_base_ref"] = git_head(actual_cwd) or git_head(integration_dir)
+    run["integration_state"] = run.get("integration_state") or "pending"
+    run["integration_note"] = None
+    run["integration_updated_at"] = utc_now()
+
+
+def overlapping_writer_blockers(index: dict[str, Any], run: dict[str, Any]) -> list[str]:
+    if not run_is_writer(run):
+        return []
+    my_paths = relative_owned_paths(run)
+    if not my_paths:
+        return []
+    blockers: list[str] = []
+    for candidate in sorted(dependency_pool(index, run), key=run_sort_key):
+        if not run_is_writer(candidate):
+            continue
+        if run_sort_key(candidate) >= run_sort_key(run):
+            continue
+        other_paths = relative_owned_paths(candidate)
+        if not other_paths:
+            continue
+        if not any(path_overlaps(left, right) for left in my_paths for right in other_paths):
+            continue
+        candidate_status = str(candidate.get("status") or "")
+        integration_state = normalize_optional_text(candidate.get("integration_state"))
+        if candidate_status not in TERMINAL_STATUSES:
+            blockers.append(str(candidate.get("task_id") or candidate["run_id"]))
+            continue
+        if run_requires_workspace_isolation(candidate) and integration_state not in INTEGRATION_READY_STATES:
+            blockers.append(str(candidate.get("task_id") or candidate["run_id"]))
+    return blockers
+
+
+def apply_run_to_integration(root: Path, run: dict[str, Any]) -> None:
+    if not run_requires_workspace_isolation(run):
+        return
+    if str(run.get("status") or "") != "completed":
+        return
+    integration_state = normalize_optional_text(run.get("integration_state"))
+    if integration_state in INTEGRATION_READY_STATES:
+        return
+    if integration_state in {"conflict", "scope-violation", "apply-failed", "commit-failed"}:
+        return
+    worktree_path_raw = normalize_optional_text(run.get("worktree_path"))
+    base_ref = normalize_optional_text(run.get("workspace_base_ref"))
+    if not worktree_path_raw or not base_ref:
+        return
+    worktree_path = Path(worktree_path_raw)
+    if not worktree_path.exists():
+        run["integration_state"] = "apply-failed"
+        run["integration_note"] = "worktree path is missing"
+        run["integration_updated_at"] = utc_now()
+        return
+    changed_paths, patch = git_has_tracked_changes(worktree_path, base_ref)
+    run["changed_paths"] = changed_paths
+    if not patch.strip():
+        run["integration_state"] = "no-changes"
+        run["integration_note"] = "writer completed without diff against the integration base"
+        run["integration_updated_at"] = utc_now()
+        return
+    owned_paths = relative_owned_paths(run)
+    outside_scope = [path for path in changed_paths if owned_paths and not path_within_owned_paths(path, owned_paths)]
+    if outside_scope:
+        run["integration_state"] = "scope-violation"
+        run["integration_note"] = "changed paths outside declared ownership: " + ", ".join(outside_scope[:6])
+        run["integration_updated_at"] = utc_now()
+        return
+    integration_dir = ensure_integration_workspace(root, run)
+    try:
+        git_run(["apply", "--3way", "--whitespace=nowarn", "-"], cwd=integration_dir, input_text=patch)
+    except subprocess.CalledProcessError as exc:
+        run["integration_state"] = "conflict"
+        run["integration_note"] = short_summary(exc.stderr or exc.stdout or "git apply failed", max_chars=180)
+        run["integration_updated_at"] = utc_now()
+        return
+    try:
+        git_run(["add", "-A"], cwd=integration_dir)
+        git_run(
+            [
+                "-c",
+                "user.name=team-leader",
+                "-c",
+                "user.email=team-leader@local",
+                "commit",
+                "-m",
+                f"team-leader integrate {run['run_id']}: {short_summary(normalize_optional_text(run.get('summary')), max_chars=72)}",
+            ],
+            cwd=integration_dir,
+        )
+    except subprocess.CalledProcessError as exc:
+        run["integration_state"] = "commit-failed"
+        run["integration_note"] = short_summary(exc.stderr or exc.stdout or "git commit failed", max_chars=180)
+        run["integration_updated_at"] = utc_now()
+        return
+    run["integration_state"] = "applied"
+    run["integration_note"] = f"applied into {integration_dir}"
+    run["integration_updated_at"] = utc_now()
+
+
+def maybe_integrate_completed_runs(root: Path, index: dict[str, Any]) -> None:
+    for run in sorted(index["runs"], key=run_sort_key):
+        apply_run_to_integration(root, run)
+
+
 def path_overlaps(left: str, right: str) -> bool:
     if left == right:
         return True
@@ -1142,6 +1421,13 @@ def project_default_cwd(brief: dict[str, Any] | None) -> Path:
     return Path.cwd()
 
 
+def project_validation_cwd(project_dir: Path, brief: dict[str, Any], runs: list[dict[str, Any]]) -> Path:
+    integration_dir = project_dir / "integration"
+    if integration_dir.exists() and any(run_requires_workspace_isolation(run) for run in runs):
+        return integration_dir
+    return project_default_cwd(brief)
+
+
 def planner_round_count(runs: list[dict[str, Any]]) -> int:
     return sum(1 for run in runs if run_is_planner(run))
 
@@ -1189,7 +1475,7 @@ def execute_validation_commands(project_dir: Path, brief: dict[str, Any], runs: 
         record["validated_at"] = utc_now()
         record["commands"] = []
         return record
-    cwd = project_default_cwd(brief)
+    cwd = project_validation_cwd(project_dir, brief, runs)
     results: list[dict[str, Any]] = []
     overall_ok = True
     for command in commands:
@@ -1282,6 +1568,32 @@ def project_is_machine_complete(brief: dict[str, Any] | None, validation: dict[s
     return True
 
 
+def brief_needs_clarification(brief: dict[str, Any] | None) -> bool:
+    if not brief:
+        return False
+    if (normalize_optional_text(brief.get("clarification_mode")) or "auto") == "off":
+        return False
+    repo_paths = normalize_str_list(brief.get("repo_paths"), "repo_paths")
+    spec_paths = normalize_str_list(brief.get("spec_paths"), "spec_paths")
+    constraints = normalize_str_list(brief.get("constraints"), "constraints")
+    notes = normalize_str_list(brief.get("notes"), "notes")
+    if not repo_paths and not spec_paths:
+        return True
+    if not constraints and not notes:
+        return True
+    return False
+
+
+def auto_fix_round_count(runs: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for run in runs
+        if run_is_planner(run)
+        and normalize_optional_text(run.get("planner_reason"))
+        in {"failed-runs", "validation-failed", "waiting-for-sentinel", "integration-conflict"}
+    )
+
+
 def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project_dir: Path, existing_runs: list[dict[str, Any]]) -> str:
     goal = normalize_optional_text(brief.get("goal")) or "No goal recorded yet."
     repo_paths = normalize_str_list(brief.get("repo_paths"), "repo_paths")
@@ -1290,9 +1602,15 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
     constraints = normalize_str_list(brief.get("constraints"), "constraints")
     validation_commands = normalize_str_list(brief.get("validation_commands"), "validation_commands")
     autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) or "manual"
+    clarification_mode = normalize_optional_text(brief.get("clarification_mode")) or "auto"
     completion_sentinel = normalize_optional_text(brief.get("completion_sentinel"))
     max_planner_rounds = brief.get("max_planner_rounds")
+    max_auto_fix_rounds = brief.get("max_auto_fix_rounds")
     previous_workers = [run for run in existing_runs if not run_is_planner(run)]
+    validation = load_project_validation(project_dir) or default_project_validation()
+    validation_status = normalize_optional_text(validation.get("status")) or "not-run"
+    answers = load_answers(project_dir)
+    answered = answered_questions(collect_question_records(existing_runs), answers)
     lines = [
         f"You are the manager-planner for the project `{project_name}`.",
         "",
@@ -1331,7 +1649,9 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
         lines.append("- none recorded")
     lines.extend(["", "Delivery policy:"])
     lines.append(f"- autonomy_mode={autonomy_mode}")
+    lines.append(f"- clarification_mode={clarification_mode}")
     lines.append(f"- max_planner_rounds={max_planner_rounds}")
+    lines.append(f"- max_auto_fix_rounds={max_auto_fix_rounds}")
     lines.append(f"- completion_sentinel={completion_sentinel or '-'}")
     lines.extend(["", "Validation commands:"])
     if validation_commands:
@@ -1339,6 +1659,28 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             lines.append(f"- `{item}`")
     else:
         lines.append("- none recorded")
+    lines.extend(["", "Validation state:"])
+    lines.append(f"- status={validation_status}")
+    lines.append(f"- validation_file={project_validation_md_path(project_dir)}")
+    command_results = validation.get("commands")
+    if isinstance(command_results, list) and command_results:
+        for item in command_results[-3:]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "- "
+                f"command={short_summary(normalize_optional_text(item.get('command')), max_chars=50)} "
+                f"status={normalize_optional_text(item.get('status')) or '-'} "
+                f"stderr={short_summary(normalize_optional_text(item.get('stderr_preview')), max_chars=64)}"
+            )
+    else:
+        lines.append("- no recorded validation results yet")
+    lines.extend(["", "Recent answered human questions:"])
+    if answered:
+        for question in answered[-5:]:
+            lines.append(f"- {question['id']}: {answers[question['id']]}")
+    else:
+        lines.append("- none")
     lines.extend(["", "Existing tracked runs:"])
     if previous_workers:
         for run in previous_workers[-10:]:
@@ -1351,9 +1693,13 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
         [
             "",
             "Rules:",
+            "- First decide whether the brief is clear enough to launch workers safely.",
+            "- If the brief is missing key repo/spec context or important constraints, ask at most 3 concise questions under a `Questions For Humans` heading and do not emit a launch plan in the same response.",
             "- Use as few child sessions as necessary.",
             "- Split writers by disjoint file ownership whenever possible.",
             "- Prefer read-only research or review children if write boundaries are unclear.",
+            "- Writers should own explicit disjoint paths whenever possible.",
+            "- When validation failed, prefer a targeted fixer or reviewer wave over a broad restart.",
             "- Use the delivery policy to decide whether another wave is necessary.",
             "- If validation likely needs to run before more work, plan a reviewer or fixer wave only when the current outputs suggest more work is needed.",
             "- If a human decision is required, ask concise questions under a `Questions For Humans` heading.",
@@ -1486,6 +1832,24 @@ def detect_conflict_risks(runs: list[dict[str, Any]]) -> list[dict[str, str]]:
             right_paths = relative_owned_paths(right)
             if not right_paths:
                 continue
+            left_task = str(left.get("task_id") or left["run_id"])
+            right_task = str(right.get("task_id") or right["run_id"])
+            right_blocked_on = normalize_str_list(right.get("blocked_on"), "blocked_on")
+            left_blocked_on = normalize_str_list(left.get("blocked_on"), "blocked_on")
+            if left_task in right_blocked_on or right_task in left_blocked_on:
+                continue
+            if (
+                str(left.get("status") or "") in TERMINAL_STATUSES
+                and (not run_requires_workspace_isolation(left) or normalize_optional_text(left.get("integration_state")) in INTEGRATION_READY_STATES)
+            ):
+                continue
+            if (
+                str(left.get("status") or "") in TERMINAL_STATUSES
+                and str(right.get("status") or "") in TERMINAL_STATUSES
+                and (not run_requires_workspace_isolation(left) or normalize_optional_text(left.get("integration_state")) in INTEGRATION_READY_STATES)
+                and (not run_requires_workspace_isolation(right) or normalize_optional_text(right.get("integration_state")) in INTEGRATION_READY_STATES)
+            ):
+                continue
             overlap = [
                 path
                 for path in left_paths
@@ -1499,12 +1863,31 @@ def detect_conflict_risks(runs: list[dict[str, Any]]) -> list[dict[str, str]]:
                 {
                     "left_run": str(left["run_id"]),
                     "right_run": str(right["run_id"]),
-                    "left_task": str(left.get("task_id") or left["run_id"]),
-                    "right_task": str(right.get("task_id") or right["run_id"]),
+                    "left_task": left_task,
+                    "right_task": right_task,
                     "paths": ", ".join(f"`{path}`" for path in unique_overlap),
                 }
             )
     return conflicts
+
+
+def integration_alerts(runs: list[dict[str, Any]]) -> list[dict[str, str]]:
+    alerts: list[dict[str, str]] = []
+    for run in sorted(runs, key=run_sort_key):
+        state = normalize_optional_text(run.get("integration_state"))
+        if not state or state in INTEGRATION_READY_STATES:
+            continue
+        alerts.append(
+            {
+                "run_id": str(run["run_id"]),
+                "task_id": str(run.get("task_id") or run["run_id"]),
+                "state": state,
+                "note": normalize_optional_text(run.get("integration_note")) or "-",
+            }
+        )
+    return alerts
+
+
 def dependency_pool(index: dict[str, Any], run: dict[str, Any]) -> list[dict[str, Any]]:
     project_slug_value = normalize_optional_text(run.get("project_slug"))
     pool = [candidate for candidate in index["runs"] if candidate is not run]
@@ -1544,6 +1927,11 @@ def compute_dispatch_state(index: dict[str, Any], run: dict[str, Any]) -> tuple[
     if status == "dry-run":
         return "dry-run", []
     blocked_on = unresolved_dependencies(index, run)
+    blocked_on.extend(
+        blocker
+        for blocker in overlapping_writer_blockers(index, run)
+        if blocker not in blocked_on
+    )
     if blocked_on:
         return "blocked", blocked_on
     return "ready", []
@@ -1601,19 +1989,30 @@ def project_stage_snapshot(
     machine_complete = project_is_machine_complete(brief, validation)
     validation_status = normalize_optional_text(validation.get("status")) if validation else None
     autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) if brief else None
+    clarification_mode = normalize_optional_text(brief.get("clarification_mode")) if brief else None
+    integration_conflicts = [
+        run for run in sorted(runs, key=run_sort_key)
+        if normalize_optional_text(run.get("integration_state")) in {"conflict", "scope-violation", "apply-failed", "commit-failed"}
+    ]
     total = len(runs)
     progress = (
         f"{counts['completed']}/{total} completed, "
         f"{counts['running']} running, {len(blocked)} blocked, "
         f"{len(open_questions)} open questions"
     )
-    if conflicts:
+    if integration_conflicts:
+        current_stage = "resolve-integration"
+        first_conflict = integration_conflicts[0]
+        stage_reason = f"{len(integration_conflicts)} writer integration issue(s) need manager review"
+        next_action = f"Inspect `{first_conflict['run_id']}` and resolve its integration note"
+        focus = short_summary(normalize_optional_text(first_conflict.get("integration_note")), max_chars=96)
+    elif conflicts:
         current_stage = "resolve-conflicts"
         stage_reason = f"{len(conflicts)} ownership overlap risk(s) detected"
         next_action = "Narrow write ownership or convert one child into a reviewer"
         focus = f"{conflicts[0]['left_task']} vs {conflicts[0]['right_task']}"
     elif open_questions:
-        current_stage = "waiting-for-human"
+        current_stage = "clarifying-brief" if clarification_mode == "auto" and not [run for run in runs if not run_is_planner(run)] else "waiting-for-human"
         first_question = open_questions[0]
         stage_reason = f"{len(open_questions)} human decision(s) still open"
         next_action = f"Answer `{first_question['id']}` for `{first_question['task_id']}`"
@@ -1669,9 +2068,13 @@ def project_stage_snapshot(
             next_action = "Review `manager-summary.md` and decide the next batch"
         focus = "All current tasks are complete"
     elif brief and normalize_optional_text(brief.get("goal")):
-        current_stage = "ready-for-planning"
-        stage_reason = "Project brief exists but no child runs are active yet"
-        next_action = "Run `orchestrate` to let the manager create the first child batch"
+        current_stage = "ready-for-clarification" if brief_needs_clarification(brief) else "ready-for-planning"
+        stage_reason = (
+            "Project brief exists but the manager should ask a few clarification questions first"
+            if brief_needs_clarification(brief)
+            else "Project brief exists but no child runs are active yet"
+        )
+        next_action = "Run `orchestrate` to let the manager create the first planning round"
         focus = short_summary(normalize_optional_text(brief.get("goal")), max_chars=96)
     else:
         current_stage = "idle"
@@ -1695,12 +2098,16 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
     question_records = collect_question_records(runs)
     answers = load_answers(project_dir)
     conflicts = detect_conflict_risks(runs)
+    integration_issues = integration_alerts(runs)
     brief = load_project_brief(project_dir, project_name)
     validation = load_project_validation(project_dir)
     stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
     goal = normalize_optional_text(brief.get("goal")) if brief else None
     autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) if brief else None
+    clarification_mode = normalize_optional_text(brief.get("clarification_mode")) if brief else None
+    max_auto_fix_rounds = brief.get("max_auto_fix_rounds") if brief else None
     validation_status = normalize_optional_text(validation.get("status")) if validation else None
+    integration_issues = integration_alerts(runs)
     watcher_line = f"- Manager watcher: `{watcher_state}`"
     if watcher_heartbeat:
         watcher_line += f" (last heartbeat `{watcher_heartbeat}`)"
@@ -1719,6 +2126,8 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             f"- Validation: `{project_validation_md_path(project_dir)}`",
             f"- Goal: {goal or '_No goal recorded yet._'}",
             f"- Autonomy mode: `{autonomy_mode or 'manual'}`",
+            f"- Clarification mode: `{clarification_mode or 'auto'}`",
+            f"- Max auto-fix rounds: `{max_auto_fix_rounds if max_auto_fix_rounds is not None else 2}`",
             f"- Validation status: `{validation_status or 'not-run'}`",
             f"- Current stage: `{stage['current_stage']}`",
             f"- Stage reason: {stage['stage_reason']}",
@@ -1733,6 +2142,7 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             f"- Completed: `{counts['completed']}`",
             f"- Failed: `{counts['failed']}`",
             f"- Cancelled: `{counts['cancelled']}`",
+            f"- Integration issues: `{len(integration_issues)}`",
             "",
             "## Files",
             "",
@@ -1767,6 +2177,7 @@ def render_task_ledger(runs: list[dict[str, Any]]) -> str:
                 str(run["run_id"]),
                 format_inline_list(normalize_str_list(run.get("depends_on"), "depends_on")),
                 format_inline_list(relative_owned_paths(run)),
+                str(run.get("integration_state") or "-"),
                 str(run.get("session_id") or "-"),
             ]
         )
@@ -1775,8 +2186,8 @@ def render_task_ledger(runs: list[dict[str, Any]]) -> str:
             "# Task Ledger",
             "",
             markdown_table(
-                ["task", "summary", "role", "status", "dispatch", "blocked_on", "run", "depends_on", "owned_paths", "session"],
-                rows or [["-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]],
+                ["task", "summary", "role", "status", "dispatch", "blocked_on", "run", "depends_on", "owned_paths", "integration", "session"],
+                rows or [["-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]],
             ),
             "",
         ]
@@ -1810,6 +2221,7 @@ def render_dashboard(
     goal = normalize_optional_text(brief.get("goal")) if brief else None
     launch_plan = read_project_launch_plan(project_dir) if project_dir else None
     validation_status = normalize_optional_text(validation.get("status")) if validation else None
+    integration_issues = integration_alerts(runs)
     for run in sorted(runs, key=run_sort_key):
         rows.append(
             [
@@ -1819,6 +2231,7 @@ def render_dashboard(
                 str(run.get("role") or "-"),
                 str(run.get("status") or "-"),
                 str(run.get("dispatch_state") or "-"),
+                str(run.get("integration_state") or "-"),
                 str(run.get("session_id") or "-"),
                 format_inline_list(relative_owned_paths(run)),
                 format_short_timestamp(normalize_optional_text(run.get("launched_at"))),
@@ -1847,6 +2260,7 @@ def render_dashboard(
         f"- Completed: `{counts['completed']}`",
         f"- Failed: `{counts['failed']}`",
         f"- Cancelled: `{counts['cancelled']}`",
+        f"- Integration issues: `{len(integration_issues)}`",
         "",
         "## Planner Output",
         "",
@@ -1873,14 +2287,20 @@ def render_dashboard(
         "## Run Table",
         "",
         markdown_table(
-            ["run", "task", "summary", "role", "status", "dispatch", "session", "owned_paths", "launched"],
-            rows or [["-", "-", "-", "-", "-", "-", "-", "-", "-"]],
+            ["run", "task", "summary", "role", "status", "dispatch", "integration", "session", "owned_paths", "launched"],
+            rows or [["-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]],
         ),
         "",
-        "## Active Runs",
+        "## Integration",
         "",
         ]
     )
+    if not integration_issues:
+        lines.append("_No integration issues._")
+    else:
+        for item in integration_issues:
+            lines.append(f"- `{item['task_id']}` / `{item['run_id']}`: `{item['state']}` {item['note']}")
+    lines.extend(["", "## Active Runs", ""])
     if watcher_heartbeat:
         lines.insert(3, f"- Last watcher heartbeat: `{watcher_heartbeat}`")
     if not active:
@@ -1897,6 +2317,8 @@ def render_dashboard(
                     f"- Role: `{run.get('role') or '-'}`",
                     f"- Session: `{run.get('session_id') or '-'}`",
                     f"- Owned paths: {format_inline_list(relative_owned_paths(run))}",
+                    f"- Workspace mode: `{run.get('workspace_mode') or 'direct'}`",
+                    f"- Integration: `{run.get('integration_state') or '-'}`",
                     "",
                 ]
             )
@@ -1914,6 +2336,7 @@ def render_dashboard(
                     f"- Task: `{run.get('task_id') or '-'}`",
                     f"- Summary: {run.get('summary') or '-'}",
                     f"- Waiting on: {format_inline_list(normalize_str_list(run.get('blocked_on'), 'blocked_on'))}",
+                    f"- Integration: `{run.get('integration_state') or '-'}`",
                     "",
                 ]
             )
@@ -2154,29 +2577,35 @@ def render_answers_template(question_records: list[dict[str, str]], answers: dic
     return "\n".join(lines)
 
 
-def render_conflicts(conflicts: list[dict[str, str]]) -> str:
+def render_conflicts(conflicts: list[dict[str, str]], integration_issues: list[dict[str, str]]) -> str:
     lines = [
         "# Conflict Risks",
         "",
         f"_Updated: `{utc_now()}`_",
         "",
     ]
-    if not conflicts:
-        lines.append("_No owned-path overlap detected._")
-        lines.append("")
-        return "\n".join(lines)
-    rows = [
-        [item["left_run"], item["right_run"], item["left_task"], item["right_task"], item["paths"]]
-        for item in conflicts
-    ]
-    lines.extend(
-        [
-            markdown_table(["left_run", "right_run", "left_task", "right_task", "overlap"], rows),
-            "",
-            "These are conflict risks for the manager to resolve, not automatic merges. Resolve by narrowing ownership or turning one child into a reviewer.",
-            "",
+    if conflicts:
+        rows = [
+            [item["left_run"], item["right_run"], item["left_task"], item["right_task"], item["paths"]]
+            for item in conflicts
         ]
-    )
+        lines.extend(
+            [
+                markdown_table(["left_run", "right_run", "left_task", "right_task", "overlap"], rows),
+                "",
+                "These are conflict risks for the manager to resolve. Overlapping writers are serialized, and isolated writer worktrees are integrated through the manager branch.",
+                "",
+            ]
+        )
+    else:
+        lines.extend(["_No owned-path overlap detected._", ""])
+    lines.extend(["## Integration Issues", ""])
+    if not integration_issues:
+        lines.extend(["_No integration issues._", ""])
+        return "\n".join(lines)
+    for item in integration_issues:
+        lines.append(f"- `{item['task_id']}` / `{item['run_id']}`: `{item['state']}` {item['note']}")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -2190,6 +2619,7 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
     open_questions = unanswered_questions(question_records, answers)
     answered = answered_questions(question_records, answers)
     conflicts = detect_conflict_risks(runs)
+    integration_issues = integration_alerts(runs)
     brief = load_project_brief(project_dir, project_name)
     validation = load_project_validation(project_dir)
     stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
@@ -2212,6 +2642,8 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"validation={project_validation_md_path(project_dir)}",
         f"goal={normalize_optional_text(brief.get('goal')) if brief else '-'}",
         f"autonomy_mode={normalize_optional_text(brief.get('autonomy_mode')) if brief else 'manual'}",
+        f"clarification_mode={normalize_optional_text(brief.get('clarification_mode')) if brief else 'auto'}",
+        f"max_auto_fix_rounds={brief.get('max_auto_fix_rounds') if brief else 2}",
         f"validation_status={normalize_optional_text(validation.get('status')) if validation else 'not-run'}",
         f"current_stage={stage['current_stage']}",
         f"stage_reason={stage['stage_reason']}",
@@ -2226,7 +2658,7 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
     lines.append(
         "counts="
         f"running:{counts['running']} blocked:{len(blocked)} completed:{counts['completed']} "
-        f"failed:{counts['failed']} cancelled:{counts['cancelled']}"
+        f"failed:{counts['failed']} cancelled:{counts['cancelled']} integration_issues:{len(integration_issues)}"
     )
     lines.extend(project_state_policy_cli(project_name, project_dir))
     lines.extend(["", "planner:"])
@@ -2247,6 +2679,7 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
             lines.append(
                 f"- {run.get('task_id') or run['run_id']}: {run.get('summary') or '-'}"
             )
+            lines.append(f"  integration: {run.get('integration_state') or '-'}")
             if live_note != "-":
                 lines.append(f"  note: {live_note}")
     lines.extend(["", "blocked_runs:"])
@@ -2283,6 +2716,14 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
             lines.append(
                 f"- {conflict['left_task']} vs {conflict['right_task']} on {conflict['paths']}"
             )
+    lines.extend(["", "integration:"])
+    if not integration_issues:
+        lines.append("- none")
+    else:
+        for item in integration_issues:
+            lines.append(
+                f"- {item['task_id']} [{item['state']}] {short_summary(item['note'], max_chars=90)}"
+            )
     return "\n".join(lines)
 
 
@@ -2305,6 +2746,9 @@ def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list
                 f"- Status: `{run.get('status') or '-'}`",
                 f"- Session: `{run.get('session_id') or '-'}`",
                 f"- Owned paths: {format_inline_list(relative_owned_paths(run))}",
+                f"- Workspace mode: `{run.get('workspace_mode') or 'direct'}`",
+                f"- Worktree: `{run.get('worktree_path') or '-'}`",
+                f"- Integration: `{run.get('integration_state') or '-'}`",
                 f"- Depends on: {format_inline_list(normalize_str_list(run.get('depends_on'), 'depends_on'))}",
                 "",
                 "## Child Output",
@@ -2365,6 +2809,7 @@ def sync_one_project(root: Path, project_name: str, slug: str, runs: list[dict[s
         write_text(answers_path, render_answers_stub())
     answers = load_answers(project_dir)
     conflicts = detect_conflict_risks(runs)
+    integration_issues = integration_alerts(runs)
     delete_if_exists(project_dir / "project.md")
     write_text(project_dir / "README.md", render_project_overview(project_name, project_dir, runs))
     write_text(project_dir / "tasks.md", render_task_ledger(runs))
@@ -2381,7 +2826,7 @@ def sync_one_project(root: Path, project_name: str, slug: str, runs: list[dict[s
         project_dir / "answers-template.md",
         render_answers_template(question_records, answers),
     )
-    write_text(project_dir / "conflicts.md", render_conflicts(conflicts))
+    write_text(project_dir / "conflicts.md", render_conflicts(conflicts, integration_issues))
 
 
 def sync_projects(root: Path, index: dict[str, Any]) -> None:
@@ -2553,9 +2998,13 @@ def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], r
     max_rounds = int(brief.get("max_planner_rounds") or 3)
     if planner_round_count(runs) >= max_rounds:
         return False, "max-rounds-reached"
+    max_auto_fix_rounds = max(0, int(brief.get("max_auto_fix_rounds") or 0))
     validation = maybe_refresh_project_validation(project_dir, brief, runs) if runs else load_project_validation(project_dir)
     if project_is_machine_complete(brief, validation) is True:
         return False, "complete"
+    if auto_fix_round_count(runs) >= max_auto_fix_rounds and max_auto_fix_rounds >= 0:
+        if validation and validation.get("status") in {"failed", "waiting-for-sentinel"}:
+            return False, "max-auto-fix-rounds-reached"
     if latest_planner and latest_planner.get("plan_applied_at") and not normalize_str_list(latest_planner.get("planned_run_ids"), "planned_run_ids"):
         if not answers_updated_after(project_dir, normalize_optional_text(latest_planner.get("finished_at"))):
             if not validation or validation.get("status") not in {"failed", "waiting-for-sentinel"}:
@@ -2564,6 +3013,12 @@ def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], r
         return True, "first-plan"
     if any(str(run.get("status") or "") == "failed" for run in runs):
         return True, "failed-runs"
+    if any(
+        normalize_optional_text(run.get("integration_state"))
+        in {"conflict", "scope-violation", "apply-failed", "commit-failed"}
+        for run in runs
+    ):
+        return True, "integration-conflict"
     if validation and validation.get("status") in {"failed", "waiting-for-sentinel"}:
         return True, str(validation.get("status"))
     if latest_planner is None:
@@ -2571,7 +3026,15 @@ def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], r
     return False, "manual-review"
 
 
-def spawn_planner_run(root: Path, index: dict[str, Any], project_name: str, brief: dict[str, Any], project_dir: Path) -> dict[str, Any]:
+def spawn_planner_run(
+    root: Path,
+    index: dict[str, Any],
+    project_name: str,
+    brief: dict[str, Any],
+    project_dir: Path,
+    *,
+    planner_reason: str,
+) -> dict[str, Any]:
     runs = project_runs(index, project_name)
     project_cd = project_default_cwd(brief)
     planner_options = DispatchOptions(
@@ -2605,7 +3068,7 @@ def spawn_planner_run(root: Path, index: dict[str, Any], project_name: str, brie
         index,
         planner_options,
         announce=False,
-        extra_fields={"planner_source": PLANNER_SOURCE},
+        extra_fields={"planner_source": PLANNER_SOURCE, "planner_reason": planner_reason},
     )
 
 
@@ -2620,9 +3083,9 @@ def maybe_auto_drive_projects(root: Path, index: dict[str, Any]) -> None:
         if autonomy_mode != "continuous":
             continue
         runs = project_runs(index, project_name)
-        should_spawn, _reason = should_spawn_planner_for_project(project_dir, brief, runs)
+        should_spawn, reason = should_spawn_planner_for_project(project_dir, brief, runs)
         if should_spawn:
-            spawn_planner_run(root, index, project_name, brief, project_dir)
+            spawn_planner_run(root, index, project_name, brief, project_dir, planner_reason=reason)
 
 
 def read_text_if_exists(path: Path) -> str | None:
@@ -2791,6 +3254,9 @@ def monitor_state(root: Path) -> tuple[str, str | None]:
 
 
 def start_run_process(run: dict[str, Any]) -> None:
+    root = Path(run["run_dir"]).parent.parent
+    prepare_run_workspace(root, run)
+    refresh_runner_for_run(run)
     stdout_path = Path(run["stdout_path"])
     stderr_path = Path(run["stderr_log"])
     runner_path = Path(run["runner_path"])
@@ -2865,6 +3331,7 @@ def refresh_run(run: dict[str, Any]) -> None:
 def refresh_index_state(root: Path, index: dict[str, Any]) -> None:
     for run in index["runs"]:
         refresh_run(run)
+    maybe_integrate_completed_runs(root, index)
     apply_planner_outputs(root, index)
     launch_ready_runs(root, index)
     maybe_auto_drive_projects(root, index)
@@ -2903,7 +3370,66 @@ def build_runner_script(
     )
 
 
+def dispatch_options_for_run(run: dict[str, Any]) -> DispatchOptions:
+    prompt_text = read_text_if_exists(Path(run["prompt_path"])) or ""
+    return DispatchOptions(
+        provider=str(run.get("provider") or DEFAULT_PROVIDER),
+        name=normalize_optional_text(run.get("name")),
+        project=normalize_optional_text(run.get("project")),
+        task_id=normalize_optional_text(run.get("task_id")),
+        role=normalize_optional_text(run.get("role")),
+        summary=normalize_optional_text(run.get("summary")),
+        prompt_text=prompt_text,
+        cd=Path(str(run["cwd"])),
+        sandbox=normalize_optional_text(run.get("sandbox")),
+        model=normalize_optional_text(run.get("model")),
+        profile=normalize_optional_text(run.get("profile")),
+        add_dirs=[Path(path) for path in normalize_str_list(run.get("add_dirs"), "add_dirs")],
+        configs=normalize_str_list(run.get("configs"), "configs"),
+        enables=normalize_str_list(run.get("enables"), "enables"),
+        disables=normalize_str_list(run.get("disables"), "disables"),
+        images=[Path(path) for path in normalize_str_list(run.get("images"), "images")],
+        search=bool(run.get("search")),
+        skip_git_repo_check=bool(run.get("skip_git_repo_check")),
+        ephemeral=bool(run.get("ephemeral")),
+        full_auto=bool(run.get("full_auto")),
+        dangerous=bool(run.get("dangerous")),
+        dry_run=False,
+        owned_paths=normalize_str_list(run.get("owned_paths"), "owned_paths"),
+        depends_on=normalize_str_list(run.get("depends_on"), "depends_on"),
+    )
+
+
+def refresh_runner_for_run(run: dict[str, Any]) -> None:
+    adapter = get_provider(str(run.get("provider") or DEFAULT_PROVIDER))
+    options = dispatch_options_for_run(run)
+    command = adapter.build_exec_command(
+        prompt_path=Path(run["prompt_path"]),
+        last_message_path=Path(run["last_message_path"]),
+        options=options,
+    )
+    run_dir = Path(run["run_dir"])
+    runner_path = Path(run["runner_path"])
+    write_text(
+        runner_path,
+        build_runner_script(
+            command=command,
+            prompt_path=Path(run["prompt_path"]),
+            state_path=run_dir / "state.txt",
+            exit_code_path=run_dir / "exit_code.txt",
+            started_path=run_dir / "started_at.txt",
+            finished_path=run_dir / "finished_at.txt",
+        ),
+    )
+    runner_path.chmod(0o755)
+    write_text(run_dir / "command.txt", quote_command(command))
+
+
 def print_run_summary(run: dict[str, Any]) -> None:
+    print(run_summary_text(run))
+
+
+def run_summary_text(run: dict[str, Any]) -> str:
     session_id = get_session_id(run) or "-"
     exit_code = run.get("exit_code")
     exit_text = str(exit_code) if exit_code is not None else "-"
@@ -2913,12 +3439,26 @@ def print_run_summary(run: dict[str, Any]) -> None:
     blocked_on = normalize_str_list(run.get("blocked_on"), "blocked_on")
     if blocked_on:
         dispatch_state = f"{dispatch_state}:{','.join(blocked_on[:2])}"
-    print(
+    integration_state = normalize_optional_text(run.get("integration_state")) or "-"
+    return (
         f"{run['run_id']:<30} {run['status']:<10} provider={run.get('provider', DEFAULT_PROVIDER):<6} "
         f"pid={run.get('pid') or '-':<8} exit={exit_text:<4} task={task_text:<18} "
-        f"dispatch={dispatch_state:<18} "
+        f"dispatch={dispatch_state:<18} integration={integration_state:<14} "
         f"session={session_id} summary={summary_text}"
     )
+
+
+def render_watch_view(root: Path, project_name: str, runs: list[dict[str, Any]]) -> str:
+    lines = [render_project_cli_summary(root, project_name, runs), "", "runs:"]
+    if not runs:
+        lines.append("- none")
+        return "\n".join(lines)
+    for run in runs:
+        lines.append(run_summary_text(run))
+        live_note = latest_live_note(run)
+        if live_note and str(run.get("status") or "") == "running":
+            lines.append(f"  note: {short_summary(live_note, max_chars=140)}")
+    return "\n".join(lines)
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -2966,9 +3506,11 @@ def cmd_intake(args: argparse.Namespace) -> int:
             notes=list(args.note),
             constraints=list(args.constraint),
             autonomy_mode=normalize_optional_text(args.autonomy_mode),
+            clarification_mode=normalize_optional_text(args.clarification_mode),
             validation_commands=list(args.validation_command),
             completion_sentinel=normalize_optional_text(args.completion_sentinel),
             max_planner_rounds=args.max_planner_rounds,
+            max_auto_fix_rounds=args.max_auto_fix_rounds,
         )
         if not normalize_optional_text(brief.get("goal")):
             raise RuntimeError("project brief still has no goal; provide --goal")
@@ -2996,9 +3538,11 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
             notes=list(args.note),
             constraints=list(args.constraint),
             autonomy_mode=normalize_optional_text(args.autonomy_mode),
+            clarification_mode=normalize_optional_text(args.clarification_mode),
             validation_commands=list(args.validation_command),
             completion_sentinel=normalize_optional_text(args.completion_sentinel),
             max_planner_rounds=args.max_planner_rounds,
+            max_auto_fix_rounds=args.max_auto_fix_rounds,
         )
         if not normalize_optional_text(brief.get("goal")):
             raise RuntimeError("project brief still has no goal; provide --goal")
@@ -3067,7 +3611,7 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
             root,
             index,
             planner_options,
-            extra_fields={"planner_source": PLANNER_SOURCE},
+            extra_fields={"planner_source": PLANNER_SOURCE, "planner_reason": "manual-orchestrate"},
         )
     return 0
 
@@ -3083,9 +3627,22 @@ def materialize_run(
     ensure_root(root)
     adapter = get_provider(options.provider)
     adapter.validate_options(options)
+    repo_root = git_toplevel(options.cd)
+    source_repo_rel_cwd: str | None = None
+    workspace_mode = "direct"
+    worktree_path: str | None = None
+    if options.project and repo_root and (options.sandbox and options.sandbox != "read-only"):
+        try:
+            source_repo_rel_cwd = str(options.cd.relative_to(repo_root))
+        except ValueError:
+            source_repo_rel_cwd = "."
+        workspace_mode = "worktree"
     run_id = make_run_id({run["run_id"] for run in index["runs"]}, options.name)
     run_dir = root / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
+    if workspace_mode == "worktree" and options.project:
+        project_dir = ensure_project_workspace(root, options.project, project_slug(options.project))
+        worktree_path = str(project_dir / "worktrees" / run_id)
 
     prompt_path = run_dir / "prompt.md"
     last_message_path = run_dir / "last_message.md"
@@ -3131,6 +3688,13 @@ def materialize_run(
         "status": "dry-run" if options.dry_run else "prepared",
         "run_dir": str(run_dir),
         "cwd": str(options.cd),
+        "source_cwd": str(options.cd),
+        "source_repo_root": str(repo_root) if repo_root else None,
+        "source_repo_rel_cwd": source_repo_rel_cwd,
+        "workspace_mode": workspace_mode,
+        "worktree_path": worktree_path,
+        "workspace_base_ref": None,
+        "workspace_prepared_at": None,
         "prompt_path": str(prompt_path),
         "stdout_path": str(stdout_path),
         "stdout_jsonl": str(stdout_path),
@@ -3163,9 +3727,14 @@ def materialize_run(
         "dispatch_state": "dry-run" if options.dry_run else "ready",
         "blocked_on": [],
         "planner_source": None,
+        "planner_reason": None,
         "plan_applied_at": None,
         "plan_apply_error": None,
         "planned_run_ids": [],
+        "integration_state": None,
+        "integration_note": None,
+        "integration_updated_at": None,
+        "changed_paths": [],
     }
     if extra_fields:
         run.update(extra_fields)
@@ -3341,6 +3910,29 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    root = resolve_path(args.root) if args.root else default_root()
+    project_name = args.project.strip()
+    while True:
+        with root_lock(root):
+            index = load_index(root)
+            refresh_index_state(root, index)
+            runs = project_runs(index, project_name)
+            if runs:
+                project_name = str(runs[0].get("project") or runs[0].get("project_slug") or project_name)
+            view = render_watch_view(root, project_name, runs)
+            active = any(str(run.get("status") or "") == "running" for run in runs)
+            blocked = any(str(run.get("dispatch_state") or "") == "blocked" for run in runs)
+        if not args.no_clear:
+            print("\033[2J\033[H", end="")
+        print(view)
+        if args.once:
+            return 0
+        if args.exit_when_settled and not active and not blocked:
+            return 0
+        time.sleep(max(1, int(args.interval)))
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     with root_lock(root):
@@ -3502,9 +4094,11 @@ def add_project_capture_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--note", action="append", default=[], help="Additional project note or Q/A context")
     parser.add_argument("--constraint", action="append", default=[], help="Constraint the planner should respect")
     parser.add_argument("--autonomy-mode", choices=AUTONOMY_MODES, help="How self-driving the manager should be")
+    parser.add_argument("--clarification-mode", choices=CLARIFICATION_MODES, help="Whether the planner should clarify the brief before launching workers")
     parser.add_argument("--validation-command", action="append", default=[], help="Validation command to run when a project wave settles")
     parser.add_argument("--completion-sentinel", help="Text marker that indicates delivery is complete when found in child output")
     parser.add_argument("--max-planner-rounds", type=int, help="Maximum number of manager planning rounds before stopping")
+    parser.add_argument("--max-auto-fix-rounds", type=int, help="Maximum automatic validation-fix or recovery planning rounds")
 
 
 def add_orchestrate_options(parser: argparse.ArgumentParser) -> None:
@@ -3568,6 +4162,15 @@ def build_parser() -> argparse.ArgumentParser:
     status_p.add_argument("--project", help="Filter to one project name or project slug")
     status_p.add_argument("--json", action="store_true", help="Print JSON instead of a table")
     status_p.set_defaults(func=cmd_status)
+
+    watch_p = sub.add_parser("watch", help="Watch one project with a live terminal summary")
+    watch_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
+    watch_p.add_argument("--project", required=True, help="Project name or project slug")
+    watch_p.add_argument("--interval", type=int, default=2, help="Seconds between refreshes")
+    watch_p.add_argument("--once", action="store_true", help="Render one frame and exit")
+    watch_p.add_argument("--exit-when-settled", action="store_true", help="Exit when the project has no running or blocked runs")
+    watch_p.add_argument("--no-clear", action="store_true", help="Do not clear the terminal between frames")
+    watch_p.set_defaults(func=cmd_watch)
 
     show_p = sub.add_parser("show", help="Show one run and its last message")
     show_p.add_argument("run", help="Run id or unique prefix")
