@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Subsession Manager"
-  short_description: "Dispatch and track real Codex child sessions"
-  default_prompt: "Use $codex-subsession-manager to launch, track, and resume real Codex child sessions for parallel work."
+  short_description: "Dispatch, track, and aggregate Codex child sessions"
+  default_prompt: "Use $codex-subsession-manager to launch Codex child sessions, keep a project markdown dashboard, and aggregate child reports for parallel work."

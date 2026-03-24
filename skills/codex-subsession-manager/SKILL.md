@@ -13,6 +13,8 @@ Treat a subsession as a full Codex worker with its own thread, context window, t
 
 Use the control script in `scripts/codex_subsession_manager.py` instead of ad hoc shell fragments. It stores a local `.agent-subsessions/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. If an older `.codex-subsessions/` directory already exists, the script will keep using it.
 
+When runs are linked to a project, the script also maintains a central markdown workspace under `.agent-subsessions/projects/<project>/` with a dashboard, task ledger, manager summary, questions for humans, conflict-risk notes, and one child report per run.
+
 Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
 
 Keep provider-specific logic inside the adapter layer: option validation, launch command construction, session detection, and resume command generation. Read `references/provider-adapters.md` when you need to extend the script beyond Codex.
@@ -72,6 +74,24 @@ python3 scripts/codex_subsession_manager.py dispatch \
 
 Each run gets its own directory under `.agent-subsessions/runs/`.
 
+For project-managed work, attach the run to a project and task id:
+
+```bash
+python3 scripts/codex_subsession_manager.py dispatch \
+  --provider codex \
+  --project payments-migration \
+  --task-id review-api \
+  --role reviewer \
+  --owned-path services/api \
+  --depends-on plan-approved \
+  --name api-review \
+  --full-auto \
+  --sandbox read-only \
+  --prompt-file /tmp/api-review-prompt.md
+```
+
+That project link is what enables automatic markdown aggregation and progress visualization.
+
 ### 3. Track progress
 
 ```bash
@@ -81,6 +101,15 @@ python3 scripts/codex_subsession_manager.py tail 20260324-120000-ui-refactor
 ```
 
 `status` refreshes run metadata, including completion state and detected session IDs.
+
+For project-linked runs, the manager also updates:
+
+- `projects/<project>/dashboard.md`
+- `projects/<project>/tasks.md`
+- `projects/<project>/manager-summary.md`
+- `projects/<project>/questions.md`
+- `projects/<project>/conflicts.md`
+- `projects/<project>/reports/<run-id>.md`
 
 ### 4. Resume the child later
 
@@ -114,7 +143,7 @@ For multiple children, create a JSON manifest and dispatch in one command:
 python3 scripts/codex_subsession_manager.py batch --file references/example_manifest.json --dry-run
 ```
 
-Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions. Use `python3 scripts/codex_subsession_manager.py providers` to inspect the adapters currently available in the script, or `providers --json` when you need machine-readable provider capability details.
+Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions. Read `references/project-workspaces.md` when you want the central-folder workflow and automatic markdown collection behavior. Use `python3 scripts/codex_subsession_manager.py providers` to inspect the adapters currently available in the script, or `providers --json` when you need machine-readable provider capability details.
 
 ## Prompting Guidance
 
@@ -128,19 +157,24 @@ Every child prompt should include:
 
 When running multiple writers in parallel, assign disjoint file ownership. If that is not possible, turn some children into read-only researchers or reviewers instead of concurrent editors.
 
+Populate `--owned-path` when a child is allowed to write. The project workspace uses those paths to flag conflict risk in `conflicts.md`.
+
 ## Operational Guidance
 
 - Prefer `--sandbox read-only` for research-only children
 - Prefer `--sandbox workspace-write --full-auto` for normal autonomous implementation children
+- Prefer linking every meaningful child to `--project`, `--task-id`, and `--role` so the markdown dashboard remains useful
 - Use `--add-dir` for extra writable paths outside the main repo root
 - Use `--skip-git-repo-check` if a child must run outside a Git repository
 - Use `attach-session` if auto-detection misses a session ID and you need a stable resume handle
 - Use `attach-thread` as a Codex-specific compatibility alias
 - Use `reconcile` to backfill session IDs after runs finish
 - When adding another CLI later, preserve the registry and run commands; only add a new adapter and keep provider branching out of the shared lifecycle code
+- Use the project markdown files as the manager-facing UI: `dashboard.md` for progress, `tasks.md` for assignment state, `questions.md` for escalation, and `manager-summary.md` for the latest aggregate snapshot
 
 ## Guardrails
 
 - Each child session consumes normal Codex usage. Use only as many concurrent children as the task justifies.
 - Do not run concurrent writers against the same files unless the user explicitly accepts merge risk.
+- `conflicts.md` reports overlap risk from declared ownership. It does not automatically merge conflicting file edits.
 - This skill manages child provider sessions, not arbitrary background jobs. Keep the current workflow centered on real CLI session primitives rather than custom task shims.

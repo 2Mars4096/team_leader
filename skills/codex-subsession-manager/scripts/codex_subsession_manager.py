@@ -21,10 +21,11 @@ UUID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
 )
-INDEX_VERSION = 2
+INDEX_VERSION = 3
 DEFAULT_PROVIDER = "codex"
 GENERIC_ROOT_NAME = ".agent-subsessions"
 LEGACY_ROOT_NAME = ".codex-subsessions"
+QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
 
 
 def utc_now() -> str:
@@ -66,12 +67,16 @@ def index_path(root: Path) -> Path:
 
 def ensure_root(root: Path) -> None:
     (root / "runs").mkdir(parents=True, exist_ok=True)
+    (root / "projects").mkdir(parents=True, exist_ok=True)
 
 
 @dataclass(frozen=True)
 class DispatchOptions:
     provider: str
     name: str | None
+    project: str | None
+    task_id: str | None
+    role: str | None
     prompt_text: str
     cd: Path
     sandbox: str | None
@@ -88,6 +93,8 @@ class DispatchOptions:
     full_auto: bool
     dangerous: bool
     dry_run: bool
+    owned_paths: list[str]
+    depends_on: list[str]
 
 
 @dataclass(frozen=True)
@@ -341,6 +348,12 @@ def load_index(root: Path) -> dict[str, Any]:
             continue
         run.setdefault("provider", DEFAULT_PROVIDER)
         run.setdefault("stdout_path", run.get("stdout_jsonl"))
+        run.setdefault("project", None)
+        run.setdefault("project_slug", None)
+        run.setdefault("task_id", None)
+        run.setdefault("role", None)
+        run.setdefault("owned_paths", [])
+        run.setdefault("depends_on", [])
         if get_session_id(run):
             set_session_id(run, get_session_id(run))
     return data
@@ -372,6 +385,566 @@ def quote_command(parts: list[str]) -> str:
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def normalize_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def normalize_str_list(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RuntimeError(f"{field_name} must be a list of strings")
+    result: list[str] = []
+    for item in value:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def project_slug(project_name: str) -> str:
+    return slugify(project_name)
+
+
+def project_root(root: Path, run: dict[str, Any]) -> Path:
+    slug = str(run.get("project_slug") or "")
+    if not slug:
+        raise RuntimeError("run has no project slug")
+    return root / "projects" / slug
+
+
+def format_inline_list(values: list[str]) -> str:
+    if not values:
+        return "-"
+    return ", ".join(f"`{value}`" for value in values)
+
+
+def format_short_timestamp(value: str | None) -> str:
+    if not value:
+        return "-"
+    if len(value) >= 19:
+        return value[:19] + "Z" if value.endswith("Z") else value[:19]
+    return value
+
+
+def run_status_counts(runs: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        "running": 0,
+        "completed": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "other": 0,
+    }
+    for run in runs:
+        status = str(run.get("status") or "")
+        if status in counts:
+            counts[status] += 1
+        else:
+            counts["other"] += 1
+    return counts
+
+
+def run_sort_key(run: dict[str, Any]) -> tuple[str, str]:
+    launched_at = str(run.get("launched_at") or "")
+    return launched_at, str(run.get("run_id") or "")
+
+
+def markdown_table(headers: list[str], rows: list[list[str]]) -> str:
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def preview_text(text: str | None, max_lines: int = 6, max_chars: int = 700) -> str:
+    if not text:
+        return "_No child report yet._"
+    lines = [line.rstrip() for line in text.strip().splitlines()]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines.append("...")
+    preview = "\n".join(lines).strip()
+    if len(preview) > max_chars:
+        preview = preview[: max_chars - 3].rstrip() + "..."
+    return preview or "_No child report yet._"
+
+
+def relative_owned_paths(run: dict[str, Any]) -> list[str]:
+    cwd_raw = normalize_optional_text(run.get("cwd"))
+    cwd = Path(cwd_raw) if cwd_raw else None
+    result: list[str] = []
+    for raw in normalize_str_list(run.get("owned_paths"), "owned_paths"):
+        path = Path(raw)
+        if path.is_absolute() and cwd:
+            try:
+                path = path.relative_to(cwd)
+            except ValueError:
+                pass
+        normalized = str(path).replace("\\", "/").strip("/")
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def path_overlaps(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if left.startswith(right + "/"):
+        return True
+    if right.startswith(left + "/"):
+        return True
+    return False
+
+
+def run_is_writer(run: dict[str, Any]) -> bool:
+    sandbox = normalize_optional_text(run.get("sandbox"))
+    if sandbox and sandbox != "read-only":
+        return True
+    role = (normalize_optional_text(run.get("role")) or "").lower()
+    return role in {"implementation", "implementer", "writer", "owner", "manager"}
+
+
+def extract_section_items(text: str, hints: tuple[str, ...]) -> list[str]:
+    items: list[str] = []
+    active = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if active:
+                break
+            continue
+        if line.startswith("#"):
+            heading = line.lstrip("#").strip().lower()
+            active = any(hint in heading for hint in hints)
+            continue
+        if not active:
+            continue
+        if line.startswith(("-", "*", "+")):
+            cleaned = line[1:].strip()
+            if cleaned:
+                items.append(cleaned)
+            continue
+        items.append(line)
+    return items
+
+
+def extract_questions(text: str | None) -> list[str]:
+    if not text:
+        return []
+    questions: list[str] = []
+    for item in extract_section_items(text, QUESTION_SECTION_HINTS):
+        questions.append(item)
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "?" not in line:
+            continue
+        cleaned = re.sub(r"^\s*[-*+0-9.()]+\s*", "", line).strip()
+        if cleaned and cleaned not in questions:
+            questions.append(cleaned)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for question in questions:
+        if question in seen:
+            continue
+        seen.add(question)
+        unique.append(question)
+    return unique
+
+
+def last_message_for_run(run: dict[str, Any]) -> str | None:
+    return read_text_if_exists(Path(run["last_message_path"]))
+
+
+def latest_live_note(run: dict[str, Any]) -> str | None:
+    path = Path(run["stdout_path"])
+    if not path.exists():
+        return None
+    latest: str | None = None
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "agent_message" and isinstance(payload.get("text"), str):
+                latest = payload["text"]
+                continue
+            if payload.get("type") != "item.completed":
+                continue
+            item = payload.get("item")
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                latest = item["text"]
+    return latest
+
+
+def detect_conflict_risks(runs: list[dict[str, Any]]) -> list[dict[str, str]]:
+    conflicts: list[dict[str, str]] = []
+    writers = [run for run in runs if run_is_writer(run)]
+    for idx, left in enumerate(writers):
+        left_paths = relative_owned_paths(left)
+        if not left_paths:
+            continue
+        for right in writers[idx + 1 :]:
+            right_paths = relative_owned_paths(right)
+            if not right_paths:
+                continue
+            overlap = [
+                path
+                for path in left_paths
+                for other in right_paths
+                if path_overlaps(path, other)
+            ]
+            if not overlap:
+                continue
+            unique_overlap = sorted(set(overlap))
+            conflicts.append(
+                {
+                    "left_run": str(left["run_id"]),
+                    "right_run": str(right["run_id"]),
+                    "left_task": str(left.get("task_id") or left["run_id"]),
+                    "right_task": str(right.get("task_id") or right["run_id"]),
+                    "paths": ", ".join(f"`{path}`" for path in unique_overlap),
+                }
+            )
+    return conflicts
+
+
+def ensure_project_workspace(root: Path, project_name: str, slug: str) -> Path:
+    project_dir = root / "projects" / slug
+    (project_dir / "reports").mkdir(parents=True, exist_ok=True)
+    return project_dir
+
+
+def render_project_overview(project_name: str, project_dir: Path, runs: list[dict[str, Any]]) -> str:
+    counts = run_status_counts(runs)
+    cwd_values = sorted({str(run.get("cwd") or "-") for run in runs})
+    return "\n".join(
+        [
+            f"# {project_name}",
+            "",
+            "## Metadata",
+            "",
+            f"- Updated: `{utc_now()}`",
+            f"- Project folder: `{project_dir}`",
+            f"- Working directories: {format_inline_list(cwd_values)}",
+            f"- Total tracked runs: `{len(runs)}`",
+            f"- Running: `{counts['running']}`",
+            f"- Completed: `{counts['completed']}`",
+            f"- Failed: `{counts['failed']}`",
+            f"- Cancelled: `{counts['cancelled']}`",
+            "",
+            "## Files",
+            "",
+            "- `dashboard.md`: live run table and recent output previews",
+            "- `tasks.md`: task-oriented ledger",
+            "- `manager-summary.md`: concise manager snapshot",
+            "- `questions.md`: human-facing questions and blockers",
+            "- `conflicts.md`: ownership overlap and conflict-risk notes",
+            "- `reports/`: one markdown report per child run",
+            "",
+        ]
+    )
+
+
+def render_task_ledger(runs: list[dict[str, Any]]) -> str:
+    rows: list[list[str]] = []
+    for run in sorted(runs, key=run_sort_key):
+        rows.append(
+            [
+                str(run.get("task_id") or run["run_id"]),
+                str(run.get("role") or "-"),
+                str(run.get("status") or "-"),
+                str(run["run_id"]),
+                format_inline_list(normalize_str_list(run.get("depends_on"), "depends_on")),
+                format_inline_list(relative_owned_paths(run)),
+                str(run.get("session_id") or "-"),
+            ]
+        )
+    return "\n".join(
+        [
+            "# Task Ledger",
+            "",
+            markdown_table(
+                ["task", "role", "status", "run", "depends_on", "owned_paths", "session"],
+                rows or [["-", "-", "-", "-", "-", "-", "-"]],
+            ),
+            "",
+        ]
+    )
+
+
+def render_dashboard(project_name: str, runs: list[dict[str, Any]], conflicts: list[dict[str, str]], questions: list[str]) -> str:
+    counts = run_status_counts(runs)
+    rows: list[list[str]] = []
+    active: list[dict[str, Any]] = []
+    completed: list[dict[str, Any]] = []
+    for run in sorted(runs, key=run_sort_key):
+        rows.append(
+            [
+                str(run["run_id"]),
+                str(run.get("task_id") or "-"),
+                str(run.get("role") or "-"),
+                str(run.get("status") or "-"),
+                str(run.get("session_id") or "-"),
+                format_inline_list(relative_owned_paths(run)),
+                format_short_timestamp(normalize_optional_text(run.get("launched_at"))),
+            ]
+        )
+        status = str(run.get("status") or "")
+        if status == "running":
+            active.append(run)
+        elif status in {"completed", "failed", "cancelled"}:
+            completed.append(run)
+    lines = [
+        f"# {project_name} Dashboard",
+        "",
+        f"- Updated: `{utc_now()}`",
+        f"- Running: `{counts['running']}`",
+        f"- Completed: `{counts['completed']}`",
+        f"- Failed: `{counts['failed']}`",
+        f"- Cancelled: `{counts['cancelled']}`",
+        "",
+        "## Run Table",
+        "",
+        markdown_table(
+            ["run", "task", "role", "status", "session", "owned_paths", "launched"],
+            rows or [["-", "-", "-", "-", "-", "-", "-"]],
+        ),
+        "",
+        "## Active Runs",
+        "",
+    ]
+    if not active:
+        lines.append("_No active runs._")
+    else:
+        for run in active:
+            live_note = latest_live_note(run)
+            lines.extend(
+                [
+                    f"### {run['run_id']}",
+                    "",
+                    f"- Task: `{run.get('task_id') or '-'}`",
+                    f"- Role: `{run.get('role') or '-'}`",
+                    f"- Session: `{run.get('session_id') or '-'}`",
+                    f"- Owned paths: {format_inline_list(relative_owned_paths(run))}",
+                    "",
+                ]
+            )
+            if live_note:
+                lines.extend([preview_text(live_note, max_lines=3, max_chars=320), ""])
+    lines.extend(["## Recent Child Output", ""])
+    if not completed:
+        lines.append("_No finished child output yet._")
+    else:
+        for run in sorted(completed, key=run_sort_key)[-3:]:
+            lines.extend(
+                [
+                    f"### {run['run_id']}",
+                    "",
+                    preview_text(last_message_for_run(run)),
+                    "",
+                ]
+            )
+    lines.extend(["## Questions For Humans", ""])
+    if not questions:
+        lines.append("_No human questions detected._")
+    else:
+        for question in questions:
+            lines.append(f"- {question}")
+    lines.extend(["", "## Conflict Risks", ""])
+    if not conflicts:
+        lines.append("_No owned-path overlap detected._")
+    else:
+        for conflict in conflicts:
+            lines.append(
+                f"- `{conflict['left_run']}` vs `{conflict['right_run']}` on {conflict['paths']}"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_manager_summary(project_name: str, runs: list[dict[str, Any]], conflicts: list[dict[str, str]], questions: list[str]) -> str:
+    counts = run_status_counts(runs)
+    lines = [
+        f"# {project_name} Manager Summary",
+        "",
+        f"- Updated: `{utc_now()}`",
+        f"- Total runs: `{len(runs)}`",
+        f"- Running: `{counts['running']}`",
+        f"- Completed: `{counts['completed']}`",
+        f"- Failed: `{counts['failed']}`",
+        f"- Cancelled: `{counts['cancelled']}`",
+        "",
+        "## Human Attention",
+        "",
+    ]
+    if not questions and not conflicts:
+        lines.append("_No human questions or conflict alerts detected._")
+    else:
+        for question in questions:
+            lines.append(f"- {question}")
+        for conflict in conflicts:
+            lines.append(
+                f"- Conflict risk between `{conflict['left_run']}` and `{conflict['right_run']}` on {conflict['paths']}"
+            )
+    lines.extend(["", "## Finished Runs", ""])
+    finished = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("status") or "") in {"completed", "failed", "cancelled"}
+    ]
+    if not finished:
+        lines.append("_No finished runs yet._")
+    else:
+        for run in finished[-5:]:
+            lines.extend(
+                [
+                    f"### {run['run_id']} ({run.get('status') or '-'})",
+                    "",
+                    preview_text(last_message_for_run(run), max_lines=5, max_chars=500),
+                    "",
+                ]
+            )
+    return "\n".join(lines)
+
+
+def render_questions(questions: list[str]) -> str:
+    lines = [
+        "# Questions For Humans",
+        "",
+        f"_Updated: `{utc_now()}`_",
+        "",
+    ]
+    if not questions:
+        lines.append("_No human questions detected._")
+    else:
+        for question in questions:
+            lines.append(f"- {question}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_conflicts(conflicts: list[dict[str, str]]) -> str:
+    lines = [
+        "# Conflict Risks",
+        "",
+        f"_Updated: `{utc_now()}`_",
+        "",
+    ]
+    if not conflicts:
+        lines.append("_No owned-path overlap detected._")
+        lines.append("")
+        return "\n".join(lines)
+    rows = [
+        [item["left_run"], item["right_run"], item["left_task"], item["right_task"], item["paths"]]
+        for item in conflicts
+    ]
+    lines.extend(
+        [
+            markdown_table(["left_run", "right_run", "left_task", "right_task", "overlap"], rows),
+            "",
+            "These are conflict risks, not automatic merges. Resolve by narrowing ownership or turning one child into a reviewer.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list[str]:
+    questions: list[str] = []
+    for run in runs:
+        report_path = project_dir / "reports" / f"{run['run_id']}.md"
+        last_message = last_message_for_run(run)
+        questions.extend(extract_questions(last_message))
+        content = "\n".join(
+            [
+                f"# {run['run_id']}",
+                "",
+                f"- Task: `{run.get('task_id') or run['run_id']}`",
+                f"- Role: `{run.get('role') or '-'}`",
+                f"- Status: `{run.get('status') or '-'}`",
+                f"- Session: `{run.get('session_id') or '-'}`",
+                f"- Owned paths: {format_inline_list(relative_owned_paths(run))}",
+                f"- Depends on: {format_inline_list(normalize_str_list(run.get('depends_on'), 'depends_on'))}",
+                "",
+                "## Child Output",
+                "",
+                last_message.strip() if last_message and last_message.strip() else "_No child report yet._",
+                "",
+            ]
+        )
+        write_text(report_path, content)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for question in questions:
+        if question in seen:
+            continue
+        seen.add(question)
+        deduped.append(question)
+    return deduped
+
+
+def sync_projects(root: Path, index: dict[str, Any]) -> None:
+    grouped: dict[str, dict[str, Any]] = {}
+    for run in index["runs"]:
+        project_name = normalize_optional_text(run.get("project"))
+        if not project_name:
+            continue
+        slug = str(run.get("project_slug") or project_slug(project_name))
+        payload = grouped.setdefault(slug, {"name": project_name, "runs": []})
+        payload["runs"].append(run)
+    for slug, payload in grouped.items():
+        project_name = str(payload["name"])
+        runs = sorted(payload["runs"], key=run_sort_key)
+        project_dir = ensure_project_workspace(root, project_name, slug)
+        questions = write_project_reports(project_dir, runs)
+        conflicts = detect_conflict_risks(runs)
+        for conflict in conflicts:
+            questions.append(
+                f"Resolve overlap between {conflict['left_run']} and {conflict['right_run']} on {conflict['paths']}."
+            )
+        deduped_questions: list[str] = []
+        seen: set[str] = set()
+        for question in questions:
+            if question in seen:
+                continue
+            seen.add(question)
+            deduped_questions.append(question)
+        write_text(project_dir / "project.md", render_project_overview(project_name, project_dir, runs))
+        write_text(project_dir / "tasks.md", render_task_ledger(runs))
+        write_text(
+            project_dir / "dashboard.md",
+            render_dashboard(project_name, runs, conflicts, deduped_questions),
+        )
+        write_text(
+            project_dir / "manager-summary.md",
+            render_manager_summary(project_name, runs, conflicts, deduped_questions),
+        )
+        write_text(project_dir / "questions.md", render_questions(deduped_questions))
+        write_text(project_dir / "conflicts.md", render_conflicts(conflicts))
+
+
+def save_index_and_sync(root: Path, data: dict[str, Any]) -> None:
+    save_index(root, data)
+    sync_projects(root, data)
 
 
 def read_text_if_exists(path: Path) -> str | None:
@@ -559,7 +1132,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     ensure_root(root)
     data = load_index(root)
-    save_index(root, data)
+    save_index_and_sync(root, data)
     print(root)
     return 0
 
@@ -633,6 +1206,10 @@ def materialize_run(
         "run_id": run_id,
         "name": options.name or run_id,
         "provider": adapter.name,
+        "project": options.project,
+        "project_slug": project_slug(options.project) if options.project else None,
+        "task_id": options.task_id,
+        "role": options.role,
         "status": "dry-run" if options.dry_run else "prepared",
         "run_dir": str(run_dir),
         "cwd": str(options.cd),
@@ -662,6 +1239,8 @@ def materialize_run(
         "enables": list(options.enables),
         "disables": list(options.disables),
         "images": [str(path) for path in options.images],
+        "owned_paths": list(options.owned_paths),
+        "depends_on": list(options.depends_on),
     }
 
     if not options.dry_run:
@@ -681,7 +1260,7 @@ def materialize_run(
         write_text(state_path, "running\n")
 
     index["runs"].append(run)
-    save_index(root, index)
+    save_index_and_sync(root, index)
     print_run_summary(run)
     return run
 
@@ -699,6 +1278,9 @@ def common_dispatch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "options": DispatchOptions(
             provider=args.provider,
             name=args.name,
+            project=normalize_optional_text(args.project),
+            task_id=normalize_optional_text(args.task_id),
+            role=normalize_optional_text(args.role),
             prompt_text=parse_prompt(args),
             cd=resolve_path(args.cd) if args.cd else Path.cwd(),
             sandbox=args.sandbox,
@@ -715,6 +1297,8 @@ def common_dispatch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             full_auto=bool(args.full_auto),
             dangerous=bool(args.dangerous),
             dry_run=bool(args.dry_run),
+            owned_paths=normalize_str_list(args.owned_path, "owned_paths"),
+            depends_on=normalize_str_list(args.depends_on, "depends_on"),
         ),
     }
 
@@ -764,6 +1348,9 @@ def cmd_batch(args: argparse.Namespace) -> int:
         prompt, prompt_file = merged_prompt_spec(spec)
         temp_args = argparse.Namespace(**vars(args))
         temp_args.name = spec.get("name", args.name)
+        temp_args.project = spec.get("project", args.project)
+        temp_args.task_id = spec.get("task_id", args.task_id)
+        temp_args.role = spec.get("role", args.role)
         temp_args.prompt = prompt
         temp_args.prompt_file = prompt_file
         temp_args.provider = spec.get("provider", args.provider)
@@ -783,6 +1370,8 @@ def cmd_batch(args: argparse.Namespace) -> int:
         temp_args.enable = spec.get("enables", args.enable)
         temp_args.disable = spec.get("disables", args.disable)
         temp_args.image = spec.get("images", args.image)
+        temp_args.owned_path = spec.get("owned_paths", args.owned_path)
+        temp_args.depends_on = spec.get("depends_on", args.depends_on)
         materialize_run(root, index, **common_dispatch_kwargs(temp_args))
     return 0
 
@@ -792,14 +1381,26 @@ def cmd_status(args: argparse.Namespace) -> int:
     index = load_index(root)
     for run in index["runs"]:
         refresh_run(run)
-    save_index(root, index)
+    save_index_and_sync(root, index)
+    runs = index["runs"]
+    if args.project:
+        project_filter = args.project.strip().lower()
+        runs = [
+            run
+            for run in runs
+            if project_filter
+            in {
+                str(run.get("project") or "").strip().lower(),
+                str(run.get("project_slug") or "").strip().lower(),
+            }
+        ]
     if args.json:
-        print(json.dumps(index["runs"], ensure_ascii=True, indent=2))
+        print(json.dumps(runs, ensure_ascii=True, indent=2))
         return 0
-    if not index["runs"]:
+    if not runs:
         print("no runs")
         return 0
-    for run in index["runs"]:
+    for run in runs:
         print_run_summary(run)
     return 0
 
@@ -809,7 +1410,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     index = load_index(root)
     run = resolve_run(index, args.run)
     refresh_run(run)
-    save_index(root, index)
+    save_index_and_sync(root, index)
     print(json.dumps(run, ensure_ascii=True, indent=2, sort_keys=True))
     last_message = read_text_if_exists(Path(run["last_message_path"]))
     if last_message:
@@ -823,7 +1424,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
     index = load_index(root)
     run = resolve_run(index, args.run)
     refresh_run(run)
-    save_index(root, index)
+    save_index_and_sync(root, index)
     path = Path(run["stderr_log"] if args.stderr else run["stdout_jsonl"])
     if not path.exists():
         print(f"missing log: {path}", file=sys.stderr)
@@ -839,7 +1440,7 @@ def cmd_resume_cmd(args: argparse.Namespace) -> int:
     index = load_index(root)
     run = resolve_run(index, args.run)
     refresh_run(run)
-    save_index(root, index)
+    save_index_and_sync(root, index)
     print(provider_for_run(run).build_resume_command(run, args.exec))
     return 0
 
@@ -849,7 +1450,7 @@ def cmd_attach_session(args: argparse.Namespace) -> int:
     index = load_index(root)
     run = resolve_run(index, args.run)
     set_session_id(run, args.session_id)
-    save_index(root, index)
+    save_index_and_sync(root, index)
     print(f"{run['run_id']} -> {args.session_id}")
     return 0
 
@@ -861,7 +1462,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     for run in targets:
         refresh_run(run)
         print_run_summary(run)
-    save_index(root, index)
+    save_index_and_sync(root, index)
     return 0
 
 
@@ -880,7 +1481,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     run_dir = Path(run["run_dir"])
     write_text(run_dir / "state.txt", "cancelled\n")
     write_text(run_dir / "finished_at.txt", run["finished_at"] + "\n")
-    save_index(root, index)
+    save_index_and_sync(root, index)
     print_run_summary(run)
     return 0
 
@@ -894,6 +1495,9 @@ def add_common_run_options(parser: argparse.ArgumentParser) -> None:
         help="CLI provider adapter. Currently codex is implemented; the control plane is shaped for future providers.",
     )
     parser.add_argument("--name", help="Human-friendly run label")
+    parser.add_argument("--project", help="Project name for automatic markdown aggregation and dashboards")
+    parser.add_argument("--task-id", help="Stable task id inside the project workspace")
+    parser.add_argument("--role", help="Worker role such as research, implementation, reviewer, or manager")
     parser.add_argument("--prompt", help="Prompt text for the child session")
     parser.add_argument("--prompt-file", help="Path to a prompt file for the child session")
     parser.add_argument("--cd", help="Working directory for the child session")
@@ -908,6 +1512,8 @@ def add_common_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--enable", action="append", default=[], help="Pass through provider --enable")
     parser.add_argument("--disable", action="append", default=[], help="Pass through provider --disable")
     parser.add_argument("--image", action="append", default=[], help="Image path to attach where supported")
+    parser.add_argument("--owned-path", action="append", default=[], help="Declared owned file or directory path for conflict-risk tracking")
+    parser.add_argument("--depends-on", action="append", default=[], help="Task ids that must complete before this task is ready")
     parser.add_argument("--search", action="store_true", help="Enable provider live web search where supported")
     parser.add_argument(
         "--skip-git-repo-check",
@@ -949,6 +1555,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_p = sub.add_parser("status", help="Show tracked runs")
     status_p.add_argument("--root", help=f"Controller root directory (default: ./{GENERIC_ROOT_NAME})")
+    status_p.add_argument("--project", help="Filter to one project name or project slug")
     status_p.add_argument("--json", action="store_true", help="Print JSON instead of a table")
     status_p.set_defaults(func=cmd_status)
 

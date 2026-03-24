@@ -1,6 +1,16 @@
 {
   "runs": [
     {
+      "project": "payments-migration",
+      "task_id": "schema-audit",
+      "role": "reviewer",
+      "owned_paths": [
+        "db/schema",
+        "db/migrations"
+      ],
+      "depends_on": [
+        "plan-approved"
+      ],
       "provider": "codex",
       "name": "schema-audit",
       "sandbox": "read-only",
@@ -8,6 +18,15 @@
       "prompt": "Audit the schema and migration flow for correctness risks. Do not edit files. Return findings only."
     },
     {
+      "project": "payments-migration",
+      "task_id": "ui-owner",
+      "role": "implementation",
+      "owned_paths": [
+        "frontend/payments"
+      ],
+      "depends_on": [
+        "schema-audit"
+      ],
       "provider": "codex",
       "name": "ui-owner",
       "sandbox": "workspace-write",
