@@ -15,6 +15,7 @@ The manager keeps these files current:
 - `README.md`: default landing page and file map
 - `brief.md`: project goal, repo paths, spec paths, notes, and constraints
 - `launch-plan.md`: latest planner-produced child launch plan
+- `validation.md`: validation-command results and machine-evaluable delivery status
 - `dashboard.md`: live run table, watcher status, and recent output preview
 - `tasks.md`: task-oriented ledger
 - `manager-summary.md`: concise aggregate snapshot
@@ -65,6 +66,13 @@ When the user only knows the goal and a few paths, the intended flow is:
 3. let the manager-planner produce `launch-plan.md`
 4. let the manager auto-dispatch worker children from that plan
 5. answer only the questions that surface in `questions.md`
+
+If you want more self-driving behavior, add delivery settings to the brief:
+
+- `autonomy_mode`: `manual`, `guided`, or `continuous`
+- `validation_commands`: shell commands that act as delivery gates
+- `completion_sentinel`: optional text marker that means “done”
+- `max_planner_rounds`: hard stop for automatic replanning
 
 If you want to stay inside Codex instead of opening the folder, run:
 

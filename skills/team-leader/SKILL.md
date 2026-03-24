@@ -13,7 +13,7 @@ Treat a subsession as a full Codex worker with its own thread, context window, t
 
 Use the control script in `scripts/team_leader.py` instead of ad hoc shell fragments. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
-When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
+When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
 
 Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
 
@@ -58,11 +58,20 @@ python3 scripts/team_leader.py intake \
   --goal "Refactor checkout to simplify the flow and reduce payment failures." \
   --repo-path /path/to/repo \
   --spec-path /path/to/spec.md \
+  --autonomy-mode guided \
+  --validation-command "pytest -q" \
+  --completion-sentinel DELIVERY_COMPLETE \
   --constraint "Keep the current API stable for mobile clients" \
   --note "The user can answer a few human questions, but does not want to hand-author worker tasks."
 ```
 
 That creates or updates `.team-leader/projects/<project>/brief.md`.
+
+Autonomy modes:
+
+- `manual`: you explicitly run `orchestrate`
+- `guided`: the manager runs validation commands and tracks delivery status, but does not auto-start new planner waves
+- `continuous`: the manager may auto-start planner waves from the brief and keep pushing until validation/completion checks pass or the planner-round limit is reached
 
 ### 3. Let the manager plan the child sessions
 
@@ -143,6 +152,7 @@ For project-linked runs, the manager also updates:
 - `projects/<project>/README.md`
 - `projects/<project>/brief.md`
 - `projects/<project>/launch-plan.md`
+- `projects/<project>/validation.md`
 - `projects/<project>/dashboard.md`
 - `projects/<project>/tasks.md`
 - `projects/<project>/manager-summary.md`
@@ -198,6 +208,15 @@ When the user gives only the goal and a few pieces of context:
 
 That keeps the “who should do what?” decision inside the manager instead of forcing the user to enumerate child sessions manually.
 
+If you want more self-driving behavior, set:
+
+- `--autonomy-mode continuous`
+- one or more `--validation-command`
+- optionally `--completion-sentinel`
+- optionally `--max-planner-rounds`
+
+Then the manager can keep pushing toward delivery instead of stopping after one batch.
+
 ## Prompting Guidance
 
 Every child prompt should include:
@@ -219,6 +238,7 @@ Populate `--owned-path` when a child is allowed to write. The project workspace 
 - Prefer `--sandbox read-only` for research-only children
 - Prefer `--sandbox workspace-write --full-auto` for normal autonomous implementation children
 - Prefer `intake` + `orchestrate` when the user has only a project goal, paths, and a few constraints
+- Prefer `guided` or `continuous` autonomy only when you also have meaningful validation commands or a clear completion signal
 - Prefer linking every meaningful child to `--project`, `--task-id`, `--summary`, and `--role` so the markdown dashboard remains useful
 - Use `--depends-on` when a task should wait for another task to complete; the manager now keeps blocked tasks parked and launches them automatically when their prerequisites finish
 - Use `--add-dir` for extra writable paths outside the main repo root
@@ -227,7 +247,7 @@ Populate `--owned-path` when a child is allowed to write. The project workspace 
 - Use `attach-thread` as a Codex-specific compatibility alias
 - Use `reconcile` to backfill session IDs after runs finish
 - When adding another CLI later, preserve the registry and run commands; only add a new adapter and keep provider branching out of the shared lifecycle code
-- Use `README.md` as the default landing page for a project workspace, then check `brief.md` for the captured goal and `launch-plan.md` for the latest manager plan before moving into `dashboard.md`, `tasks.md`, `questions.md`, `answers.md`, and `manager-summary.md`
+- Use `README.md` as the default landing page for a project workspace, then check `brief.md` for the captured goal, `launch-plan.md` for the latest manager plan, and `validation.md` for delivery status before moving into `dashboard.md`, `tasks.md`, `questions.md`, `answers.md`, and `manager-summary.md`
 
 ## Guardrails
 

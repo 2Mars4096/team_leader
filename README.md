@@ -16,6 +16,7 @@ The default landing page for each project is `.team-leader/projects/<project>/RE
 
 - `brief.md` records the project goal, repo paths, spec paths, notes, and constraints
 - `launch-plan.md` shows the latest planner-produced child-session launch plan
+- `validation.md` shows validation-command results and machine-evaluable delivery status
 - `dashboard.md` shows live run progress, active child notes, and watcher status
 - `tasks.md` shows assignment state and summary titles
 - `manager-summary.md` shows the latest manager aggregation
@@ -32,6 +33,12 @@ While child sessions are running, the manager refreshes those markdown files aut
 3. let the planner child produce a launch plan
 4. let the manager auto-dispatch worker children from that plan
 5. answer only the questions that really need a human
+
+Projects can now set an autonomy mode:
+
+- `manual`: you explicitly run `orchestrate`
+- `guided`: the manager runs validation commands and tracks delivery state, but does not auto-start new planner waves
+- `continuous`: once the brief is present, the manager can auto-start planner waves and keep pushing until validation and completion signals say the project is delivered, or the configured planner-round limit is reached
 
 From Codex itself, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary. That prints the current stage, stage reason, next action, current focus, workspace path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
 

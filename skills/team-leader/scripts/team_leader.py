@@ -37,9 +37,12 @@ PROJECT_BRIEF_FILE = "brief.json"
 PROJECT_BRIEF_MD = "brief.md"
 PROJECT_PLAN_FILE = "launch-plan.json"
 PROJECT_PLAN_MD = "launch-plan.md"
+PROJECT_VALIDATION_FILE = "validation.json"
+PROJECT_VALIDATION_MD = "validation.md"
 PLANNER_TASK_PREFIX = "manager-plan"
 PLANNER_ROLE = "manager"
 PLANNER_SOURCE = "team-leader-planner"
+AUTONOMY_MODES = ("manual", "guided", "continuous")
 
 
 def utc_now() -> str:
@@ -533,6 +536,14 @@ def project_launch_plan_md_path(project_dir: Path) -> Path:
     return project_dir / PROJECT_PLAN_MD
 
 
+def project_validation_path(project_dir: Path) -> Path:
+    return project_dir / PROJECT_VALIDATION_FILE
+
+
+def project_validation_md_path(project_dir: Path) -> Path:
+    return project_dir / PROJECT_VALIDATION_MD
+
+
 def default_project_brief(project_name: str) -> dict[str, Any]:
     return {
         "project": project_name,
@@ -541,6 +552,10 @@ def default_project_brief(project_name: str) -> dict[str, Any]:
         "spec_paths": [],
         "notes": [],
         "constraints": [],
+        "autonomy_mode": "manual",
+        "validation_commands": [],
+        "completion_sentinel": None,
+        "max_planner_rounds": 3,
         "updated_at": utc_now(),
     }
 
@@ -566,6 +581,21 @@ def load_project_brief(project_dir: Path, project_name: str | None = None) -> di
     )
     brief["notes"] = unique_preserve_order(normalize_str_list(payload.get("notes"), "notes"))
     brief["constraints"] = unique_preserve_order(normalize_str_list(payload.get("constraints"), "constraints"))
+    autonomy_mode = normalize_optional_text(payload.get("autonomy_mode")) or "manual"
+    autonomy_mode = autonomy_mode.lower()
+    if autonomy_mode not in AUTONOMY_MODES:
+        autonomy_mode = "manual"
+    brief["autonomy_mode"] = autonomy_mode
+    brief["validation_commands"] = unique_preserve_order(
+        normalize_str_list(payload.get("validation_commands"), "validation_commands")
+    )
+    brief["completion_sentinel"] = normalize_optional_text(payload.get("completion_sentinel"))
+    max_rounds_raw = payload.get("max_planner_rounds")
+    try:
+        max_rounds = int(max_rounds_raw)
+    except (TypeError, ValueError):
+        max_rounds = 3
+    brief["max_planner_rounds"] = max(1, max_rounds)
     brief["updated_at"] = normalize_optional_text(payload.get("updated_at")) or utc_now()
     return brief
 
@@ -589,6 +619,10 @@ def merge_project_brief(
     spec_paths: list[str] | None = None,
     notes: list[str] | None = None,
     constraints: list[str] | None = None,
+    autonomy_mode: str | None = None,
+    validation_commands: list[str] | None = None,
+    completion_sentinel: str | None = None,
+    max_planner_rounds: int | None = None,
 ) -> dict[str, Any]:
     brief = dict(existing or default_project_brief(project_name))
     brief["project"] = project_name
@@ -609,6 +643,19 @@ def merge_project_brief(
         normalize_str_list(brief.get("constraints"), "constraints")
         + [item for item in (constraints or []) if item]
     )
+    if autonomy_mode is not None:
+        mode = autonomy_mode.strip().lower()
+        if mode not in AUTONOMY_MODES:
+            raise RuntimeError(f"unsupported autonomy mode: {autonomy_mode}. supported values: {', '.join(AUTONOMY_MODES)}")
+        brief["autonomy_mode"] = mode
+    brief["validation_commands"] = unique_preserve_order(
+        normalize_str_list(brief.get("validation_commands"), "validation_commands")
+        + [item for item in (validation_commands or []) if item]
+    )
+    if completion_sentinel is not None:
+        brief["completion_sentinel"] = completion_sentinel
+    if max_planner_rounds is not None:
+        brief["max_planner_rounds"] = max(1, int(max_planner_rounds))
     brief["updated_at"] = utc_now()
     return brief
 
@@ -619,6 +666,10 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     spec_paths = normalize_str_list(brief.get("spec_paths"), "spec_paths")
     notes = normalize_str_list(brief.get("notes"), "notes")
     constraints = normalize_str_list(brief.get("constraints"), "constraints")
+    validation_commands = normalize_str_list(brief.get("validation_commands"), "validation_commands")
+    autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) or "manual"
+    completion_sentinel = normalize_optional_text(brief.get("completion_sentinel"))
+    max_planner_rounds = brief.get("max_planner_rounds")
     lines = [
         f"# {brief.get('project') or 'Project'} Brief",
         "",
@@ -648,6 +699,16 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     else:
         for item in constraints:
             lines.append(f"- {item}")
+    lines.extend(["", "## Delivery Policy", ""])
+    lines.append(f"- Autonomy mode: `{autonomy_mode}`")
+    lines.append(f"- Max planner rounds: `{max_planner_rounds}`")
+    lines.append(f"- Completion sentinel: `{completion_sentinel or '-'}`")
+    lines.extend(["", "## Validation Commands", ""])
+    if not validation_commands:
+        lines.append("_No validation commands recorded yet._")
+    else:
+        for item in validation_commands:
+            lines.append(f"- `{item}`")
     lines.extend(["", "## Notes", ""])
     if not notes:
         lines.append("_No notes recorded yet._")
@@ -718,6 +779,89 @@ def render_project_launch_plan(payload: dict[str, Any]) -> str:
     lines.extend(
         [
             markdown_table(["task", "summary", "role", "sandbox", "depends_on", "owned_paths"], rows or [["-", "-", "-", "-", "-", "-"]]),
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def default_project_validation() -> dict[str, Any]:
+    return {
+        "updated_at": None,
+        "status": "not-run",
+        "basis": None,
+        "validated_at": None,
+        "completion_sentinel": None,
+        "completion_satisfied": None,
+        "completion_source": None,
+        "commands": [],
+    }
+
+
+def load_project_validation(project_dir: Path) -> dict[str, Any] | None:
+    path = project_validation_path(project_dir)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid project validation file: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"invalid project validation file: {path}")
+    record = default_project_validation()
+    record.update(payload)
+    commands = payload.get("commands")
+    if not isinstance(commands, list):
+        record["commands"] = []
+    return record
+
+
+def save_project_validation(project_dir: Path, payload: dict[str, Any]) -> None:
+    write_text(
+        project_validation_path(project_dir),
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+    )
+    write_text(project_validation_md_path(project_dir), render_project_validation(payload))
+
+
+def render_project_validation(payload: dict[str, Any]) -> str:
+    commands = payload.get("commands")
+    if not isinstance(commands, list):
+        commands = []
+    lines = [
+        "# Validation",
+        "",
+        f"- Updated: `{normalize_optional_text(payload.get('updated_at')) or utc_now()}`",
+        f"- Status: `{normalize_optional_text(payload.get('status')) or 'not-run'}`",
+        f"- Validated at: `{normalize_optional_text(payload.get('validated_at')) or '-'}`",
+        f"- Basis: `{normalize_optional_text(payload.get('basis')) or '-'}`",
+        f"- Completion sentinel: `{normalize_optional_text(payload.get('completion_sentinel')) or '-'}`",
+        f"- Completion satisfied: `{normalize_optional_text(payload.get('completion_satisfied')) or '-'}`",
+        f"- Completion source: `{normalize_optional_text(payload.get('completion_source')) or '-'}`",
+        "",
+        "## Commands",
+        "",
+    ]
+    if not commands:
+        lines.append("_No validation results recorded yet._")
+        lines.append("")
+        return "\n".join(lines)
+    rows: list[list[str]] = []
+    for item in commands:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            [
+                short_summary(normalize_optional_text(item.get("command")), max_chars=54),
+                str(item.get("exit_code") if item.get("exit_code") is not None else "-"),
+                short_summary(normalize_optional_text(item.get("status")), max_chars=18),
+                short_summary(normalize_optional_text(item.get("stdout_preview")), max_chars=60),
+                short_summary(normalize_optional_text(item.get("stderr_preview")), max_chars=60),
+            ]
+        )
+    lines.extend(
+        [
+            markdown_table(["command", "exit", "status", "stdout", "stderr"], rows or [["-", "-", "-", "-", "-"]]),
             "",
         ]
     )
@@ -956,12 +1100,156 @@ def project_default_cwd(brief: dict[str, Any] | None) -> Path:
     return Path.cwd()
 
 
+def planner_round_count(runs: list[dict[str, Any]]) -> int:
+    return sum(1 for run in runs if run_is_planner(run))
+
+
+def project_run_basis(runs: list[dict[str, Any]]) -> str:
+    payload = [
+        {
+            "run_id": str(run.get("run_id") or ""),
+            "status": str(run.get("status") or ""),
+            "dispatch_state": str(run.get("dispatch_state") or ""),
+            "finished_at": str(run.get("finished_at") or ""),
+            "exit_code": run.get("exit_code"),
+        }
+        for run in sorted(runs, key=run_sort_key)
+        if not run_is_planner(run)
+    ]
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def completion_signal_from_runs(runs: list[dict[str, Any]], sentinel: str | None) -> tuple[bool | None, str | None]:
+    marker = normalize_optional_text(sentinel)
+    if not marker:
+        return None, None
+    marker_l = marker.lower()
+    for run in sorted(runs, key=run_sort_key, reverse=True):
+        text = (last_message_for_run(run) or "").lower()
+        if marker_l in text:
+            return True, str(run.get("run_id") or "")
+    return False, None
+
+
+def execute_validation_commands(project_dir: Path, brief: dict[str, Any], runs: list[dict[str, Any]]) -> dict[str, Any]:
+    commands = normalize_str_list(brief.get("validation_commands"), "validation_commands")
+    basis = project_run_basis(runs)
+    sentinel = normalize_optional_text(brief.get("completion_sentinel"))
+    completion_satisfied, completion_source = completion_signal_from_runs(runs, sentinel)
+    record = default_project_validation()
+    record["updated_at"] = utc_now()
+    record["basis"] = basis
+    record["completion_sentinel"] = sentinel
+    record["completion_satisfied"] = completion_satisfied
+    record["completion_source"] = completion_source
+    if not commands:
+        record["status"] = "passed" if completion_satisfied is not False else "waiting-for-sentinel"
+        record["validated_at"] = utc_now()
+        record["commands"] = []
+        return record
+    cwd = project_default_cwd(brief)
+    results: list[dict[str, Any]] = []
+    overall_ok = True
+    for command in commands:
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(cwd),
+                text=True,
+                capture_output=True,
+                timeout=600,
+            )
+            exit_code = proc.returncode
+            stdout_preview = preview_text(proc.stdout, max_lines=4, max_chars=300)
+            stderr_preview = preview_text(proc.stderr, max_lines=4, max_chars=300)
+            status = "passed" if exit_code == 0 else "failed"
+        except subprocess.TimeoutExpired as exc:
+            exit_code = None
+            stdout_preview = preview_text(exc.stdout, max_lines=4, max_chars=300) if exc.stdout else "_Timed out before stdout was captured._"
+            stderr_preview = preview_text(exc.stderr, max_lines=4, max_chars=300) if exc.stderr else "_Timed out before stderr was captured._"
+            status = "timeout"
+        results.append(
+            {
+                "command": command,
+                "exit_code": exit_code,
+                "status": status,
+                "stdout_preview": stdout_preview,
+                "stderr_preview": stderr_preview,
+            }
+        )
+        if status != "passed":
+            overall_ok = False
+    record["commands"] = results
+    if not overall_ok:
+        record["status"] = "failed"
+    elif completion_satisfied is False:
+        record["status"] = "waiting-for-sentinel"
+    else:
+        record["status"] = "passed"
+    record["validated_at"] = utc_now()
+    return record
+
+
+def maybe_refresh_project_validation(project_dir: Path, brief: dict[str, Any], runs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    validation = load_project_validation(project_dir) or default_project_validation()
+    commands = normalize_str_list(brief.get("validation_commands"), "validation_commands")
+    sentinel = normalize_optional_text(brief.get("completion_sentinel"))
+    if not commands and not sentinel:
+        if project_validation_path(project_dir).exists() or project_validation_md_path(project_dir).exists():
+            save_project_validation(project_dir, validation)
+        return validation
+    active = any(str(run.get("status") or "") == "running" for run in runs)
+    blocked = any(str(run.get("dispatch_state") or "") == "blocked" for run in runs)
+    failed = any(str(run.get("status") or "") == "failed" for run in runs)
+    if active or blocked or failed:
+        return validation
+    if not runs:
+        return validation
+    basis = project_run_basis(runs)
+    if validation.get("basis") == basis and validation.get("status") in {"passed", "failed", "waiting-for-sentinel"}:
+        completion_satisfied, completion_source = completion_signal_from_runs(runs, sentinel)
+        if validation.get("completion_satisfied") != completion_satisfied or validation.get("completion_source") != completion_source:
+            validation["completion_satisfied"] = completion_satisfied
+            validation["completion_source"] = completion_source
+            validation["updated_at"] = utc_now()
+            if validation.get("status") == "passed" and completion_satisfied is False:
+                validation["status"] = "waiting-for-sentinel"
+            elif validation.get("status") == "waiting-for-sentinel" and completion_satisfied is True:
+                validation["status"] = "passed"
+            save_project_validation(project_dir, validation)
+        return validation
+    validation = execute_validation_commands(project_dir, brief, runs)
+    save_project_validation(project_dir, validation)
+    return validation
+
+
+def project_is_machine_complete(brief: dict[str, Any] | None, validation: dict[str, Any] | None) -> bool | None:
+    if not brief:
+        return None
+    sentinel = normalize_optional_text(brief.get("completion_sentinel"))
+    commands = normalize_str_list(brief.get("validation_commands"), "validation_commands")
+    if not sentinel and not commands:
+        return None
+    if not validation:
+        return False
+    if validation.get("status") != "passed":
+        return False
+    if sentinel:
+        return bool(validation.get("completion_satisfied"))
+    return True
+
+
 def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project_dir: Path, existing_runs: list[dict[str, Any]]) -> str:
     goal = normalize_optional_text(brief.get("goal")) or "No goal recorded yet."
     repo_paths = normalize_str_list(brief.get("repo_paths"), "repo_paths")
     spec_paths = normalize_str_list(brief.get("spec_paths"), "spec_paths")
     notes = normalize_str_list(brief.get("notes"), "notes")
     constraints = normalize_str_list(brief.get("constraints"), "constraints")
+    validation_commands = normalize_str_list(brief.get("validation_commands"), "validation_commands")
+    autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) or "manual"
+    completion_sentinel = normalize_optional_text(brief.get("completion_sentinel"))
+    max_planner_rounds = brief.get("max_planner_rounds")
     previous_workers = [run for run in existing_runs if not run_is_planner(run)]
     lines = [
         f"You are the manager-planner for the project `{project_name}`.",
@@ -999,6 +1287,16 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             lines.append(f"- {item}")
     else:
         lines.append("- none recorded")
+    lines.extend(["", "Delivery policy:"])
+    lines.append(f"- autonomy_mode={autonomy_mode}")
+    lines.append(f"- max_planner_rounds={max_planner_rounds}")
+    lines.append(f"- completion_sentinel={completion_sentinel or '-'}")
+    lines.extend(["", "Validation commands:"])
+    if validation_commands:
+        for item in validation_commands:
+            lines.append(f"- `{item}`")
+    else:
+        lines.append("- none recorded")
     lines.extend(["", "Existing tracked runs:"])
     if previous_workers:
         for run in previous_workers[-10:]:
@@ -1014,6 +1312,8 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             "- Use as few child sessions as necessary.",
             "- Split writers by disjoint file ownership whenever possible.",
             "- Prefer read-only research or review children if write boundaries are unclear.",
+            "- Use the delivery policy to decide whether another wave is necessary.",
+            "- If validation likely needs to run before more work, plan a reviewer or fixer wave only when the current outputs suggest more work is needed.",
             "- If a human decision is required, ask concise questions under a `Questions For Humans` heading.",
             "- If you have enough information, emit exactly one JSON code block with a launch plan.",
             "",
@@ -1240,6 +1540,7 @@ def project_stage_snapshot(
     answers: dict[str, str],
     conflicts: list[dict[str, str]],
     brief: dict[str, Any] | None = None,
+    validation: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     counts = run_status_counts(runs)
     active = [
@@ -1255,6 +1556,9 @@ def project_stage_snapshot(
         if str(run.get("status") or "") == "failed"
     ]
     open_questions = unanswered_questions(question_records, answers)
+    machine_complete = project_is_machine_complete(brief, validation)
+    validation_status = normalize_optional_text(validation.get("status")) if validation else None
+    autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) if brief else None
     total = len(runs)
     progress = (
         f"{counts['completed']}/{total} completed, "
@@ -1296,10 +1600,31 @@ def project_stage_snapshot(
         stage_reason = f"{len(failed)} run(s) failed"
         next_action = f"Inspect `{first_failed['run_id']}` with `show` or `tail`"
         focus = str(first_failed.get("summary") or "-")
+    elif validation_status == "failed":
+        current_stage = "validation-failed"
+        stage_reason = "Validation commands reported failures"
+        if autonomy_mode == "continuous":
+            next_action = "Manager will plan another delivery wave automatically"
+        else:
+            next_action = "Review `validation.md` and rerun `orchestrate` when ready"
+        focus = "Validation gate did not pass"
+    elif validation_status == "waiting-for-sentinel":
+        current_stage = "awaiting-completion-signal"
+        stage_reason = "Validation passed but the completion sentinel was not found"
+        next_action = "Review results or run another planning round"
+        focus = normalize_optional_text(brief.get("completion_sentinel")) or "Waiting for completion signal"
+    elif machine_complete is True:
+        current_stage = "delivered"
+        stage_reason = "Machine-evaluable delivery criteria are satisfied"
+        next_action = "Review final outputs and close the project"
+        focus = "Delivery criteria satisfied"
     elif total > 0 and counts["completed"] == total:
         current_stage = "completed"
         stage_reason = "All tracked runs finished successfully"
-        next_action = "Review `manager-summary.md` and decide the next batch"
+        if validation_status and validation_status != "not-run":
+            next_action = "Review `validation.md` and decide the next batch"
+        else:
+            next_action = "Review `manager-summary.md` and decide the next batch"
         focus = "All current tasks are complete"
     elif brief and normalize_optional_text(brief.get("goal")):
         current_stage = "ready-for-planning"
@@ -1329,8 +1654,11 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
     answers = load_answers(project_dir)
     conflicts = detect_conflict_risks(runs)
     brief = load_project_brief(project_dir, project_name)
-    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief)
+    validation = load_project_validation(project_dir)
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
     goal = normalize_optional_text(brief.get("goal")) if brief else None
+    autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) if brief else None
+    validation_status = normalize_optional_text(validation.get("status")) if validation else None
     watcher_line = f"- Manager watcher: `{watcher_state}`"
     if watcher_heartbeat:
         watcher_line += f" (last heartbeat `{watcher_heartbeat}`)"
@@ -1346,7 +1674,10 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             f"- Project folder: `{project_dir}`",
             f"- Brief file: `{project_brief_md_path(project_dir)}`",
             f"- Launch plan: `{project_launch_plan_md_path(project_dir)}`",
+            f"- Validation: `{project_validation_md_path(project_dir)}`",
             f"- Goal: {goal or '_No goal recorded yet._'}",
+            f"- Autonomy mode: `{autonomy_mode or 'manual'}`",
+            f"- Validation status: `{validation_status or 'not-run'}`",
             f"- Current stage: `{stage['current_stage']}`",
             f"- Stage reason: {stage['stage_reason']}",
             f"- Next action: {stage['next_action']}",
@@ -1365,6 +1696,7 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             "",
             "- `brief.md`: project goal, repo paths, spec paths, notes, and constraints",
             "- `launch-plan.md`: latest planner-produced child launch plan",
+            "- `validation.md`: latest validation results and delivery status",
             "- `dashboard.md`: live run table, active notes, questions, and conflict alerts",
             "- `tasks.md`: task-oriented ledger with summaries and ownership",
             "- `manager-summary.md`: concise manager snapshot",
@@ -1430,9 +1762,11 @@ def render_dashboard(
     open_questions = unanswered_questions(question_records, answers)
     answered = answered_questions(question_records, answers)
     brief = load_project_brief(project_dir, project_name) if project_dir else None
-    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief)
+    validation = load_project_validation(project_dir) if project_dir else None
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
     goal = normalize_optional_text(brief.get("goal")) if brief else None
     launch_plan = read_project_launch_plan(project_dir) if project_dir else None
+    validation_status = normalize_optional_text(validation.get("status")) if validation else None
     for run in sorted(runs, key=run_sort_key):
         rows.append(
             [
@@ -1459,6 +1793,7 @@ def render_dashboard(
         "",
         f"- Updated: `{utc_now()}`",
         f"- Goal: {goal or '_No goal recorded yet._'}",
+        f"- Validation status: `{validation_status or 'not-run'}`",
         f"- Current stage: `{stage['current_stage']}`",
         f"- Stage reason: {stage['stage_reason']}",
         f"- Next action: {stage['next_action']}",
@@ -1486,6 +1821,11 @@ def render_dashboard(
         lines.extend(["_No planner launch plan captured yet._", "",])
     lines.extend(
         [
+        "## Validation",
+        "",
+        f"- Status: `{validation_status or 'not-run'}`",
+        f"- File: `{project_validation_md_path(project_dir) if project_dir else '-'}`",
+        "",
         "## Run Table",
         "",
         markdown_table(
@@ -1594,14 +1934,17 @@ def render_manager_summary(
     if project_dir is None and runs:
         project_dir = project_root(Path(runs[0]["run_dir"]).parent.parent, runs[0])
     brief = load_project_brief(project_dir, project_name) if project_dir else None
-    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief)
+    validation = load_project_validation(project_dir) if project_dir else None
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
     goal = normalize_optional_text(brief.get("goal")) if brief else None
     launch_plan = read_project_launch_plan(project_dir) if project_dir else None
+    validation_status = normalize_optional_text(validation.get("status")) if validation else None
     lines = [
         f"# {project_name} Manager Summary",
         "",
         f"- Updated: `{utc_now()}`",
         f"- Goal: {goal or '_No goal recorded yet._'}",
+        f"- Validation status: `{validation_status or 'not-run'}`",
         f"- Current stage: `{stage['current_stage']}`",
         f"- Stage reason: {stage['stage_reason']}",
         f"- Next action: {stage['next_action']}",
@@ -1805,7 +2148,8 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
     answered = answered_questions(question_records, answers)
     conflicts = detect_conflict_risks(runs)
     brief = load_project_brief(project_dir, project_name)
-    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief)
+    validation = load_project_validation(project_dir)
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
     launch_plan = read_project_launch_plan(project_dir)
     active = [
         run for run in sorted(runs, key=run_sort_key)
@@ -1822,7 +2166,10 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"dashboard={project_dir / 'dashboard.md'}",
         f"brief={project_brief_md_path(project_dir)}",
         f"launch_plan={project_launch_plan_md_path(project_dir)}",
+        f"validation={project_validation_md_path(project_dir)}",
         f"goal={normalize_optional_text(brief.get('goal')) if brief else '-'}",
+        f"autonomy_mode={normalize_optional_text(brief.get('autonomy_mode')) if brief else 'manual'}",
+        f"validation_status={normalize_optional_text(validation.get('status')) if validation else 'not-run'}",
         f"current_stage={stage['current_stage']}",
         f"stage_reason={stage['stage_reason']}",
         f"next_action={stage['next_action']}",
@@ -1963,6 +2310,11 @@ def sync_one_project(root: Path, project_name: str, slug: str, runs: list[dict[s
         write_text(project_brief_md_path(project_dir), render_project_brief(brief))
     if not project_launch_plan_md_path(project_dir).exists():
         write_text(project_launch_plan_md_path(project_dir), render_project_launch_plan({}))
+    validation = load_project_validation(project_dir)
+    if validation:
+        write_text(project_validation_md_path(project_dir), render_project_validation(validation))
+    elif not project_validation_md_path(project_dir).exists():
+        write_text(project_validation_md_path(project_dir), render_project_validation(default_project_validation()))
     question_records = write_project_reports(project_dir, runs)
     answers_path = project_dir / "answers.md"
     if not answers_path.exists():
@@ -2136,6 +2488,97 @@ def apply_planner_outputs(root: Path, index: dict[str, Any]) -> None:
         if str(run.get("status") or "") != "completed":
             continue
         apply_planner_run(root, index, run)
+
+
+def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], runs: list[dict[str, Any]]) -> tuple[bool, str]:
+    if not normalize_optional_text(brief.get("goal")):
+        return False, "missing-goal"
+    open_questions = unanswered_questions(collect_question_records(runs), load_answers(project_dir))
+    if open_questions:
+        return False, "waiting-for-human"
+    conflicts = detect_conflict_risks(runs)
+    if conflicts:
+        return False, "resolve-conflicts"
+    if any(str(run.get("status") or "") == "running" for run in runs):
+        return False, "active-runs"
+    if any(str(run.get("dispatch_state") or "") == "blocked" for run in runs):
+        return False, "blocked-runs"
+    latest_planner = latest_project_planner_run(runs)
+    if latest_planner and str(latest_planner.get("status") or "") in {"running", "prepared", "blocked"}:
+        return False, "planner-already-running"
+    max_rounds = int(brief.get("max_planner_rounds") or 3)
+    if planner_round_count(runs) >= max_rounds:
+        return False, "max-rounds-reached"
+    validation = maybe_refresh_project_validation(project_dir, brief, runs) if runs else load_project_validation(project_dir)
+    if project_is_machine_complete(brief, validation) is True:
+        return False, "complete"
+    if latest_planner and latest_planner.get("plan_applied_at") and not normalize_str_list(latest_planner.get("planned_run_ids"), "planned_run_ids"):
+        if not answers_updated_after(project_dir, normalize_optional_text(latest_planner.get("finished_at"))):
+            if not validation or validation.get("status") not in {"failed", "waiting-for-sentinel"}:
+                return False, "planner-produced-no-work"
+    if not runs:
+        return True, "first-plan"
+    if any(str(run.get("status") or "") == "failed" for run in runs):
+        return True, "failed-runs"
+    if validation and validation.get("status") in {"failed", "waiting-for-sentinel"}:
+        return True, str(validation.get("status"))
+    if latest_planner is None:
+        return True, "missing-planner"
+    return False, "manual-review"
+
+
+def spawn_planner_run(root: Path, index: dict[str, Any], project_name: str, brief: dict[str, Any], project_dir: Path) -> dict[str, Any]:
+    runs = project_runs(index, project_name)
+    project_cd = project_default_cwd(brief)
+    planner_options = DispatchOptions(
+        provider=DEFAULT_PROVIDER,
+        name=next_planner_task_id(runs),
+        project=project_name,
+        task_id=next_planner_task_id(runs),
+        role=PLANNER_ROLE,
+        summary=f"Plan and assign the next child sessions for {project_name}",
+        prompt_text=planner_prompt_for_project(project_name, brief, project_dir, runs),
+        cd=project_cd,
+        sandbox="read-only",
+        model=None,
+        profile=None,
+        add_dirs=project_extra_add_dirs(project_cd, brief),
+        configs=[],
+        enables=[],
+        disables=[],
+        images=[],
+        search=False,
+        skip_git_repo_check=False,
+        ephemeral=False,
+        full_auto=True,
+        dangerous=False,
+        dry_run=False,
+        owned_paths=[],
+        depends_on=[],
+    )
+    return materialize_run(
+        root,
+        index,
+        planner_options,
+        announce=False,
+        extra_fields={"planner_source": PLANNER_SOURCE},
+    )
+
+
+def maybe_auto_drive_projects(root: Path, index: dict[str, Any]) -> None:
+    for slug, project_name in sorted(known_projects(root, index).items()):
+        project_dir = ensure_project_workspace(root, project_name, slug)
+        brief = load_project_brief(project_dir, project_name)
+        if not brief:
+            continue
+        maybe_refresh_project_validation(project_dir, brief, project_runs(index, project_name))
+        autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) or "manual"
+        if autonomy_mode != "continuous":
+            continue
+        runs = project_runs(index, project_name)
+        should_spawn, _reason = should_spawn_planner_for_project(project_dir, brief, runs)
+        if should_spawn:
+            spawn_planner_run(root, index, project_name, brief, project_dir)
 
 
 def read_text_if_exists(path: Path) -> str | None:
@@ -2380,6 +2823,7 @@ def refresh_index_state(root: Path, index: dict[str, Any]) -> None:
         refresh_run(run)
     apply_planner_outputs(root, index)
     launch_ready_runs(root, index)
+    maybe_auto_drive_projects(root, index)
     save_index_and_sync(root, index)
     ensure_monitor(root, index)
 
@@ -2477,6 +2921,10 @@ def cmd_intake(args: argparse.Namespace) -> int:
             spec_paths=list(args.spec_path),
             notes=list(args.note),
             constraints=list(args.constraint),
+            autonomy_mode=normalize_optional_text(args.autonomy_mode),
+            validation_commands=list(args.validation_command),
+            completion_sentinel=normalize_optional_text(args.completion_sentinel),
+            max_planner_rounds=args.max_planner_rounds,
         )
         if not normalize_optional_text(brief.get("goal")):
             raise RuntimeError("project brief still has no goal; provide --goal")
@@ -2503,11 +2951,16 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
             spec_paths=list(args.spec_path),
             notes=list(args.note),
             constraints=list(args.constraint),
+            autonomy_mode=normalize_optional_text(args.autonomy_mode),
+            validation_commands=list(args.validation_command),
+            completion_sentinel=normalize_optional_text(args.completion_sentinel),
+            max_planner_rounds=args.max_planner_rounds,
         )
         if not normalize_optional_text(brief.get("goal")):
             raise RuntimeError("project brief still has no goal; provide --goal")
         save_project_brief(project_dir, brief)
         runs = project_runs(index, project_name)
+        maybe_refresh_project_validation(project_dir, brief, runs)
         question_records = collect_question_records(runs)
         answers = load_answers(project_dir)
         open_questions = unanswered_questions(question_records, answers)
@@ -2539,11 +2992,12 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
         add_dirs = project_extra_add_dirs(project_default_cwd(brief), brief)
         add_dirs.extend(resolve_path(path) for path in args.add_dir)
         add_dirs = [path for idx, path in enumerate(add_dirs) if path not in add_dirs[:idx]]
+        planner_task_id = next_planner_task_id(runs)
         planner_options = DispatchOptions(
             provider=args.provider,
-            name=next_planner_task_id(runs),
+            name=planner_task_id,
             project=project_name,
-            task_id=next_planner_task_id(runs),
+            task_id=planner_task_id,
             role=PLANNER_ROLE,
             summary=f"Plan and assign the next child sessions for {project_name}",
             prompt_text=planner_prompt_for_project(project_name, brief, project_dir, runs),
@@ -3003,6 +3457,10 @@ def add_project_capture_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--spec-path", action="append", default=[], help="Relevant spec, design, or reference path")
     parser.add_argument("--note", action="append", default=[], help="Additional project note or Q/A context")
     parser.add_argument("--constraint", action="append", default=[], help="Constraint the planner should respect")
+    parser.add_argument("--autonomy-mode", choices=AUTONOMY_MODES, help="How self-driving the manager should be")
+    parser.add_argument("--validation-command", action="append", default=[], help="Validation command to run when a project wave settles")
+    parser.add_argument("--completion-sentinel", help="Text marker that indicates delivery is complete when found in child output")
+    parser.add_argument("--max-planner-rounds", type=int, help="Maximum number of manager planning rounds before stopping")
 
 
 def add_orchestrate_options(parser: argparse.ArgumentParser) -> None:
