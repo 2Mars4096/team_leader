@@ -67,8 +67,22 @@ def resolve_path(raw: str | Path) -> Path:
     return Path(raw).expanduser().resolve()
 
 
+def path_looks_like_skill_dir(path: Path) -> bool:
+    return (
+        (path / "SKILL.md").exists()
+        and (path / "scripts" / "team_leader.py").exists()
+        and (path / "agents" / "openai.yaml").exists()
+    )
+
+
 def default_root() -> Path:
     cwd = Path.cwd()
+    if path_looks_like_skill_dir(cwd):
+        raise RuntimeError(
+            "current working directory looks like the team-leader skill directory. "
+            "Run this controller from the target project directory so the default "
+            f"{DEFAULT_ROOT_NAME} root is created there, or pass --root and --cd explicitly."
+        )
     default_path = cwd / DEFAULT_ROOT_NAME
     if default_path.exists():
         return default_path
@@ -783,6 +797,34 @@ def render_project_launch_plan(payload: dict[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def project_state_policy_markdown(project_name: str, project_dir: Path) -> list[str]:
+    return [
+        "## State Policy",
+        "",
+        f"- Project slug: `{project_slug(project_name)}`",
+        f"- Reused folder: `{project_dir}`",
+        "- Same project name reuses this folder and its tracked history.",
+        "- Generated markdown files here are persistent manager state, not disposable temp files.",
+        "- Normal continuation: keep the files and let the manager refresh them.",
+        "- Human-edited file: `answers.md`.",
+        "- Clean restart: use a new project name instead of deleting generated files by hand.",
+        "",
+    ]
+
+
+def project_state_policy_cli(project_name: str, project_dir: Path) -> list[str]:
+    return [
+        "",
+        "state_policy:",
+        f"- project_slug={project_slug(project_name)}",
+        f"- reused_folder={project_dir}",
+        "- same project name reuses this folder and tracked history",
+        "- generated markdown files are persistent manager state",
+        "- normal continuation: keep the files; only answers.md is meant for human edits",
+        "- clean restart: use a new project name instead of deleting generated files by hand",
+    ]
 
 
 def default_project_validation() -> dict[str, Any]:
@@ -1706,6 +1748,7 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             "- `conflicts.md`: ownership overlap and conflict-risk notes",
             "- `reports/`: one markdown report per child run",
             "",
+            *project_state_policy_markdown(project_name, project_dir),
         ]
     )
 
@@ -1826,6 +1869,7 @@ def render_dashboard(
         f"- Status: `{validation_status or 'not-run'}`",
         f"- File: `{project_validation_md_path(project_dir) if project_dir else '-'}`",
         "",
+        *(project_state_policy_markdown(project_name, project_dir) if project_dir else []),
         "## Run Table",
         "",
         markdown_table(
@@ -1970,11 +2014,10 @@ def render_manager_summary(
                 f"- Summary: {normalize_optional_text(launch_plan.get('plan_summary')) or '-'}",
             ]
         )
-    lines.extend([
-        "",
-        "## Human Attention",
-        "",
-    ])
+    lines.extend([""])
+    if project_dir:
+        lines.extend(project_state_policy_markdown(project_name, project_dir))
+    lines.extend(["## Human Attention", ""])
     if not open_questions and not conflicts:
         lines.append("_No human questions or conflict alerts detected._")
     else:
@@ -2185,6 +2228,7 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"running:{counts['running']} blocked:{len(blocked)} completed:{counts['completed']} "
         f"failed:{counts['failed']} cancelled:{counts['cancelled']}"
     )
+    lines.extend(project_state_policy_cli(project_name, project_dir))
     lines.extend(["", "planner:"])
     if not launch_plan:
         lines.append("- none")

@@ -11,9 +11,11 @@ This skill manages real child sessions through a provider adapter layer, with `c
 
 Treat a subsession as a full Codex worker with its own thread, context window, tool use, and follow-up lifecycle. This is more flexible than a lightweight in-process subagent because a child session can keep working independently, be resumed later, and itself act as a manager when useful.
 
-Use the control script in `scripts/team_leader.py` instead of ad hoc shell fragments. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
+Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragments. This path is relative to the skill itself, not the project root. In this repo that file is at `skills/team-leader/scripts/team_leader.py`, and when installed it lives under the Codex skills directory at `.../skills/team-leader/scripts/team_leader.py`. Keep your working directory at the target project unless you pass `--root` and `--cd` explicitly; do not `cd` into the skill directory just to run the controller, because the default `.team-leader/` root is derived from the current working directory. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
 When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. While any child is active, the manager refreshes those markdown files automatically in the background.
+
+That project workspace is persistent state, not a temp folder. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The only file intended for direct human edits is `answers.md`. For a clean restart, use a new project name.
 
 Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
 
@@ -46,7 +48,7 @@ Subsessions in this skill are separate Codex sessions:
 python3 scripts/team_leader.py init
 ```
 
-This creates `.team-leader/` in the current working directory unless an older compatible root already exists.
+Run `init` from the target project directory. This creates `.team-leader/` in the current working directory unless an older compatible root already exists. If you must invoke the controller by an absolute skill path from somewhere else, pass `--root /path/to/project/.team-leader` explicitly.
 
 ### 2. Record a project goal and context
 
@@ -65,7 +67,7 @@ python3 scripts/team_leader.py intake \
   --note "The user can answer a few human questions, but does not want to hand-author worker tasks."
 ```
 
-That creates or updates `.team-leader/projects/<project>/brief.md`.
+Run `intake` from the target project directory, or pass `--root` explicitly. That creates or updates `.team-leader/projects/<project>/brief.md`.
 
 Autonomy modes:
 

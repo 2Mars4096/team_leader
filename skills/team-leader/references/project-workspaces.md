@@ -10,6 +10,8 @@ Project-linked runs are synced into:
 
 The default controller root is now `.team-leader/`. Older `.agent-subsessions/` and `.codex-subsessions/` roots are still recognized automatically.
 
+Keep your working directory at the target project when you rely on the default root. If you invoke the controller via an absolute path from the installed skill directory, pass `--root` explicitly instead of changing directories into the skill folder.
+
 The manager keeps these files current:
 
 - `README.md`: default landing page and file map
@@ -24,6 +26,8 @@ The manager keeps these files current:
 - `answers-template.md`: copy-ready answer lines for open questions
 - `conflicts.md`: owned-path overlap risk
 - `reports/<run-id>.md`: one markdown report per child run
+
+This project folder is persistent manager state. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The intended human-edited file is `answers.md`. For a clean restart, use a new project name.
 
 ## Recommended Metadata
 
