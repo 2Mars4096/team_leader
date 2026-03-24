@@ -1815,27 +1815,26 @@ def latest_live_note(run: dict[str, Any]) -> str | None:
     if not path.exists():
         return None
     latest: str | None = None
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("type") == "agent_message" and isinstance(payload.get("text"), str):
-                latest = payload["text"]
-                continue
-            if payload.get("type") != "item.completed":
-                continue
-            item = payload.get("item")
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
-                latest = item["text"]
+    for line in read_tail_text(path).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") == "agent_message" and isinstance(payload.get("text"), str):
+            latest = payload["text"]
+            continue
+        if payload.get("type") != "item.completed":
+            continue
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            latest = item["text"]
     return latest
 
 
@@ -3112,6 +3111,19 @@ def read_text_if_exists(path: Path) -> str | None:
     return path.read_text(encoding="utf-8")
 
 
+def read_tail_text(path: Path, *, max_bytes: int = 131072) -> str:
+    size = path.stat().st_size
+    start = max(0, size - max_bytes)
+    with path.open("rb") as fh:
+        if start:
+            fh.seek(start)
+        data = fh.read()
+    text = data.decode("utf-8", errors="replace")
+    if start and "\n" in text:
+        text = text.split("\n", 1)[1]
+    return text
+
+
 def read_jsonl_candidates(path: Path) -> list[str]:
     candidates: list[str] = []
     if not path.exists():
@@ -3941,24 +3953,34 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_watch(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     project_name = args.project.strip()
-    while True:
-        with root_lock(root):
-            index = load_index(root)
-            refresh_index_state(root, index)
-            runs = project_runs(index, project_name)
-            if runs:
-                project_name = str(runs[0].get("project") or runs[0].get("project_slug") or project_name)
-            view = render_watch_view(root, project_name, runs)
-            active = any(str(run.get("status") or "") == "running" for run in runs)
-            blocked = any(str(run.get("dispatch_state") or "") == "blocked" for run in runs)
-        if not args.no_clear:
-            print("\033[2J\033[H", end="")
-        print(view)
-        if args.once:
-            return 0
-        if args.exit_when_settled and not active and not blocked:
-            return 0
-        time.sleep(max(1, int(args.interval)))
+    use_alt_screen = sys.stdout.isatty() and not args.no_clear and not args.no_alt_screen
+    last_view: str | None = None
+    if use_alt_screen:
+        print("\033[?1049h\033[H", end="", flush=True)
+    try:
+        while True:
+            with root_lock(root):
+                index = load_index(root)
+                refresh_index_state(root, index)
+                runs = project_runs(index, project_name)
+                if runs:
+                    project_name = str(runs[0].get("project") or runs[0].get("project_slug") or project_name)
+                view = render_watch_view(root, project_name, runs)
+                active = any(str(run.get("status") or "") == "running" for run in runs)
+                blocked = any(str(run.get("dispatch_state") or "") == "blocked" for run in runs)
+            if view != last_view or args.once:
+                if not args.no_clear:
+                    print("\033[2J\033[H", end="")
+                print(view)
+                last_view = view
+            if args.once:
+                return 0
+            if args.exit_when_settled and not active and not blocked:
+                return 0
+            time.sleep(max(1, int(args.interval)))
+    finally:
+        if use_alt_screen:
+            print("\033[?1049l", end="", flush=True)
 
 
 def cmd_show(args: argparse.Namespace) -> int:
@@ -4198,6 +4220,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_p.add_argument("--once", action="store_true", help="Render one frame and exit")
     watch_p.add_argument("--exit-when-settled", action="store_true", help="Exit when the project has no running or blocked runs")
     watch_p.add_argument("--no-clear", action="store_true", help="Do not clear the terminal between frames")
+    watch_p.add_argument("--no-alt-screen", action="store_true", help="Keep normal terminal scrollback instead of using an alternate screen")
     watch_p.set_defaults(func=cmd_watch)
 
     show_p = sub.add_parser("show", help="Show one run and its last message")
