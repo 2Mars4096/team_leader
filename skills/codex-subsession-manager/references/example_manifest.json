@@ -1,0 +1,16 @@
+{
+  "runs": [
+    {
+      "name": "schema-audit",
+      "sandbox": "read-only",
+      "full_auto": true,
+      "prompt": "Audit the schema and migration flow for correctness risks. Do not edit files. Return findings only."
+    },
+    {
+      "name": "ui-owner",
+      "sandbox": "workspace-write",
+      "full_auto": true,
+      "prompt": "Own the UI cleanup for the assigned screen. Edit only the frontend files needed for that screen and report what changed."
+    }
+  ]
+}
