@@ -3115,6 +3115,194 @@ def render_team_status_summary(root: Path, project_name: str, runs: list[dict[st
     return "\n".join(lines)
 
 
+def build_team_status_snapshot(root: Path, project_name: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
+    slug = str(runs[0].get("project_slug") or project_slug(project_name)) if runs else project_slug(project_name)
+    project_dir = project_workspace_dir(root, project_name, slug)
+    watcher_state, _watcher_heartbeat = monitor_state(root)
+    question_records = collect_question_records(runs)
+    answers = load_answers(project_dir)
+    open_questions = unanswered_questions(question_records, answers)
+    conflicts = detect_conflict_risks(runs)
+    integration_issues = integration_alerts(runs)
+    warning_runs = output_warning_runs(runs)
+    brief = load_project_brief(project_dir, project_name)
+    validation = load_project_validation(project_dir)
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
+    active = []
+    blocked = []
+    queued = []
+    statuses: dict[str, dict[str, str]] = {}
+    for run in sorted(runs, key=run_sort_key):
+        label = str(run.get("task_id") or run["run_id"])
+        note = short_summary(latest_live_note(run), max_chars=100)
+        statuses[label] = {
+            "status": str(run.get("status") or "-"),
+            "dispatch_state": str(run.get("dispatch_state") or "-"),
+            "integration_state": normalize_optional_text(run.get("integration_state")) or "-",
+            "summary": str(run.get("summary") or "-"),
+            "note": note,
+        }
+        if str(run.get("status") or "") == "running":
+            active.append({"label": label, "summary": str(run.get("summary") or "-"), "note": note})
+        if str(run.get("dispatch_state") or "") == "blocked":
+            blocked.append(
+                {
+                    "label": label,
+                    "waiting_on": format_inline_list(normalize_str_list(run.get("blocked_on"), "blocked_on")),
+                }
+            )
+        if str(run.get("dispatch_state") or "") == "queued":
+            queued.append(
+                {
+                    "label": label,
+                    "waiting_on": format_inline_list(normalize_str_list(run.get("blocked_on"), "blocked_on")),
+                }
+            )
+    return {
+        "project": project_name,
+        "stage": str(stage["current_stage"]),
+        "stage_reason": str(stage["stage_reason"]),
+        "progress": str(stage["progress"]),
+        "next_action": str(stage["next_action"]),
+        "current_focus": str(stage["focus"]),
+        "watcher_state": watcher_state,
+        "active": active,
+        "blocked": blocked,
+        "queued": queued,
+        "statuses": statuses,
+        "open_questions": [
+            {
+                "id": str(question["id"]),
+                "task_id": str(question["task_id"]),
+                "text": str(question["text"]),
+            }
+            for question in open_questions
+        ],
+        "conflicts": [
+            {
+                "left_task": str(conflict["left_task"]),
+                "right_task": str(conflict["right_task"]),
+                "paths": str(conflict["paths"]),
+            }
+            for conflict in conflicts
+        ],
+        "integration": [
+            {
+                "task_id": str(item["task_id"]),
+                "state": str(item["state"]),
+                "note": str(item["note"]),
+            }
+            for item in integration_issues
+        ],
+        "warnings": [
+            {
+                "task_id": str(run.get("task_id") or run["run_id"]),
+                "warnings": format_inline_list(normalize_str_list(run.get("output_warnings"), "output_warnings")),
+            }
+            for run in warning_runs
+        ],
+    }
+
+
+def render_team_status_milestones(previous: dict[str, Any] | None, current: dict[str, Any]) -> str:
+    lines: list[str] = [f"project={current['project']}"]
+    if previous is None:
+        lines.extend(
+            [
+                f"milestone=initial stage={current['stage']}",
+                f"reason={current['stage_reason']}",
+                f"progress={current['progress']}",
+                f"next_action={current['next_action']}",
+                f"current_focus={current['current_focus']}",
+            ]
+        )
+        if current["active"]:
+            lines.append("active:")
+            for item in current["active"]:
+                lines.append(f"- {item['label']}: {item['summary']}")
+                if item["note"] != "-":
+                    lines.append(f"  note: {item['note']}")
+        return "\n".join(lines)
+    if current["stage"] != previous["stage"]:
+        lines.append(f"milestone=stage-change {previous['stage']} -> {current['stage']}")
+        lines.append(f"reason={current['stage_reason']}")
+        lines.append(f"progress={current['progress']}")
+        lines.append(f"next_action={current['next_action']}")
+        lines.append(f"current_focus={current['current_focus']}")
+    previous_statuses = previous.get("statuses", {})
+    current_statuses = current.get("statuses", {})
+    run_events: list[str] = []
+    for label in sorted(set(previous_statuses) | set(current_statuses)):
+        old = previous_statuses.get(label)
+        new = current_statuses.get(label)
+        if old is None and new is not None:
+            run_events.append(f"- {label}: discovered as {new['status']} dispatch={new['dispatch_state']} summary={new['summary']}")
+            continue
+        if new is None and old is not None:
+            run_events.append(f"- {label}: no longer tracked")
+            continue
+        assert old is not None and new is not None
+        if old["status"] != new["status"]:
+            run_events.append(f"- {label}: status {old['status']} -> {new['status']}")
+        if old["dispatch_state"] != new["dispatch_state"]:
+            run_events.append(f"- {label}: dispatch {old['dispatch_state']} -> {new['dispatch_state']}")
+        if old["integration_state"] != new["integration_state"]:
+            run_events.append(f"- {label}: integration {old['integration_state']} -> {new['integration_state']}")
+        if new["status"] == "running" and old["note"] != new["note"] and new["note"] != "-":
+            run_events.append(f"- {label}: note {new['note']}")
+    if run_events:
+        lines.append("runs:")
+        lines.extend(run_events)
+    previous_questions = {item["id"]: item for item in previous.get("open_questions", [])}
+    current_questions = {item["id"]: item for item in current.get("open_questions", [])}
+    new_questions = [item for qid, item in current_questions.items() if qid not in previous_questions]
+    resolved_questions = [item for qid, item in previous_questions.items() if qid not in current_questions]
+    if new_questions:
+        lines.append("questions_opened:")
+        for item in new_questions[:5]:
+            lines.append(f"- {item['id']} [{item['task_id']}] {short_summary(item['text'], max_chars=100)}")
+    if resolved_questions:
+        lines.append("questions_resolved:")
+        for item in resolved_questions[:5]:
+            lines.append(f"- {item['id']} [{item['task_id']}]")
+    previous_conflicts = {f"{item['left_task']}|{item['right_task']}|{item['paths']}" for item in previous.get("conflicts", [])}
+    current_conflicts = {f"{item['left_task']}|{item['right_task']}|{item['paths']}" for item in current.get("conflicts", [])}
+    new_conflicts = sorted(current_conflicts - previous_conflicts)
+    if new_conflicts:
+        lines.append("conflicts:")
+        for item in new_conflicts[:5]:
+            left_task, right_task, paths = item.split("|", 2)
+            lines.append(f"- {left_task} vs {right_task} on {paths}")
+    previous_integration = {f"{item['task_id']}|{item['state']}|{item['note']}" for item in previous.get("integration", [])}
+    current_integration = {f"{item['task_id']}|{item['state']}|{item['note']}" for item in current.get("integration", [])}
+    new_integration = sorted(current_integration - previous_integration)
+    if new_integration:
+        lines.append("integration:")
+        for item in new_integration[:5]:
+            task_id, state, note = item.split("|", 2)
+            lines.append(f"- {task_id} [{state}] {short_summary(note, max_chars=100)}")
+    previous_warnings = {item['task_id']: item['warnings'] for item in previous.get("warnings", [])}
+    current_warnings = {item['task_id']: item['warnings'] for item in current.get("warnings", [])}
+    warning_events = []
+    for task_id in sorted(set(previous_warnings) | set(current_warnings)):
+        old = previous_warnings.get(task_id)
+        new = current_warnings.get(task_id)
+        if old != new:
+            warning_events.append(f"- {task_id}: {new or 'cleared'}")
+    if warning_events:
+        lines.append("warnings:")
+        lines.extend(warning_events[:5])
+    if len(lines) == 1:
+        lines.extend(
+            [
+                f"milestone=progress stage={current['stage']}",
+                f"progress={current['progress']}",
+                f"current_focus={current['current_focus']}",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list[dict[str, str]]:
     question_records = collect_question_records(runs)
     by_run: dict[str, list[dict[str, str]]] = {}
@@ -4512,6 +4700,7 @@ def cmd_team_status(args: argparse.Namespace) -> int:
         max_updates = 20
     printed_updates = 0
     last_view: str | None = None
+    previous_snapshot: dict[str, Any] | None = None
     while True:
         with root_lock(root):
             index = load_index(root)
@@ -4519,8 +4708,13 @@ def cmd_team_status(args: argparse.Namespace) -> int:
             runs = project_runs(index, project_name)
             if runs:
                 project_name = str(runs[0].get("project") or runs[0].get("project_slug") or project_name)
-            view = render_team_status_summary(root, project_name, runs)
-            view_key = watch_view_key(view)
+            snapshot = build_team_status_snapshot(root, project_name, runs)
+            if args.milestones:
+                view = render_team_status_milestones(previous_snapshot, snapshot)
+                view_key = json.dumps(snapshot, ensure_ascii=True, sort_keys=True)
+            else:
+                view = render_team_status_summary(root, project_name, runs)
+                view_key = watch_view_key(view)
             unsettled = project_has_unsettled_runs(runs)
         if view_key != last_view or args.once:
             if printed_updates:
@@ -4528,6 +4722,7 @@ def cmd_team_status(args: argparse.Namespace) -> int:
             print(f"[{utc_now()}]")
             print(view)
             last_view = view_key
+            previous_snapshot = snapshot
             printed_updates += 1
         if args.once:
             return 0
@@ -4780,6 +4975,7 @@ def build_parser() -> argparse.ArgumentParser:
     team_status_p.add_argument("--project", required=True, help="Project name or project slug")
     team_status_p.add_argument("--interval", type=int, default=2, help="Seconds between refreshes")
     team_status_p.add_argument("--once", action="store_true", help="Render one update and exit")
+    team_status_p.add_argument("--milestones", action="store_true", help="Print only meaningful milestone changes such as stage transitions, child lifecycle changes, and new questions")
     team_status_p.add_argument("--exit-when-settled", action="store_true", help="Exit when the project has no running, queued, ready, prepared, or blocked runs")
     team_status_p.add_argument("--max-updates", type=int, help="Maximum number of changed updates to print before exiting; defaults to 20 when stdout is captured")
     team_status_p.set_defaults(func=cmd_team_status)

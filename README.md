@@ -69,6 +69,8 @@ From the target project root, use `python3 skills/team-leader/scripts/team_leade
 
 For progressive feedback inside Codex, prefer `python3 skills/team-leader/scripts/team_leader.py team-status --project <project>`. That prints compact change-based updates with the current stage, progress, active child summaries, latest child notes, blocked or queued work, open questions, and warnings. When stdout is captured, it automatically caps itself unless you override `--max-updates`.
 
+If you want a lighter event-style feed, add `--milestones`. That only emits meaningful changes such as stage transitions, child lifecycle changes, new child notes, newly opened questions, conflicts, integration issues, and warning changes.
+
 If you want a dedicated monitoring skill chip in Codex, install `skills/team-status` as well. That gives you a `$team-status` skill entry for project progress checks while keeping `$team-leader` focused on planning and dispatch.
 
 For a live terminal panel, use `python3 skills/team-leader/scripts/team_leader.py watch --project <project>`. That repeatedly refreshes the project summary plus per-run lines, including integration state and the latest child note. In captured terminal environments, `watch` now defaults to one snapshot unless you explicitly opt into streaming.

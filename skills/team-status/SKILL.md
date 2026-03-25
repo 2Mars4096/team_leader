@@ -15,6 +15,7 @@ This skill is a thin alias around the `team-leader` controller's `team-status` s
 2. Keep the working directory at the target project unless `--root` is explicitly given.
 3. Run the controller with `team-status --project <project>`.
 4. Report the current stage, progress, active child summaries, latest child notes, blocked or queued work, open questions, conflicts, and warnings.
+5. If the user wants lighter dynamic feedback inside Codex, prefer `--milestones`.
 
 ## Controller Path
 
@@ -39,6 +40,12 @@ Progressive updates until the project settles:
 python3 ../team-leader/scripts/team_leader.py team-status --project <project> --exit-when-settled
 ```
 
+Milestone-only updates:
+
+```bash
+python3 ../team-leader/scripts/team_leader.py team-status --project <project> --milestones --exit-when-settled
+```
+
 If the user wants a non-streaming high-signal snapshot instead, use:
 
 ```bash
@@ -48,6 +55,7 @@ python3 ../team-leader/scripts/team_leader.py status --project <project>
 ## Output Style
 
 - Prefer `team-status` over `watch` inside Codex.
+- Prefer `team-status --milestones` inside Codex when the user wants progressive updates without full snapshots every time.
 - Summarize the stage change first.
 - Then list active children and their latest notes.
 - Call out blocked or queued runs, open questions, conflicts, and warnings.
