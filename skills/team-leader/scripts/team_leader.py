@@ -39,6 +39,7 @@ DEFAULT_JSONL_SCAN_BYTES = 8 * 1024 * 1024
 STDOUT_WARNING_BYTES = 8 * 1024 * 1024
 STDERR_WARNING_BYTES = 4 * 1024 * 1024
 CHILD_RUN_ENV = "TEAM_LEADER_CHILD_RUN"
+MONITOR_RUN_ENV = "TEAM_LEADER_MONITOR_RUN"
 QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
 ANSWER_LINE_RE = re.compile(r"^\s*[-*+]\s*`?([a-z0-9][a-z0-9-]*)`?\s*:\s*(.+?)\s*$", re.IGNORECASE)
 PRELAUNCH_STATUSES = {"prepared", "blocked"}
@@ -3563,6 +3564,8 @@ def index_has_active_runs(index: dict[str, Any]) -> bool:
 
 
 def ensure_monitor(root: Path, index: dict[str, Any]) -> None:
+    if os.environ.get(MONITOR_RUN_ENV) == "1":
+        return
     if not index_has_active_runs(index):
         return
     pid_path = monitor_pid_path(root)
@@ -3581,6 +3584,7 @@ def ensure_monitor(root: Path, index: dict[str, Any]) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         cwd=str(root),
+        env={**os.environ, MONITOR_RUN_ENV: "1"},
         start_new_session=True,
     )
     write_text(pid_path, f"{process.pid}\n")
@@ -4422,6 +4426,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 def cmd_monitor(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
+    os.environ[MONITOR_RUN_ENV] = "1"
     pid_path = monitor_pid_path(root)
     heartbeat_path = monitor_heartbeat_path(root)
     current_pid = os.getpid()
