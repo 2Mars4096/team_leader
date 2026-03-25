@@ -29,6 +29,7 @@ The default landing page for each project is `.team-leader/projects/<project>/RE
 - `brief.md` records the project goal, repo paths, spec paths, notes, and constraints
 - `launch-plan.md` shows the latest planner-produced child-session launch plan
 - `validation.md` shows validation-command results and machine-evaluable delivery status
+- `metrics.md` shows the project scorecard for speed, human-touch, parallel overlap, and waiting overhead
 - `dashboard.md` shows live run progress, active child notes, and watcher status
 - `tasks.md` shows assignment state and summary titles
 - `manager-summary.md` shows the latest manager aggregation
@@ -70,6 +71,8 @@ From the target project root, use `python3 skills/team-leader/scripts/team_leade
 For progressive feedback inside Codex, prefer `python3 skills/team-leader/scripts/team_leader.py team-status --project <project>`. That now defaults to a milestone-style feed: stage transitions, child lifecycle changes, new child notes, newly opened questions, conflicts, integration issues, and warning changes. When stdout is captured, it automatically caps itself unless you override `--max-updates`.
 
 If you want the fuller compact summary instead of milestone mode, add `--full`.
+
+For a concise efficiency scorecard, use `python3 skills/team-leader/scripts/team_leader.py team-metrics --project <project>`. That prints descriptive metrics for project age, time to first useful result, time to validated completion, human-touch count, parallel overlap, and stuck time, and the same content is written to `metrics.md`.
 
 If you want a dedicated monitoring skill chip in Codex, install `skills/team-status` as well. That gives you a `$team-status` skill entry for project progress checks while keeping `$team-leader` focused on planning and dispatch.
 

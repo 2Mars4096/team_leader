@@ -183,6 +183,21 @@ If you want the fuller compact summary instead, add `--full`:
 python3 scripts/team_leader.py team-status --project payments-migration --full --exit-when-settled
 ```
 
+For a concise scorecard of whether the manager is actually helping, use:
+
+```bash
+python3 scripts/team_leader.py team-metrics --project payments-migration
+```
+
+That prints descriptive metrics for:
+
+- project age
+- time to first useful result
+- time to validated completion
+- human-touch count
+- parallel overlap value
+- stuck time from blocking, queuing, or other prelaunch delay
+
 For a live terminal view:
 
 ```bash
@@ -197,6 +212,7 @@ For project-linked runs, the manager also updates:
 - `projects/<project>/brief.md`
 - `projects/<project>/launch-plan.md`
 - `projects/<project>/validation.md`
+- `projects/<project>/metrics.md`
 - `projects/<project>/dashboard.md`
 - `projects/<project>/tasks.md`
 - `projects/<project>/manager-summary.md`

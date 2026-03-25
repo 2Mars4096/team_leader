@@ -50,6 +50,7 @@ PROJECT_PLAN_FILE = "launch-plan.json"
 PROJECT_PLAN_MD = "launch-plan.md"
 PROJECT_VALIDATION_FILE = "validation.json"
 PROJECT_VALIDATION_MD = "validation.md"
+PROJECT_METRICS_MD = "metrics.md"
 PLANNER_TASK_PREFIX = "manager-plan"
 PLANNER_ROLE = "manager"
 PLANNER_SOURCE = "team-leader-planner"
@@ -503,7 +504,10 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("owned_paths", [])
         run.setdefault("depends_on", [])
         run.setdefault("dispatch_state", None)
+        run.setdefault("dispatch_state_changed_at", run.get("created_at") or run.get("launched_at"))
         run.setdefault("blocked_on", [])
+        run.setdefault("blocked_seconds", 0)
+        run.setdefault("queued_seconds", 0)
         run.setdefault("planner_source", None)
         run.setdefault("planner_reason", None)
         run.setdefault("plan_applied_at", None)
@@ -539,6 +543,54 @@ def save_index(root: Path, data: dict[str, Any]) -> None:
         index_path(root),
         json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
     )
+
+
+def dispatch_wait_field(dispatch_state: str | None) -> str | None:
+    state = normalize_optional_text(dispatch_state)
+    if state == "blocked":
+        return "blocked_seconds"
+    if state == "queued":
+        return "queued_seconds"
+    return None
+
+
+def set_run_dispatch_state(
+    run: dict[str, Any],
+    dispatch_state: str,
+    blocked_on: list[str] | None = None,
+    *,
+    changed_at: str | None = None,
+) -> None:
+    now_text = changed_at or utc_now()
+    old_state = normalize_optional_text(run.get("dispatch_state"))
+    old_since_text = normalize_optional_text(run.get("dispatch_state_changed_at")) or normalize_optional_text(run.get("created_at")) or now_text
+    if old_state and old_state != dispatch_state:
+        wait_field = dispatch_wait_field(old_state)
+        if wait_field:
+            now_epoch = parse_timestamp_epoch(now_text) or epoch_now()
+            old_since_epoch = parse_timestamp_epoch(old_since_text) or now_epoch
+            if now_epoch > old_since_epoch:
+                run[wait_field] = int(run.get(wait_field) or 0) + (now_epoch - old_since_epoch)
+        run["dispatch_state_changed_at"] = now_text
+    elif not normalize_optional_text(run.get("dispatch_state_changed_at")):
+        run["dispatch_state_changed_at"] = old_since_text
+    run["dispatch_state"] = dispatch_state
+    run["blocked_on"] = list(blocked_on or [])
+
+
+def accumulated_dispatch_wait_seconds(run: dict[str, Any], dispatch_state: str, *, now_epoch: int | None = None) -> int:
+    field = dispatch_wait_field(dispatch_state)
+    if not field:
+        return 0
+    total = int(run.get(field) or 0)
+    current_state = normalize_optional_text(run.get("dispatch_state"))
+    if current_state != dispatch_state:
+        return total
+    since_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("dispatch_state_changed_at")))
+    current_epoch = now_epoch or epoch_now()
+    if since_epoch is not None and current_epoch > since_epoch:
+        total += current_epoch - since_epoch
+    return total
 
 
 def make_run_id(existing: set[str], label: str | None) -> str:
@@ -726,6 +778,22 @@ def format_short_timestamp(value: str | None) -> str:
     return value
 
 
+def format_duration(seconds: int | float | None) -> str:
+    if seconds is None:
+        return "-"
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{minutes:02d}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours:02d}h"
+
+
 def unique_preserve_order(values: list[str]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -766,9 +834,14 @@ def project_validation_md_path(project_dir: Path) -> Path:
     return project_dir / PROJECT_VALIDATION_MD
 
 
+def project_metrics_md_path(project_dir: Path) -> Path:
+    return project_dir / PROJECT_METRICS_MD
+
+
 def default_project_brief(project_name: str) -> dict[str, Any]:
     return {
         "project": project_name,
+        "created_at": utc_now(),
         "goal": None,
         "repo_paths": [],
         "spec_paths": [],
@@ -796,6 +869,7 @@ def load_project_brief(project_dir: Path, project_name: str | None = None) -> di
         raise RuntimeError(f"invalid project brief: {path}")
     brief = default_project_brief(project_name or str(payload.get("project") or project_dir.name))
     brief["project"] = str(payload.get("project") or brief["project"])
+    brief["created_at"] = normalize_optional_text(payload.get("created_at")) or brief["created_at"]
     brief["goal"] = normalize_optional_text(payload.get("goal"))
     brief["repo_paths"] = unique_preserve_order(
         [str(resolve_path(item)) for item in normalize_str_list(payload.get("repo_paths"), "repo_paths")]
@@ -863,6 +937,7 @@ def merge_project_brief(
 ) -> dict[str, Any]:
     brief = dict(existing or default_project_brief(project_name))
     brief["project"] = project_name
+    brief["created_at"] = normalize_optional_text(brief.get("created_at")) or utc_now()
     if goal is not None:
         brief["goal"] = goal
     brief["repo_paths"] = unique_preserve_order(
@@ -922,6 +997,7 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     lines = [
         f"# {brief.get('project') or 'Project'} Brief",
         "",
+        f"- Created: `{normalize_optional_text(brief.get('created_at')) or utc_now()}`",
         f"- Updated: `{normalize_optional_text(brief.get('updated_at')) or utc_now()}`",
         "",
         "## Goal",
@@ -2151,8 +2227,7 @@ def compute_dispatch_state(index: dict[str, Any], run: dict[str, Any]) -> tuple[
 def update_dispatch_metadata(index: dict[str, Any]) -> None:
     for run in index["runs"]:
         dispatch_state, blocked_on = compute_dispatch_state(index, run)
-        run["dispatch_state"] = dispatch_state
-        run["blocked_on"] = list(blocked_on)
+        set_run_dispatch_state(run, dispatch_state, blocked_on)
 
 
 def apply_parallel_limit_metadata(index: dict[str, Any]) -> None:
@@ -2164,8 +2239,7 @@ def apply_parallel_limit_metadata(index: dict[str, Any]) -> None:
         if str(run.get("dispatch_state") or "") != "ready":
             continue
         if active_count >= parallel_limit:
-            run["dispatch_state"] = "queued"
-            run["blocked_on"] = [f"parallel-limit:{parallel_limit}"]
+            set_run_dispatch_state(run, "queued", [f"parallel-limit:{parallel_limit}"])
             continue
         active_count += 1
 
@@ -2188,8 +2262,7 @@ def apply_release_throttle_metadata(index: dict[str, Any]) -> None:
         if str(run.get("dispatch_state") or "") != "ready":
             continue
         if reserved >= release_budget:
-            run["dispatch_state"] = "queued"
-            run["blocked_on"] = [f"release-throttle:{release_budget}/{release_window}s"]
+            set_run_dispatch_state(run, "queued", [f"release-throttle:{release_budget}/{release_window}s"])
             continue
         reserved += 1
 
@@ -2349,6 +2422,268 @@ def project_stage_snapshot(
     }
 
 
+def project_start_timestamp(brief: dict[str, Any] | None, runs: list[dict[str, Any]]) -> str | None:
+    candidates: list[tuple[int, str]] = []
+    if brief:
+        for key in ("created_at", "updated_at"):
+            value = normalize_optional_text(brief.get(key))
+            epoch = parse_timestamp_epoch(value)
+            if value and epoch is not None:
+                candidates.append((epoch, value))
+                break
+    for run in runs:
+        value = normalize_optional_text(run.get("created_at")) or normalize_optional_text(run.get("launched_at"))
+        epoch = parse_timestamp_epoch(value)
+        if value and epoch is not None:
+            candidates.append((epoch, value))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+def first_useful_result_timestamp(runs: list[dict[str, Any]]) -> str | None:
+    candidates: list[tuple[int, str]] = []
+    for run in runs:
+        finished_at = normalize_optional_text(run.get("finished_at"))
+        finished_epoch = parse_timestamp_epoch(finished_at)
+        if not finished_at or finished_epoch is None:
+            continue
+        last_message_path = Path(run["last_message_path"])
+        has_report = last_message_path.exists() and last_message_path.stat().st_size > 0
+        if has_report or question_records_for_run(run) or str(run.get("status") or "") == "completed":
+            candidates.append((finished_epoch, finished_at))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+def project_concurrency_metrics(runs: list[dict[str, Any]], *, now_epoch: int | None = None) -> dict[str, int]:
+    current_epoch = now_epoch or epoch_now()
+    events: list[tuple[int, int]] = []
+    total_child_seconds = 0
+    launched_runs = 0
+    for run in runs:
+        launched_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("launched_at")))
+        if launched_epoch is None:
+            continue
+        finished_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("finished_at")))
+        if finished_epoch is None and str(run.get("status") or "") == "running":
+            finished_epoch = current_epoch
+        if finished_epoch is None or finished_epoch < launched_epoch:
+            continue
+        launched_runs += 1
+        total_child_seconds += finished_epoch - launched_epoch
+        events.append((launched_epoch, 1))
+        events.append((finished_epoch, -1))
+    if not events:
+        return {
+            "launched_runs": launched_runs,
+            "max_concurrent_runs": 0,
+            "parallel_overlap_seconds": 0,
+            "total_child_seconds": total_child_seconds,
+        }
+    events.sort(key=lambda item: (item[0], 0 if item[1] < 0 else 1))
+    active = 0
+    previous_epoch: int | None = None
+    max_concurrent = 0
+    overlap_seconds = 0
+    for timestamp, delta in events:
+        if previous_epoch is not None and timestamp > previous_epoch and active > 1:
+            overlap_seconds += timestamp - previous_epoch
+        active += delta
+        if active > max_concurrent:
+            max_concurrent = active
+        previous_epoch = timestamp
+    return {
+        "launched_runs": launched_runs,
+        "max_concurrent_runs": max_concurrent,
+        "parallel_overlap_seconds": overlap_seconds,
+        "total_child_seconds": total_child_seconds,
+    }
+
+
+def project_wait_metrics(runs: list[dict[str, Any]], *, now_epoch: int | None = None) -> dict[str, int]:
+    current_epoch = now_epoch or epoch_now()
+    blocked_seconds = 0
+    queued_seconds = 0
+    prelaunch_delay_seconds = 0
+    for run in runs:
+        blocked_seconds += accumulated_dispatch_wait_seconds(run, "blocked", now_epoch=current_epoch)
+        queued_seconds += accumulated_dispatch_wait_seconds(run, "queued", now_epoch=current_epoch)
+        created_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("created_at")))
+        launched_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("launched_at")))
+        if created_epoch is None:
+            continue
+        if launched_epoch is not None and launched_epoch > created_epoch:
+            tracked_wait = int(run.get("blocked_seconds") or 0) + int(run.get("queued_seconds") or 0)
+            prelaunch_delay_seconds += max(0, launched_epoch - created_epoch - tracked_wait)
+        elif launched_epoch is None and str(run.get("status") or "") in PRELAUNCH_STATUSES:
+            tracked_wait = (
+                accumulated_dispatch_wait_seconds(run, "blocked", now_epoch=current_epoch)
+                + accumulated_dispatch_wait_seconds(run, "queued", now_epoch=current_epoch)
+            )
+            prelaunch_delay_seconds += max(0, current_epoch - created_epoch - tracked_wait)
+    return {
+        "blocked_seconds": blocked_seconds,
+        "queued_seconds": queued_seconds,
+        "prelaunch_delay_seconds": prelaunch_delay_seconds,
+        "stuck_time_seconds": blocked_seconds + queued_seconds + prelaunch_delay_seconds,
+    }
+
+
+def build_project_metrics(root: Path, project_name: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
+    slug = str(runs[0].get("project_slug") or project_slug(project_name)) if runs else project_slug(project_name)
+    project_dir = project_workspace_dir(root, project_name, slug)
+    brief = load_project_brief(project_dir, project_name)
+    validation = load_project_validation(project_dir)
+    question_records = collect_question_records(runs)
+    answers = load_answers(project_dir)
+    open_questions = unanswered_questions(question_records, answers)
+    answered = answered_questions(question_records, answers)
+    counts = run_status_counts(runs)
+    now_epoch = epoch_now()
+    start_at = project_start_timestamp(brief, runs)
+    start_epoch = parse_timestamp_epoch(start_at)
+    first_result_at = first_useful_result_timestamp(runs)
+    first_result_epoch = parse_timestamp_epoch(first_result_at)
+    validation_at = None
+    if validation and (
+        project_is_machine_complete(brief, validation) is True
+        or normalize_optional_text(validation.get("status")) == "passed"
+    ):
+        validation_at = normalize_optional_text(validation.get("validated_at")) or normalize_optional_text(validation.get("updated_at"))
+    validation_epoch = parse_timestamp_epoch(validation_at)
+    concurrency = project_concurrency_metrics(runs, now_epoch=now_epoch)
+    waits = project_wait_metrics(runs, now_epoch=now_epoch)
+    return {
+        "project": project_name,
+        "updated_at": utc_now(),
+        "workspace": str(project_dir),
+        "metrics_file": str(project_metrics_md_path(project_dir)),
+        "project_started_at": start_at,
+        "project_age_seconds": (now_epoch - start_epoch) if start_epoch is not None else None,
+        "time_to_first_useful_result_seconds": (
+            first_result_epoch - start_epoch
+            if start_epoch is not None and first_result_epoch is not None and first_result_epoch >= start_epoch
+            else None
+        ),
+        "first_useful_result_at": first_result_at,
+        "time_to_validated_completion_seconds": (
+            validation_epoch - start_epoch
+            if start_epoch is not None and validation_epoch is not None and validation_epoch >= start_epoch
+            else None
+        ),
+        "validated_completion_at": validation_at,
+        "human_touch_count": len(answered) + len(open_questions),
+        "open_question_count": len(open_questions),
+        "answered_question_count": len(answered),
+        "parallel_value": concurrency,
+        "stuck_time": waits,
+        "total_runs": len(runs),
+        "planner_rounds": planner_round_count(runs),
+        "auto_fix_rounds": auto_fix_round_count(runs),
+        "running_runs": counts["running"],
+        "completed_runs": counts["completed"],
+        "failed_runs": counts["failed"],
+        "cancelled_runs": counts["cancelled"],
+        "validation_status": normalize_optional_text(validation.get("status")) if validation else None,
+    }
+
+
+def render_project_metrics(metrics: dict[str, Any]) -> str:
+    parallel = metrics.get("parallel_value") or {}
+    stuck = metrics.get("stuck_time") or {}
+    lines = [
+        f"# {metrics['project']} Metrics",
+        "",
+        f"- Updated: `{metrics['updated_at']}`",
+        f"- Workspace: `{metrics['workspace']}`",
+        "",
+        "## Scorecard",
+        "",
+        f"- `project_age`: `{format_duration(metrics.get('project_age_seconds'))}`",
+        "  How long this tracked project has existed since the first brief or child run.",
+        f"- `time_to_first_useful_result`: `{format_duration(metrics.get('time_to_first_useful_result_seconds'))}`",
+        "  Approximate delay from project start to the first finished child report or human-question output.",
+        f"- `time_to_validated_completion`: `{format_duration(metrics.get('time_to_validated_completion_seconds'))}`",
+        "  Delay from project start to a passed validation or machine-complete delivery signal, when available.",
+        f"- `human_touch_count`: `{metrics.get('human_touch_count', 0)}`",
+        "  Total human coordination so far: answered questions plus any still-open questions.",
+        (
+            f"- `parallel_value`: max_concurrent=`{parallel.get('max_concurrent_runs', 0)}` "
+            f"overlap=`{format_duration(parallel.get('parallel_overlap_seconds'))}`"
+        ),
+        "  Real overlap achieved by child sessions, which is a better speed signal than raw run count alone.",
+        (
+            f"- `stuck_time`: blocked=`{format_duration(stuck.get('blocked_seconds'))}` "
+            f"queued=`{format_duration(stuck.get('queued_seconds'))}` "
+            f"prelaunch=`{format_duration(stuck.get('prelaunch_delay_seconds'))}` "
+            f"total=`{format_duration(stuck.get('stuck_time_seconds'))}`"
+        ),
+        "  Time work spent waiting on dependencies, release throttles, parallel caps, or other prelaunch delay.",
+        "",
+        "## Details",
+        "",
+        f"- Project started: `{metrics.get('project_started_at') or '-'}`",
+        f"- First useful result at: `{metrics.get('first_useful_result_at') or '-'}`",
+        f"- Validated completion at: `{metrics.get('validated_completion_at') or '-'}`",
+        f"- Validation status: `{metrics.get('validation_status') or 'not-run'}`",
+        f"- Total runs: `{metrics.get('total_runs', 0)}`",
+        f"- Running: `{metrics.get('running_runs', 0)}`",
+        f"- Completed: `{metrics.get('completed_runs', 0)}`",
+        f"- Failed: `{metrics.get('failed_runs', 0)}`",
+        f"- Cancelled: `{metrics.get('cancelled_runs', 0)}`",
+        f"- Planner rounds: `{metrics.get('planner_rounds', 0)}`",
+        f"- Auto-fix rounds: `{metrics.get('auto_fix_rounds', 0)}`",
+        f"- Open questions: `{metrics.get('open_question_count', 0)}`",
+        f"- Answered questions: `{metrics.get('answered_question_count', 0)}`",
+        f"- Total child-seconds: `{format_duration(parallel.get('total_child_seconds'))}`",
+        f"- Launched runs: `{parallel.get('launched_runs', 0)}`",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def render_team_metrics_cli(metrics: dict[str, Any]) -> str:
+    parallel = metrics.get("parallel_value") or {}
+    stuck = metrics.get("stuck_time") or {}
+    lines = [
+        f"project={metrics['project']}",
+        f"updated_at={metrics['updated_at']}",
+        f"workspace={metrics['workspace']}",
+        f"metrics_file={metrics['metrics_file']}",
+        "",
+        "scorecard:",
+        f"- project_age={format_duration(metrics.get('project_age_seconds'))} :: age of this tracked project",
+        f"- time_to_first_useful_result={format_duration(metrics.get('time_to_first_useful_result_seconds'))} :: delay to the first finished child output or human question",
+        f"- time_to_validated_completion={format_duration(metrics.get('time_to_validated_completion_seconds'))} :: delay to passed validation or machine-complete delivery",
+        f"- human_touch_count={metrics.get('human_touch_count', 0)} :: answered questions plus open questions still waiting on a human",
+        (
+            f"- parallel_value=max_concurrent:{parallel.get('max_concurrent_runs', 0)} "
+            f"overlap:{format_duration(parallel.get('parallel_overlap_seconds'))} "
+            f"child_time:{format_duration(parallel.get('total_child_seconds'))} "
+            ":: real overlap achieved by child sessions"
+        ),
+        (
+            f"- stuck_time=blocked:{format_duration(stuck.get('blocked_seconds'))} "
+            f"queued:{format_duration(stuck.get('queued_seconds'))} "
+            f"prelaunch:{format_duration(stuck.get('prelaunch_delay_seconds'))} "
+            f"total:{format_duration(stuck.get('stuck_time_seconds'))} "
+            ":: time work spent waiting instead of progressing"
+        ),
+        "",
+        "details:",
+        f"- project_started_at={metrics.get('project_started_at') or '-'}",
+        f"- first_useful_result_at={metrics.get('first_useful_result_at') or '-'}",
+        f"- validated_completion_at={metrics.get('validated_completion_at') or '-'}",
+        f"- validation_status={metrics.get('validation_status') or 'not-run'}",
+        f"- total_runs={metrics.get('total_runs', 0)} running={metrics.get('running_runs', 0)} completed={metrics.get('completed_runs', 0)} failed={metrics.get('failed_runs', 0)} cancelled={metrics.get('cancelled_runs', 0)}",
+        f"- planner_rounds={metrics.get('planner_rounds', 0)} auto_fix_rounds={metrics.get('auto_fix_rounds', 0)}",
+        f"- open_questions={metrics.get('open_question_count', 0)} answered_questions={metrics.get('answered_question_count', 0)}",
+    ]
+    return "\n".join(lines)
+
+
 def render_project_overview(project_name: str, project_dir: Path, runs: list[dict[str, Any]]) -> str:
     counts = run_status_counts(runs)
     cwd_values = sorted({str(run.get("cwd") or "-") for run in runs})
@@ -2384,6 +2719,7 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             f"- Brief file: `{project_brief_md_path(project_dir)}`",
             f"- Launch plan: `{project_launch_plan_md_path(project_dir)}`",
             f"- Validation: `{project_validation_md_path(project_dir)}`",
+            f"- Metrics: `{project_metrics_md_path(project_dir)}`",
             f"- Goal: {goal or '_No goal recorded yet._'}",
             f"- Autonomy mode: `{autonomy_mode or 'manual'}`",
             f"- Clarification mode: `{clarification_mode or 'auto'}`",
@@ -2413,6 +2749,7 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             "- `brief.md`: project goal, repo paths, spec paths, notes, and constraints",
             "- `launch-plan.md`: latest planner-produced child launch plan",
             "- `validation.md`: latest validation results and delivery status",
+            "- `metrics.md`: scorecard for timing, human-touch, parallelism, and waiting overhead",
             "- `dashboard.md`: live run table, active notes, questions, and conflict alerts",
             "- `tasks.md`: task-oriented ledger with summaries and ownership",
             "- `manager-summary.md`: concise manager snapshot",
@@ -2924,6 +3261,7 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"workspace={project_dir}",
         f"landing_page={project_dir / 'README.md'}",
         f"dashboard={project_dir / 'dashboard.md'}",
+        f"metrics={project_metrics_md_path(project_dir)}",
         f"brief={project_brief_md_path(project_dir)}",
         f"launch_plan={project_launch_plan_md_path(project_dir)}",
         f"validation={project_validation_md_path(project_dir)}",
@@ -3059,6 +3397,7 @@ def render_team_status_summary(root: Path, project_name: str, runs: list[dict[st
         f"current_focus={stage['focus']}",
         f"workspace={project_dir}",
         f"dashboard={project_dir / 'dashboard.md'}",
+        f"metrics={project_metrics_md_path(project_dir)}",
     ]
     watcher_line = f"watcher={watcher_state}"
     if watcher_heartbeat:
@@ -3387,6 +3726,7 @@ def sync_one_project(root: Path, project_name: str, slug: str, runs: list[dict[s
     answers = load_answers(project_dir)
     conflicts = detect_conflict_risks(runs)
     integration_issues = integration_alerts(runs)
+    metrics = build_project_metrics(root, project_name, runs)
     delete_if_exists(project_dir / "project.md")
     write_text(project_dir / "README.md", render_project_overview(project_name, project_dir, runs))
     write_text(project_dir / "tasks.md", render_task_ledger(runs))
@@ -3404,6 +3744,7 @@ def sync_one_project(root: Path, project_name: str, slug: str, runs: list[dict[s
         render_answers_template(question_records, answers),
     )
     write_text(project_dir / "conflicts.md", render_conflicts(conflicts, integration_issues))
+    write_text(project_metrics_md_path(project_dir), render_project_metrics(metrics))
 
 
 def sync_projects(root: Path, index: dict[str, Any]) -> None:
@@ -3951,9 +4292,9 @@ def start_run_process(run: dict[str, Any]) -> None:
     stderr_fh.close()
     run["pid"] = process.pid
     run["status"] = "running"
-    run["dispatch_state"] = "running"
-    run["blocked_on"] = []
-    run["launched_at"] = utc_now()
+    launch_time = utc_now()
+    set_run_dispatch_state(run, "running", [], changed_at=launch_time)
+    run["launched_at"] = launch_time
     run["started_epoch"] = epoch_now()
     write_text(run_dir / "state.txt", "running\n")
 
@@ -4193,6 +4534,7 @@ def project_has_state_files(root: Path, project_name: str) -> bool:
         or project_launch_plan_md_path(project_dir).exists()
         or project_validation_path(project_dir).exists()
         or project_validation_md_path(project_dir).exists()
+        or project_metrics_md_path(project_dir).exists()
     )
 
 
@@ -4470,7 +4812,10 @@ def materialize_run(
         "owned_paths": list(options.owned_paths),
         "depends_on": list(options.depends_on),
         "dispatch_state": "dry-run" if options.dry_run else "ready",
+        "dispatch_state_changed_at": utc_now(),
         "blocked_on": [],
+        "blocked_seconds": 0,
+        "queued_seconds": 0,
         "planner_source": None,
         "planner_reason": None,
         "plan_applied_at": None,
@@ -4741,6 +5086,26 @@ def cmd_team_status(args: argparse.Namespace) -> int:
         time.sleep(max(1, int(args.interval)))
 
 
+def cmd_team_metrics(args: argparse.Namespace) -> int:
+    root = resolve_path(args.root) if args.root else default_root()
+    project_name = args.project.strip()
+    with root_lock(root):
+        index = load_index(root)
+        refresh_index_state(root, index)
+        runs = project_runs(index, project_name)
+        if not runs and not project_has_state_files(root, project_name):
+            print("no runs")
+            return 0
+        if runs:
+            project_name = str(runs[0].get("project") or runs[0].get("project_slug") or project_name)
+        metrics = build_project_metrics(root, project_name, runs)
+    if args.json:
+        print(json.dumps(metrics, ensure_ascii=True, indent=2, sort_keys=True))
+        return 0
+    print(render_team_metrics_cli(metrics))
+    return 0
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     with root_lock(root):
@@ -4985,6 +5350,12 @@ def build_parser() -> argparse.ArgumentParser:
     team_status_p.add_argument("--exit-when-settled", action="store_true", help="Exit when the project has no running, queued, ready, prepared, or blocked runs")
     team_status_p.add_argument("--max-updates", type=int, help="Maximum number of changed updates to print before exiting; defaults to 20 when stdout is captured")
     team_status_p.set_defaults(func=cmd_team_status)
+
+    team_metrics_p = sub.add_parser("team-metrics", help="Show a project scorecard for speed, coordination, and waiting overhead")
+    team_metrics_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
+    team_metrics_p.add_argument("--project", required=True, help="Project name or project slug")
+    team_metrics_p.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of the descriptive scorecard")
+    team_metrics_p.set_defaults(func=cmd_team_metrics)
 
     watch_p = sub.add_parser("watch", help="Watch one project with a live terminal summary")
     watch_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
