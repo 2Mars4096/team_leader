@@ -74,11 +74,17 @@ def resolve_path(raw: str | Path) -> Path:
     return Path(raw).expanduser().resolve()
 
 
-def resolve_executable(raw: str) -> str:
+def resolve_executable(raw: str, *, cwd: Path | None = None) -> str:
     candidate = Path(raw).expanduser()
-    if candidate.is_absolute() or os.sep in raw:
+    if candidate.is_absolute():
         if candidate.exists():
             return str(candidate.resolve())
+        raise RuntimeError(f"unable to resolve executable path: {raw}")
+    if os.sep in raw:
+        base = cwd or Path.cwd()
+        resolved = (base / candidate).resolve()
+        if resolved.exists():
+            return str(resolved)
         raise RuntimeError(f"unable to resolve executable path: {raw}")
     found = shutil.which(raw)
     if found:
@@ -3217,21 +3223,27 @@ def read_head_text(path: Path, *, max_bytes: int = 131072) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def read_jsonl_candidates(path: Path) -> list[str]:
+def read_jsonl_candidates(path: Path, *, max_scan_bytes: int = 8 * 1024 * 1024) -> list[str]:
     candidates: list[str] = []
     if not path.exists():
         return candidates
-    for line in read_head_text(path).splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        collect_uuid_candidates(payload, candidates)
-        if candidates:
-            break
+    scanned = 0
+    with path.open("rb") as fh:
+        while scanned < max_scan_bytes:
+            raw_line = fh.readline()
+            if not raw_line:
+                break
+            scanned += len(raw_line)
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            collect_uuid_candidates(payload, candidates)
+            if candidates:
+                break
     return candidates
 
 
@@ -3554,7 +3566,8 @@ def refresh_runner_for_run(run: dict[str, Any]) -> None:
         last_message_path=Path(run["last_message_path"]),
         options=options,
     )
-    real_provider_bin = resolve_executable(normalize_optional_text(run.get("provider_bin")) or adapter.resolved_bin())
+    provider_bin_raw = normalize_optional_text(run.get("provider_bin")) or adapter.resolved_bin()
+    real_provider_bin = resolve_executable(provider_bin_raw, cwd=Path(str(run["cwd"])))
     command[0] = real_provider_bin
     run_dir = Path(run["run_dir"])
     runner_path = Path(run["runner_path"])
@@ -3819,7 +3832,8 @@ def materialize_run(
         last_message_path=last_message_path,
         options=options,
     )
-    real_provider_bin = resolve_executable(adapter.resolved_bin())
+    provider_bin_raw = adapter.resolved_bin()
+    real_provider_bin = resolve_executable(provider_bin_raw, cwd=options.cd)
     command[0] = real_provider_bin
     guard_dir = write_child_cli_guard(run_dir, adapter, real_provider_bin)
     guard_target = str(guard_dir / adapter.default_bin)
@@ -3846,7 +3860,7 @@ def materialize_run(
         "run_id": run_id,
         "name": options.name or run_id,
         "provider": adapter.name,
-        "provider_bin": real_provider_bin,
+        "provider_bin": provider_bin_raw,
         "project": options.project,
         "project_slug": project_slug(options.project) if options.project else None,
         "task_id": options.task_id,
