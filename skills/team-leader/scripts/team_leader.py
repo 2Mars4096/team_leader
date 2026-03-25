@@ -3211,20 +3211,27 @@ def read_tail_lines(path: Path, line_count: int, *, max_bytes: int = 1048576) ->
     return lines[-target:]
 
 
+def read_head_text(path: Path, *, max_bytes: int = 131072) -> str:
+    with path.open("rb") as fh:
+        data = fh.read(max_bytes)
+    return data.decode("utf-8", errors="replace")
+
+
 def read_jsonl_candidates(path: Path) -> list[str]:
     candidates: list[str] = []
     if not path.exists():
         return candidates
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            collect_uuid_candidates(payload, candidates)
+    for line in read_head_text(path).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        collect_uuid_candidates(payload, candidates)
+        if candidates:
+            break
     return candidates
 
 
@@ -4118,7 +4125,10 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(json.dumps(run, ensure_ascii=True, indent=2, sort_keys=True))
     if last_message:
         print()
-        print(last_message.rstrip())
+        if args.full_message:
+            print(last_message.rstrip())
+        else:
+            print(preview_text(last_message, max_lines=args.message_lines, max_chars=args.message_chars))
     return 0
 
 
@@ -4351,6 +4361,9 @@ def build_parser() -> argparse.ArgumentParser:
     show_p = sub.add_parser("show", help="Show one run and its last message")
     show_p.add_argument("run", help="Run id or unique prefix")
     show_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
+    show_p.add_argument("--full-message", action="store_true", help="Print the full child last_message instead of a bounded preview")
+    show_p.add_argument("--message-lines", type=int, default=12, help="Maximum preview lines when --full-message is not used")
+    show_p.add_argument("--message-chars", type=int, default=2000, help="Maximum preview characters when --full-message is not used")
     show_p.set_defaults(func=cmd_show)
 
     tail_p = sub.add_parser("tail", help="Tail stdout or stderr for one run")
