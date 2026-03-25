@@ -1946,6 +1946,17 @@ def last_message_for_run(run: dict[str, Any]) -> str | None:
     return read_text_if_exists(Path(run["last_message_path"]))
 
 
+def last_message_preview_path_for_run(run: dict[str, Any]) -> Path:
+    return Path(run["run_dir"]) / "last_message.preview.md"
+
+
+def last_message_display_for_run(run: dict[str, Any]) -> str | None:
+    preview_path = last_message_preview_path_for_run(run)
+    if preview_path.exists():
+        return read_text_if_exists(preview_path)
+    return last_message_for_run(run)
+
+
 def latest_live_note(run: dict[str, Any]) -> str | None:
     path = Path(run["stdout_path"])
     if not path.exists():
@@ -2563,7 +2574,7 @@ def render_dashboard(
                     "",
                     f"_Summary: {run.get('summary') or '-'}_",
                     "",
-                    preview_text(last_message_for_run(run)),
+                    preview_text(last_message_display_for_run(run)),
                     "",
                 ]
             )
@@ -2713,7 +2724,7 @@ def render_manager_summary(
                     "",
                     f"_Summary: {run.get('summary') or '-'}_",
                     "",
-                    preview_text(last_message_for_run(run), max_lines=5, max_chars=500),
+                    preview_text(last_message_display_for_run(run), max_lines=5, max_chars=500),
                     "",
                 ]
             )
@@ -2976,7 +2987,7 @@ def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list
         by_run.setdefault(record["run_id"], []).append(record)
     for run in runs:
         report_path = project_dir / "reports" / f"{run['run_id']}.md"
-        last_message = last_message_for_run(run)
+        last_message = last_message_display_for_run(run)
         run_questions = by_run.get(str(run["run_id"]), [])
         content = "\n".join(
             [
@@ -3393,12 +3404,12 @@ def read_jsonl_candidates(path: Path, *, max_scan_bytes: int | None = None) -> l
     return candidates
 
 
-def truncate_text_file_middle(path: Path, *, max_bytes: int) -> tuple[bool, int | None]:
+def build_truncated_text_preview(path: Path, *, max_bytes: int) -> tuple[str | None, bool, int | None]:
     if not path.exists():
-        return False, None
+        return None, False, None
     original_size = path.stat().st_size
     if original_size <= max_bytes:
-        return False, original_size
+        return read_text_if_exists(path), False, original_size
     head_budget = max(1024, (max_bytes // 2) - 256)
     tail_budget = max(1024, max_bytes - head_budget - 256)
     head = read_head_text(path, max_bytes=head_budget)
@@ -3410,8 +3421,7 @@ def truncate_text_file_middle(path: Path, *, max_bytes: int) -> tuple[bool, int 
     payload = (head + marker + tail).encode("utf-8", errors="replace")
     if len(payload) > max_bytes:
         payload = payload[: max_bytes - 4] + b"...\n"
-    path.write_bytes(payload)
-    return True, original_size
+    return payload.decode("utf-8", errors="replace"), True, original_size
 
 
 def refresh_run_artifacts(run: dict[str, Any]) -> None:
@@ -3420,6 +3430,7 @@ def refresh_run_artifacts(run: dict[str, Any]) -> None:
     stdout_path = Path(run["stdout_path"])
     stderr_path = Path(run["stderr_log"])
     last_message_path = Path(run["last_message_path"])
+    preview_path = last_message_preview_path_for_run(run)
     for label, path in (
         ("stdout_jsonl", stdout_path),
         ("stderr_log", stderr_path),
@@ -3428,20 +3439,26 @@ def refresh_run_artifacts(run: dict[str, Any]) -> None:
         if path.exists():
             artifact_sizes[label] = path.stat().st_size
     if last_message_path.exists():
-        if str(run.get("status") or "") in TERMINAL_STATUSES:
-            truncated, original_size = truncate_text_file_middle(last_message_path, max_bytes=max_last_message_bytes())
-            artifact_sizes["last_message"] = last_message_path.stat().st_size
-            if truncated:
-                run["last_message_truncated"] = True
-                run["last_message_original_bytes"] = original_size
-            elif not run.get("last_message_truncated"):
-                run["last_message_original_bytes"] = original_size
+        preview_text_value, truncated, original_size = build_truncated_text_preview(
+            last_message_path,
+            max_bytes=max_last_message_bytes(),
+        )
+        if original_size is not None:
+            run["last_message_original_bytes"] = original_size
+        run["last_message_truncated"] = bool(truncated)
+        if truncated and preview_text_value is not None:
+            write_text(preview_path, preview_text_value)
+            artifact_sizes["last_message_preview"] = preview_path.stat().st_size
+        else:
+            delete_if_exists(preview_path)
         if run.get("last_message_truncated"):
             warnings.append(
                 f"last_message_truncated:{run.get('last_message_original_bytes') or artifact_sizes.get('last_message') or '-'}"
             )
-        elif artifact_sizes.get("last_message", 0) > max_last_message_bytes():
-            warnings.append(f"last_message_large:{artifact_sizes['last_message']}")
+    else:
+        delete_if_exists(preview_path)
+        run["last_message_truncated"] = False
+        run["last_message_original_bytes"] = None
     if artifact_sizes.get("stdout_jsonl", 0) >= STDOUT_WARNING_BYTES:
         warnings.append(f"stdout_jsonl_large:{artifact_sizes['stdout_jsonl']}")
     if artifact_sizes.get("stderr_log", 0) >= STDERR_WARNING_BYTES:
@@ -4344,14 +4361,15 @@ def cmd_show(args: argparse.Namespace) -> int:
         index = load_index(root)
         refresh_index_state(root, index)
         run = resolve_run(index, args.run)
-        last_message = read_text_if_exists(Path(run["last_message_path"]))
+        last_message = last_message_for_run(run)
+        display_message = last_message_display_for_run(run)
     print(json.dumps(run, ensure_ascii=True, indent=2, sort_keys=True))
-    if last_message:
+    if display_message:
         print()
         if args.full_message:
-            print(last_message.rstrip())
+            print((last_message or "").rstrip())
         else:
-            print(preview_text(last_message, max_lines=args.message_lines, max_chars=args.message_chars))
+            print(preview_text(display_message, max_lines=args.message_lines, max_chars=args.message_chars))
     return 0
 
 
