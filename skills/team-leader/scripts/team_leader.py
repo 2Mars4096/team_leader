@@ -4696,6 +4696,7 @@ def cmd_team_status(args: argparse.Namespace) -> int:
     project_name = args.project.strip()
     is_tty = sys.stdout.isatty()
     max_updates = args.max_updates
+    use_milestones = bool(args.milestones or not args.full)
     if max_updates is None and not is_tty:
         max_updates = 20
     printed_updates = 0
@@ -4709,7 +4710,7 @@ def cmd_team_status(args: argparse.Namespace) -> int:
             if runs:
                 project_name = str(runs[0].get("project") or runs[0].get("project_slug") or project_name)
             snapshot = build_team_status_snapshot(root, project_name, runs)
-            if args.milestones:
+            if use_milestones:
                 view = render_team_status_milestones(previous_snapshot, snapshot)
                 view_key = json.dumps(snapshot, ensure_ascii=True, sort_keys=True)
             else:
@@ -4975,7 +4976,8 @@ def build_parser() -> argparse.ArgumentParser:
     team_status_p.add_argument("--project", required=True, help="Project name or project slug")
     team_status_p.add_argument("--interval", type=int, default=2, help="Seconds between refreshes")
     team_status_p.add_argument("--once", action="store_true", help="Render one update and exit")
-    team_status_p.add_argument("--milestones", action="store_true", help="Print only meaningful milestone changes such as stage transitions, child lifecycle changes, and new questions")
+    team_status_p.add_argument("--milestones", action="store_true", help="Explicitly request milestone mode; this is now the default behavior")
+    team_status_p.add_argument("--full", action="store_true", help="Print the fuller compact project summary instead of milestone-only updates")
     team_status_p.add_argument("--exit-when-settled", action="store_true", help="Exit when the project has no running, queued, ready, prepared, or blocked runs")
     team_status_p.add_argument("--max-updates", type=int, help="Maximum number of changed updates to print before exiting; defaults to 20 when stdout is captured")
     team_status_p.set_defaults(func=cmd_team_status)

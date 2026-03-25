@@ -175,15 +175,13 @@ For progressive feedback with compact live updates, use:
 python3 scripts/team_leader.py team-status --project payments-migration
 ```
 
-That prints only changed updates: stage, progress, next action, active child summaries, latest child notes, blocked or queued work, open questions, conflict alerts, and artifact warnings. In captured environments, it caps itself by default instead of streaming forever.
+That now defaults to milestone-style updates: stage transitions, child started/completed changes, new child notes, newly opened questions, conflicts, integration alerts, and warning changes. In captured environments, it caps itself by default instead of streaming forever.
 
-If you want an even lighter event feed inside Codex, add `--milestones`:
+If you want the fuller compact summary instead, add `--full`:
 
 ```bash
-python3 scripts/team_leader.py team-status --project payments-migration --milestones --exit-when-settled
+python3 scripts/team_leader.py team-status --project payments-migration --full --exit-when-settled
 ```
-
-That emits only milestone changes such as stage transitions, child started/completed state changes, new child notes, newly opened questions, conflicts, integration alerts, and warning changes.
 
 For a live terminal view:
 

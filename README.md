@@ -67,9 +67,9 @@ Autonomy modes:
 
 From the target project root, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary in this repo. When the skill is installed elsewhere, call that installed script path while keeping the working directory anchored to the target project, or pass `--root` and `--cd` explicitly. That prints the current stage, stage reason, next action, current focus, workspace path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
 
-For progressive feedback inside Codex, prefer `python3 skills/team-leader/scripts/team_leader.py team-status --project <project>`. That prints compact change-based updates with the current stage, progress, active child summaries, latest child notes, blocked or queued work, open questions, and warnings. When stdout is captured, it automatically caps itself unless you override `--max-updates`.
+For progressive feedback inside Codex, prefer `python3 skills/team-leader/scripts/team_leader.py team-status --project <project>`. That now defaults to a milestone-style feed: stage transitions, child lifecycle changes, new child notes, newly opened questions, conflicts, integration issues, and warning changes. When stdout is captured, it automatically caps itself unless you override `--max-updates`.
 
-If you want a lighter event-style feed, add `--milestones`. That only emits meaningful changes such as stage transitions, child lifecycle changes, new child notes, newly opened questions, conflicts, integration issues, and warning changes.
+If you want the fuller compact summary instead of milestone mode, add `--full`.
 
 If you want a dedicated monitoring skill chip in Codex, install `skills/team-status` as well. That gives you a `$team-status` skill entry for project progress checks while keeping `$team-leader` focused on planning and dispatch.
 
