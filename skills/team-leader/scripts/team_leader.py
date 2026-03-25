@@ -524,6 +524,9 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("output_warnings", [])
         run.setdefault("last_message_truncated", False)
         run.setdefault("last_message_original_bytes", None)
+        run.setdefault("question_records", [])
+        run.setdefault("question_source_bytes", None)
+        run.setdefault("question_source_mtime_ns", None)
         if get_session_id(run):
             set_session_id(run, get_session_id(run))
     return data
@@ -532,9 +535,9 @@ def load_index(root: Path) -> dict[str, Any]:
 def save_index(root: Path, data: dict[str, Any]) -> None:
     ensure_root(root)
     data["version"] = INDEX_VERSION
-    index_path(root).write_text(
+    write_text(
+        index_path(root),
         json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
     )
 
 
@@ -554,6 +557,9 @@ def quote_command(parts: list[str]) -> str:
 
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing = read_text_if_exists(path)
+    if existing == content:
+        return
     path.write_text(content, encoding="utf-8")
 
 
@@ -1918,6 +1924,47 @@ def build_question_record(run: dict[str, Any], text: str) -> dict[str, str]:
     }
 
 
+def question_records_for_run(run: dict[str, Any]) -> list[dict[str, str]]:
+    path = Path(run["last_message_path"])
+    if not path.exists():
+        run["question_records"] = []
+        run["question_source_bytes"] = None
+        run["question_source_mtime_ns"] = None
+        return []
+    stat = path.stat()
+    size = stat.st_size
+    mtime_ns = stat.st_mtime_ns
+    cached = run.get("question_records")
+    if (
+        isinstance(cached, list)
+        and run.get("question_source_bytes") == size
+        and run.get("question_source_mtime_ns") == mtime_ns
+    ):
+        normalized: list[dict[str, str]] = []
+        for item in cached:
+            if not isinstance(item, dict):
+                continue
+            text = normalize_optional_text(item.get("text"))
+            if not text:
+                continue
+            normalized.append(
+                {
+                    "id": normalize_optional_text(item.get("id")) or question_id_for(run, text),
+                    "run_id": normalize_optional_text(item.get("run_id")) or str(run["run_id"]),
+                    "task_id": normalize_optional_text(item.get("task_id")) or str(run.get("task_id") or run["run_id"]),
+                    "summary": normalize_optional_text(item.get("summary")) or str(run.get("summary") or "-"),
+                    "text": text,
+                }
+            )
+        run["question_records"] = normalized
+        return normalized
+    records = [build_question_record(run, question_text) for question_text in extract_questions(last_message_for_run(run))]
+    run["question_records"] = records
+    run["question_source_bytes"] = size
+    run["question_source_mtime_ns"] = mtime_ns
+    return records
+
+
 def load_answers(project_dir: Path) -> dict[str, str]:
     text = read_text_if_exists(project_dir / "answers.md")
     if not text:
@@ -2157,9 +2204,7 @@ def collect_question_records(runs: list[dict[str, Any]]) -> list[dict[str, str]]
     question_records: list[dict[str, str]] = []
     seen_question_ids: set[str] = set()
     for run in runs:
-        last_message = last_message_for_run(run)
-        for question_text in extract_questions(last_message):
-            record = build_question_record(run, question_text)
+        for record in question_records_for_run(run):
             if record["id"] in seen_question_ids:
                 continue
             seen_question_ids.add(record["id"])
@@ -2975,6 +3020,96 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         lines.append("- none")
     else:
         for run in warning_runs:
+            warnings = format_inline_list(normalize_str_list(run.get("output_warnings"), "output_warnings"))
+            lines.append(f"- {run.get('task_id') or run['run_id']}: {warnings}")
+    return "\n".join(lines)
+
+
+def render_team_status_summary(root: Path, project_name: str, runs: list[dict[str, Any]]) -> str:
+    slug = str(runs[0].get("project_slug") or project_slug(project_name)) if runs else project_slug(project_name)
+    project_dir = project_workspace_dir(root, project_name, slug)
+    watcher_state, watcher_heartbeat = monitor_state(root)
+    question_records = collect_question_records(runs)
+    answers = load_answers(project_dir)
+    open_questions = unanswered_questions(question_records, answers)
+    conflicts = detect_conflict_risks(runs)
+    integration_issues = integration_alerts(runs)
+    warning_runs = output_warning_runs(runs)
+    brief = load_project_brief(project_dir, project_name)
+    validation = load_project_validation(project_dir)
+    stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
+    active = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("status") or "") == "running"
+    ]
+    blocked = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("dispatch_state") or "") == "blocked"
+    ]
+    queued = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("dispatch_state") or "") == "queued"
+    ]
+    lines = [
+        f"project={project_name}",
+        f"stage={stage['current_stage']}",
+        f"stage_reason={stage['stage_reason']}",
+        f"progress={stage['progress']}",
+        f"next_action={stage['next_action']}",
+        f"current_focus={stage['focus']}",
+        f"workspace={project_dir}",
+        f"dashboard={project_dir / 'dashboard.md'}",
+    ]
+    watcher_line = f"watcher={watcher_state}"
+    if watcher_heartbeat:
+        watcher_line += f" heartbeat={watcher_heartbeat}"
+    lines.append(watcher_line)
+    lines.extend(["", "active_runs:"])
+    if not active:
+        lines.append("- none")
+    else:
+        for run in active:
+            lines.append(f"- {run.get('task_id') or run['run_id']}: {run.get('summary') or '-'}")
+            live_note = short_summary(latest_live_note(run), max_chars=100)
+            if live_note != "-":
+                lines.append(f"  note: {live_note}")
+    lines.extend(["", "blocked_runs:"])
+    if not blocked:
+        lines.append("- none")
+    else:
+        for run in blocked:
+            waiting_on = format_inline_list(normalize_str_list(run.get("blocked_on"), "blocked_on"))
+            lines.append(f"- {run.get('task_id') or run['run_id']}: {waiting_on}")
+    lines.extend(["", "queued_runs:"])
+    if not queued:
+        lines.append("- none")
+    else:
+        for run in queued:
+            waiting_on = format_inline_list(normalize_str_list(run.get("blocked_on"), "blocked_on"))
+            lines.append(f"- {run.get('task_id') or run['run_id']}: {waiting_on}")
+    lines.extend(["", "open_questions:"])
+    if not open_questions:
+        lines.append("- none")
+    else:
+        for question in open_questions[:5]:
+            lines.append(f"- {question['id']} [{question['task_id']}] {short_summary(question['text'], max_chars=90)}")
+    lines.extend(["", "conflicts:"])
+    if not conflicts:
+        lines.append("- none")
+    else:
+        for conflict in conflicts:
+            lines.append(f"- {conflict['left_task']} vs {conflict['right_task']} on {conflict['paths']}")
+    lines.extend(["", "integration:"])
+    if not integration_issues:
+        lines.append("- none")
+    else:
+        for item in integration_issues[:5]:
+            lines.append(f"- {item['task_id']} [{item['state']}] {short_summary(item['note'], max_chars=90)}")
+    lines.extend(["", "output_warnings:"])
+    if not warning_runs:
+        lines.append("- none")
+    else:
+        for run in warning_runs[:5]:
             warnings = format_inline_list(normalize_str_list(run.get("output_warnings"), "output_warnings"))
             lines.append(f"- {run.get('task_id') or run['run_id']}: {warnings}")
     return "\n".join(lines)
@@ -3858,6 +3993,19 @@ def watch_view_key(view: str) -> str:
     return re.sub(r"(?m)^(watcher=[^\n]+?) heartbeat=[^\n]+$", r"\1", view)
 
 
+def project_has_unsettled_runs(runs: list[dict[str, Any]]) -> bool:
+    for run in runs:
+        status = str(run.get("status") or "")
+        dispatch_state = str(run.get("dispatch_state") or "")
+        if status == "running":
+            return True
+        if status in {"prepared"}:
+            return True
+        if dispatch_state in {"ready", "blocked", "queued"}:
+            return True
+    return False
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     with root_lock(root):
@@ -4355,6 +4503,44 @@ def cmd_watch(args: argparse.Namespace) -> int:
             print("\033[?1049l", end="", flush=True)
 
 
+def cmd_team_status(args: argparse.Namespace) -> int:
+    root = resolve_path(args.root) if args.root else default_root()
+    project_name = args.project.strip()
+    is_tty = sys.stdout.isatty()
+    max_updates = args.max_updates
+    if max_updates is None and not is_tty:
+        max_updates = 20
+    printed_updates = 0
+    last_view: str | None = None
+    while True:
+        with root_lock(root):
+            index = load_index(root)
+            refresh_index_state(root, index)
+            runs = project_runs(index, project_name)
+            if runs:
+                project_name = str(runs[0].get("project") or runs[0].get("project_slug") or project_name)
+            view = render_team_status_summary(root, project_name, runs)
+            view_key = watch_view_key(view)
+            unsettled = project_has_unsettled_runs(runs)
+        if view_key != last_view or args.once:
+            if printed_updates:
+                print()
+            print(f"[{utc_now()}]")
+            print(view)
+            last_view = view_key
+            printed_updates += 1
+        if args.once:
+            return 0
+        if args.exit_when_settled and not unsettled:
+            return 0
+        if max_updates is not None and max_updates > 0 and printed_updates >= max_updates:
+            if unsettled:
+                print()
+                print("note=team-status stopped after max-updates; rerun for more progress or use a real terminal for an uncapped stream")
+            return 0
+        time.sleep(max(1, int(args.interval)))
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     with root_lock(root):
@@ -4588,6 +4774,15 @@ def build_parser() -> argparse.ArgumentParser:
     status_p.add_argument("--project", help="Filter to one project name or project slug")
     status_p.add_argument("--json", action="store_true", help="Print JSON instead of a table")
     status_p.set_defaults(func=cmd_status)
+
+    team_status_p = sub.add_parser("team-status", help="Show compact project progress updates and child activity")
+    team_status_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
+    team_status_p.add_argument("--project", required=True, help="Project name or project slug")
+    team_status_p.add_argument("--interval", type=int, default=2, help="Seconds between refreshes")
+    team_status_p.add_argument("--once", action="store_true", help="Render one update and exit")
+    team_status_p.add_argument("--exit-when-settled", action="store_true", help="Exit when the project has no running, queued, ready, prepared, or blocked runs")
+    team_status_p.add_argument("--max-updates", type=int, help="Maximum number of changed updates to print before exiting; defaults to 20 when stdout is captured")
+    team_status_p.set_defaults(func=cmd_team_status)
 
     watch_p = sub.add_parser("watch", help="Watch one project with a live terminal summary")
     watch_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")

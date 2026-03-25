@@ -93,6 +93,12 @@ If you want to stay inside Codex instead of opening the folder, run:
 
 That prints the same high-signal view directly in the terminal, including the current stage, stage reason, next action, current focus, and exact file paths for the workspace, landing page, and dashboard.
 
+For compact progressive updates that work better in captured Codex output, use:
+
+`python3 scripts/team_leader.py team-status --project <project>`
+
+That emits change-based updates for stage, progress, active child summaries, latest child notes, queued or blocked work, open questions, and warnings.
+
 For a live terminal view, use:
 
 `python3 scripts/team_leader.py watch --project <project>`

@@ -21,6 +21,7 @@ The controller now includes conservative safety defaults aimed at avoiding runaw
 - at most `2` new child launches per `15` seconds by default
 - child `last_message.md` files truncated to a bounded size with head/tail preservation
 - bounded session-id scans and bounded log tail reads
+- `team-status --project` gives a compact progressive update stream that is safer in captured Codex output than a full-screen watch
 - non-TTY `watch` falls back to a single snapshot unless explicitly told to stream
 
 That project workspace is persistent state, not a temp folder. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The only file intended for direct human edits is `answers.md`. For a clean restart, use a new project name.
@@ -167,6 +168,14 @@ python3 scripts/team_leader.py status --project payments-migration
 ```
 
 That prints the current stage, stage reason, next action, current focus, workspace path, landing page path, dashboard path, watcher state, active runs, blocked runs, open questions, recent answers, conflict hints, and integration state directly in the terminal.
+
+For progressive feedback with compact live updates, use:
+
+```bash
+python3 scripts/team_leader.py team-status --project payments-migration
+```
+
+That prints only changed updates: stage, progress, next action, active child summaries, latest child notes, blocked or queued work, open questions, conflict alerts, and artifact warnings. In captured environments, it caps itself by default instead of streaming forever.
 
 For a live terminal view:
 

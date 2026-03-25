@@ -20,6 +20,7 @@ The current safety defaults are intentionally conservative:
 - no more than `2` new child launches every `15` seconds
 - oversized child `last_message.md` files are truncated with head/tail preservation
 - `status --project` and project markdown now surface artifact-size warnings
+- `team-status --project` provides a compact progressive update stream that is safer to use inside captured Codex output
 - non-TTY `watch` falls back to a single snapshot unless explicitly allowed to stream
 
 The default landing page for each project is `.team-leader/projects/<project>/README.md`. From there:
@@ -64,6 +65,8 @@ Autonomy modes:
 - `continuous`: once the brief is present, the manager can auto-start planner waves and keep pushing until validation and completion signals say the project is delivered, or the configured planner-round limit is reached
 
 From the target project root, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary in this repo. When the skill is installed elsewhere, call that installed script path while keeping the working directory anchored to the target project, or pass `--root` and `--cd` explicitly. That prints the current stage, stage reason, next action, current focus, workspace path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
+
+For progressive feedback inside Codex, prefer `python3 skills/team-leader/scripts/team_leader.py team-status --project <project>`. That prints compact change-based updates with the current stage, progress, active child summaries, latest child notes, blocked or queued work, open questions, and warnings. When stdout is captured, it automatically caps itself unless you override `--max-updates`.
 
 For a live terminal panel, use `python3 skills/team-leader/scripts/team_leader.py watch --project <project>`. That repeatedly refreshes the project summary plus per-run lines, including integration state and the latest child note. In captured terminal environments, `watch` now defaults to one snapshot unless you explicitly opt into streaming.
 
