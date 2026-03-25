@@ -11,6 +11,7 @@ import os
 import os.path
 import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -30,6 +31,7 @@ DEFAULT_PROVIDER = "codex"
 DEFAULT_ROOT_NAME = ".team-leader"
 LEGACY_ROOT_NAMES = (".agent-subsessions", ".codex-subsessions")
 LEGACY_ROOTS_LABEL = ", ".join(f"./{name}" for name in LEGACY_ROOT_NAMES)
+DEFAULT_MAX_PARALLEL_SESSIONS = 8
 CHILD_RUN_ENV = "TEAM_LEADER_CHILD_RUN"
 QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
 ANSWER_LINE_RE = re.compile(r"^\s*[-*+]\s*`?([a-z0-9][a-z0-9-]*)`?\s*:\s*(.+?)\s*$", re.IGNORECASE)
@@ -70,6 +72,18 @@ def slugify(value: str) -> str:
 
 def resolve_path(raw: str | Path) -> Path:
     return Path(raw).expanduser().resolve()
+
+
+def resolve_executable(raw: str) -> str:
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute() or os.sep in raw:
+        if candidate.exists():
+            return str(candidate.resolve())
+        raise RuntimeError(f"unable to resolve executable path: {raw}")
+    found = shutil.which(raw)
+    if found:
+        return str(Path(found).resolve())
+    raise RuntimeError(f"unable to locate executable on PATH: {raw}")
 
 
 def path_looks_like_skill_dir(path: Path) -> bool:
@@ -524,6 +538,40 @@ def child_prompt_guard(prompt_text: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def write_child_cli_guard(run_dir: Path, adapter: ProviderAdapter, real_bin: str) -> Path:
+    guard_dir = run_dir / "child-bin"
+    guard_dir.mkdir(parents=True, exist_ok=True)
+    blocked_names = {
+        adapter.default_bin,
+        os.path.basename(adapter.resolved_bin()),
+        os.path.basename(real_bin),
+    }
+    script = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            'echo "nested provider launch is disabled inside a team-leader child session." >&2',
+            'echo "Report replanning or delegation needs back to the parent manager instead." >&2',
+            "exit 97",
+            "",
+        ]
+    )
+    for name in sorted(item for item in blocked_names if item):
+        path = guard_dir / name
+        write_text(path, script)
+        path.chmod(0o755)
+    return guard_dir
+
+
+def max_parallel_sessions() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_MAX_PARALLEL_SESSIONS"))
+    if raw is None:
+        return DEFAULT_MAX_PARALLEL_SESSIONS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_PARALLEL_SESSIONS
+
+
 def delete_if_exists(path: Path) -> None:
     if path.exists():
         path.unlink()
@@ -827,6 +875,7 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     lines.extend(["", "## Delivery Policy", ""])
     lines.append(f"- Autonomy mode: `{autonomy_mode}`")
     lines.append(f"- Clarification mode: `{clarification_mode}`")
+    lines.append(f"- Max parallel sessions: `{max_parallel_sessions()}`")
     lines.append(f"- Max planner rounds: `{max_planner_rounds}`")
     lines.append(f"- Max auto-fix rounds: `{max_auto_fix_rounds}`")
     lines.append(f"- Completion sentinel: `{completion_sentinel or '-'}`")
@@ -1961,6 +2010,21 @@ def update_dispatch_metadata(index: dict[str, Any]) -> None:
         run["blocked_on"] = list(blocked_on)
 
 
+def apply_parallel_limit_metadata(index: dict[str, Any]) -> None:
+    active_count = sum(1 for run in index["runs"] if str(run.get("status") or "") == "running")
+    parallel_limit = max_parallel_sessions()
+    for run in sorted(index["runs"], key=run_sort_key):
+        if str(run.get("status") or "") not in PRELAUNCH_STATUSES:
+            continue
+        if str(run.get("dispatch_state") or "") != "ready":
+            continue
+        if active_count >= parallel_limit:
+            run["dispatch_state"] = "queued"
+            run["blocked_on"] = [f"parallel-limit:{parallel_limit}"]
+            continue
+        active_count += 1
+
+
 def ensure_project_workspace(root: Path, project_name: str, slug: str) -> Path:
     project_dir = project_workspace_dir(root, project_name, slug)
     (project_dir / "reports").mkdir(parents=True, exist_ok=True)
@@ -1998,6 +2062,10 @@ def project_stage_snapshot(
         run for run in sorted(runs, key=run_sort_key)
         if str(run.get("dispatch_state") or "") == "blocked"
     ]
+    queued = [
+        run for run in sorted(runs, key=run_sort_key)
+        if str(run.get("dispatch_state") or "") == "queued"
+    ]
     failed = [
         run for run in sorted(runs, key=run_sort_key)
         if str(run.get("status") or "") == "failed"
@@ -2015,6 +2083,7 @@ def project_stage_snapshot(
     progress = (
         f"{counts['completed']}/{total} completed, "
         f"{counts['running']} running, {len(blocked)} blocked, "
+        f"{len(queued)} queued, "
         f"{len(open_questions)} open questions"
     )
     if integration_conflicts:
@@ -2052,6 +2121,12 @@ def project_stage_snapshot(
             f"Wait for {format_inline_list(normalize_str_list(first_blocked.get('blocked_on'), 'blocked_on'))}"
         )
         focus = str(first_blocked.get("summary") or "-")
+    elif queued:
+        first_queued = queued[0]
+        current_stage = "waiting-for-capacity"
+        stage_reason = f"{len(queued)} task(s) waiting for the parallel session limit"
+        next_action = f"Wait for a running child to finish so `{first_queued.get('task_id') or first_queued['run_id']}` can start"
+        focus = str(first_queued.get("summary") or "-")
     elif failed:
         first_failed = failed[0]
         current_stage = "review-failures"
@@ -2660,6 +2735,7 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"goal={normalize_optional_text(brief.get('goal')) if brief else '-'}",
         f"autonomy_mode={normalize_optional_text(brief.get('autonomy_mode')) if brief else 'manual'}",
         f"clarification_mode={normalize_optional_text(brief.get('clarification_mode')) if brief else 'auto'}",
+        f"parallel_limit={max_parallel_sessions()}",
         f"max_auto_fix_rounds={brief.get('max_auto_fix_rounds') if brief else 2}",
         f"validation_status={normalize_optional_text(validation.get('status')) if validation else 'not-run'}",
         f"current_stage={stage['current_stage']}",
@@ -2862,6 +2938,7 @@ def sync_projects(root: Path, index: dict[str, Any]) -> None:
 
 def save_index_and_sync(root: Path, data: dict[str, Any]) -> None:
     update_dispatch_metadata(data)
+    apply_parallel_limit_metadata(data)
     save_index(root, data)
     sync_projects(root, data)
 
@@ -3316,6 +3393,7 @@ def start_run_process(run: dict[str, Any]) -> None:
 
 def launch_ready_runs(root: Path, index: dict[str, Any]) -> None:
     update_dispatch_metadata(index)
+    apply_parallel_limit_metadata(index)
     for run in sorted(index["runs"], key=run_sort_key):
         if str(run.get("status") or "") not in PRELAUNCH_STATUSES:
             continue
@@ -3323,8 +3401,11 @@ def launch_ready_runs(root: Path, index: dict[str, Any]) -> None:
         if dispatch_state == "blocked":
             run["status"] = "blocked"
             continue
+        if dispatch_state == "queued":
+            continue
         start_run_process(run)
     update_dispatch_metadata(index)
+    apply_parallel_limit_metadata(index)
 
 
 def run_has_provider_artifacts(run: dict[str, Any]) -> bool:
@@ -3385,13 +3466,21 @@ def build_runner_script(
     exit_code_path: Path,
     started_path: Path,
     finished_path: Path,
+    env_exports: dict[str, str] | None = None,
+    path_prefix: Path | None = None,
 ) -> str:
     cmd = quote_command(command)
-    return "\n".join(
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -uo pipefail",
+        f"export {CHILD_RUN_ENV}=1",
+    ]
+    if path_prefix is not None:
+        lines.append(f"export PATH={shlex.quote(str(path_prefix))}:$PATH")
+    for key, value in sorted((env_exports or {}).items()):
+        lines.append(f"export {key}={shlex.quote(value)}")
+    lines.extend(
         [
-            "#!/usr/bin/env bash",
-            "set -uo pipefail",
-            f"export {CHILD_RUN_ENV}=1",
             f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {shlex.quote(str(started_path))}",
             f"printf '%s\\n' running > {shlex.quote(str(state_path))}",
             f"{cmd} < {shlex.quote(str(prompt_path))}",
@@ -3407,6 +3496,7 @@ def build_runner_script(
             "",
         ]
     )
+    return "\n".join(lines)
 
 
 def dispatch_options_for_run(run: dict[str, Any]) -> DispatchOptions:
@@ -3447,8 +3537,12 @@ def refresh_runner_for_run(run: dict[str, Any]) -> None:
         last_message_path=Path(run["last_message_path"]),
         options=options,
     )
+    real_provider_bin = resolve_executable(normalize_optional_text(run.get("provider_bin")) or adapter.resolved_bin())
+    command[0] = real_provider_bin
     run_dir = Path(run["run_dir"])
     runner_path = Path(run["runner_path"])
+    guard_dir = write_child_cli_guard(run_dir, adapter, real_provider_bin)
+    guard_target = str(guard_dir / adapter.default_bin)
     write_text(
         runner_path,
         build_runner_script(
@@ -3458,6 +3552,10 @@ def refresh_runner_for_run(run: dict[str, Any]) -> None:
             exit_code_path=run_dir / "exit_code.txt",
             started_path=run_dir / "started_at.txt",
             finished_path=run_dir / "finished_at.txt",
+            env_exports={
+                adapter.bin_env_var: guard_target,
+            },
+            path_prefix=guard_dir,
         ),
     )
     runner_path.chmod(0o755)
@@ -3704,6 +3802,10 @@ def materialize_run(
         last_message_path=last_message_path,
         options=options,
     )
+    real_provider_bin = resolve_executable(adapter.resolved_bin())
+    command[0] = real_provider_bin
+    guard_dir = write_child_cli_guard(run_dir, adapter, real_provider_bin)
+    guard_target = str(guard_dir / adapter.default_bin)
 
     write_text(
         runner_path,
@@ -3714,6 +3816,10 @@ def materialize_run(
             exit_code_path=exit_code_path,
             started_path=started_path,
             finished_path=finished_path,
+            env_exports={
+                adapter.bin_env_var: guard_target,
+            },
+            path_prefix=guard_dir,
         ),
     )
     runner_path.chmod(0o755)
@@ -3723,7 +3829,7 @@ def materialize_run(
         "run_id": run_id,
         "name": options.name or run_id,
         "provider": adapter.name,
-        "provider_bin": adapter.resolved_bin(),
+        "provider_bin": real_provider_bin,
         "project": options.project,
         "project_slug": project_slug(options.project) if options.project else None,
         "task_id": options.task_id,
