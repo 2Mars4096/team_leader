@@ -1,0 +1,4 @@
+interface:
+  display_name: "Team Status"
+  short_description: "Monitor team-leader project progress and child activity"
+  default_prompt: "Use $team-status to show compact progress updates for a team-leader project, including stage changes, active child sessions, and latest child notes."

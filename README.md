@@ -5,6 +5,7 @@ Codex-first skill for running a team-leader style manager over real child CLI se
 ## Skill
 
 - `skills/team-leader`
+- `skills/team-status`
 
 The current implementation ships with a `codex` provider adapter and a control plane that is structured so later adapters can target other CLIs without changing the run registry format.
 
@@ -67,6 +68,8 @@ Autonomy modes:
 From the target project root, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary in this repo. When the skill is installed elsewhere, call that installed script path while keeping the working directory anchored to the target project, or pass `--root` and `--cd` explicitly. That prints the current stage, stage reason, next action, current focus, workspace path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
 
 For progressive feedback inside Codex, prefer `python3 skills/team-leader/scripts/team_leader.py team-status --project <project>`. That prints compact change-based updates with the current stage, progress, active child summaries, latest child notes, blocked or queued work, open questions, and warnings. When stdout is captured, it automatically caps itself unless you override `--max-updates`.
+
+If you want a dedicated monitoring skill chip in Codex, install `skills/team-status` as well. That gives you a `$team-status` skill entry for project progress checks while keeping `$team-leader` focused on planning and dispatch.
 
 For a live terminal panel, use `python3 skills/team-leader/scripts/team_leader.py watch --project <project>`. That repeatedly refreshes the project summary plus per-run lines, including integration state and the latest child note. In captured terminal environments, `watch` now defaults to one snapshot unless you explicitly opt into streaming.
 
