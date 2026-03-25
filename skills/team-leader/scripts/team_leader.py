@@ -3891,22 +3891,14 @@ def read_pid_file(path: Path) -> int | None:
     return int(text)
 
 
-def index_has_active_runs(index: dict[str, Any]) -> bool:
-    for run in index["runs"]:
-        status = str(run.get("status") or "")
-        if status == "running":
-            return True
-        if status in TERMINAL_STATUSES:
-            continue
-        if pid_alive(run.get("pid")):
-            return True
-    return False
+def index_has_unsettled_runs(index: dict[str, Any]) -> bool:
+    return project_has_unsettled_runs(index["runs"])
 
 
 def ensure_monitor(root: Path, index: dict[str, Any]) -> None:
     if os.environ.get(MONITOR_RUN_ENV) == "1":
         return
-    if not index_has_active_runs(index):
+    if not index_has_unsettled_runs(index):
         return
     pid_path = monitor_pid_path(root)
     current_pid = read_pid_file(pid_path)
@@ -4192,6 +4184,16 @@ def project_has_unsettled_runs(runs: list[dict[str, Any]]) -> bool:
         if dispatch_state in {"ready", "blocked", "queued"}:
             return True
     return False
+
+
+def project_has_state_files(root: Path, project_name: str) -> bool:
+    project_dir = project_workspace_dir(root, project_name, project_slug(project_name))
+    return bool(
+        project_brief_path(project_dir).exists()
+        or project_launch_plan_md_path(project_dir).exists()
+        or project_validation_path(project_dir).exists()
+        or project_validation_md_path(project_dir).exists()
+    )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -4674,8 +4676,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     project_name = str(runs[0].get("project") or runs[0].get("project_slug") or project_name)
                 view = render_watch_view(root, project_name, runs)
                 view_key = watch_view_key(view)
-                active = any(str(run.get("status") or "") == "running" for run in runs)
-                blocked = any(str(run.get("dispatch_state") or "") == "blocked" for run in runs)
+                unsettled = project_has_unsettled_runs(runs)
             if view_key != last_view or args.once:
                 if should_clear:
                     print("\033[2J\033[H", end="")
@@ -4683,7 +4684,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 last_view = view_key
             if args.once:
                 return 0
-            if args.exit_when_settled and not active and not blocked:
+            if args.exit_when_settled and not unsettled:
                 return 0
             time.sleep(max(1, int(args.interval)))
     finally:
@@ -4707,6 +4708,9 @@ def cmd_team_status(args: argparse.Namespace) -> int:
             index = load_index(root)
             refresh_index_state(root, index)
             runs = project_runs(index, project_name)
+            if not runs and not project_has_state_files(root, project_name):
+                print("no runs")
+                return 0
             if runs:
                 project_name = str(runs[0].get("project") or runs[0].get("project_slug") or project_name)
             snapshot = build_team_status_snapshot(root, project_name, runs)
@@ -4837,7 +4841,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
                 index = load_index(root)
                 refresh_index_state(root, index)
                 write_text(heartbeat_path, utc_now() + "\n")
-                if not index_has_active_runs(index):
+                if not index_has_unsettled_runs(index):
                     break
             time.sleep(max(1, int(args.interval)))
     finally:
