@@ -3500,6 +3500,10 @@ def render_watch_view(root: Path, project_name: str, runs: list[dict[str, Any]])
     return "\n".join(lines)
 
 
+def watch_view_key(view: str) -> str:
+    return re.sub(r"(?m)^(watcher=[^\n]+?) heartbeat=[^\n]+$", r"\1", view)
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     with root_lock(root):
@@ -3968,13 +3972,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 if runs:
                     project_name = str(runs[0].get("project") or runs[0].get("project_slug") or project_name)
                 view = render_watch_view(root, project_name, runs)
+                view_key = watch_view_key(view)
                 active = any(str(run.get("status") or "") == "running" for run in runs)
                 blocked = any(str(run.get("dispatch_state") or "") == "blocked" for run in runs)
-            if view != last_view or args.once:
+            if view_key != last_view or args.once:
                 if should_clear:
                     print("\033[2J\033[H", end="")
                 print(view)
-                last_view = view
+                last_view = view_key
             if args.once:
                 return 0
             if args.exit_when_settled and not active and not blocked:
