@@ -3201,6 +3201,16 @@ def read_tail_text(path: Path, *, max_bytes: int = 131072) -> str:
     return text
 
 
+def read_tail_lines(path: Path, line_count: int, *, max_bytes: int = 1048576) -> list[str]:
+    target = max(1, int(line_count))
+    chunk = min(65536, max_bytes)
+    lines = read_tail_text(path, max_bytes=chunk).splitlines()
+    while len(lines) < target and chunk < max_bytes:
+        chunk = min(max_bytes, chunk * 2)
+        lines = read_tail_text(path, max_bytes=chunk).splitlines()
+    return lines[-target:]
+
+
 def read_jsonl_candidates(path: Path) -> list[str]:
     candidates: list[str] = []
     if not path.exists():
@@ -4064,6 +4074,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     project_name = args.project.strip()
     is_tty = sys.stdout.isatty()
+    if not is_tty and not args.once and not args.allow_non_tty_stream:
+        args.once = True
     should_clear = is_tty and not args.no_clear
     use_alt_screen = should_clear and not args.no_alt_screen
     last_view: str | None = None
@@ -4120,8 +4132,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
     if not path.exists():
         print(f"missing log: {path}", file=sys.stderr)
         return 1
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    for line in lines[-args.lines:]:
+    for line in read_tail_lines(path, args.lines):
         print(line)
     return 0
 
@@ -4334,6 +4345,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_p.add_argument("--exit-when-settled", action="store_true", help="Exit when the project has no running or blocked runs")
     watch_p.add_argument("--no-clear", action="store_true", help="Do not clear the terminal between frames")
     watch_p.add_argument("--no-alt-screen", action="store_true", help="Keep normal terminal scrollback instead of using an alternate screen")
+    watch_p.add_argument("--allow-non-tty-stream", action="store_true", help="Permit continuous watch output even when stdout is captured instead of attached to a real terminal")
     watch_p.set_defaults(func=cmd_watch)
 
     show_p = sub.add_parser("show", help="Show one run and its last message")
