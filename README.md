@@ -14,6 +14,14 @@ Invoke the controller by script path, but keep your working directory at the tar
 
 Project-linked runs maintain a central markdown workspace under `.team-leader/projects/<project>/` so the manager can track the project brief, planner output, dashboards, collected child reports, human questions, and conflict-risk notes without manually stitching together terminal output. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. Older `.agent-subsessions` and `.codex-subsessions` roots are still recognized automatically.
 
+The current safety defaults are intentionally conservative:
+
+- no more than `8` child sessions running at once
+- no more than `2` new child launches every `15` seconds
+- oversized child `last_message.md` files are truncated with head/tail preservation
+- `status --project` and project markdown now surface artifact-size warnings
+- non-TTY `watch` falls back to a single snapshot unless explicitly allowed to stream
+
 The default landing page for each project is `.team-leader/projects/<project>/README.md`. From there:
 
 - `brief.md` records the project goal, repo paths, spec paths, notes, and constraints
@@ -57,7 +65,7 @@ Autonomy modes:
 
 From the target project root, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary in this repo. When the skill is installed elsewhere, call that installed script path while keeping the working directory anchored to the target project, or pass `--root` and `--cd` explicitly. That prints the current stage, stage reason, next action, current focus, workspace path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
 
-For a live terminal panel, use `python3 skills/team-leader/scripts/team_leader.py watch --project <project>`. That repeatedly refreshes the project summary plus per-run lines, including integration state and the latest child note.
+For a live terminal panel, use `python3 skills/team-leader/scripts/team_leader.py watch --project <project>`. That repeatedly refreshes the project summary plus per-run lines, including integration state and the latest child note. In captured terminal environments, `watch` now defaults to one snapshot unless you explicitly opt into streaming.
 
 ## Install After Pushing
 

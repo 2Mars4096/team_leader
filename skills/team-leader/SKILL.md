@@ -15,6 +15,14 @@ Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragm
 
 When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. While any child is active, the manager refreshes those markdown files automatically in the background.
 
+The controller now includes conservative safety defaults aimed at avoiding runaway resource use:
+
+- at most `8` child sessions running in parallel by default
+- at most `2` new child launches per `15` seconds by default
+- child `last_message.md` files truncated to a bounded size with head/tail preservation
+- bounded session-id scans and bounded log tail reads
+- non-TTY `watch` falls back to a single snapshot unless explicitly told to stream
+
 That project workspace is persistent state, not a temp folder. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The only file intended for direct human edits is `answers.md`. For a clean restart, use a new project name.
 
 Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
@@ -166,7 +174,7 @@ For a live terminal view:
 python3 scripts/team_leader.py watch --project payments-migration
 ```
 
-Use `--once` for a single render or `--exit-when-settled` when you want the view to stop after the project has no running or blocked runs.
+Use `--once` for a single render or `--exit-when-settled` when you want the view to stop after the project has no running or blocked runs. In captured or non-TTY environments like Codex terminal output, `watch` now defaults to a single snapshot unless you explicitly opt into streaming.
 
 For project-linked runs, the manager also updates:
 

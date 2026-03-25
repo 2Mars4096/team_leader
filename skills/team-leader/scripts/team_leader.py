@@ -32,6 +32,12 @@ DEFAULT_ROOT_NAME = ".team-leader"
 LEGACY_ROOT_NAMES = (".agent-subsessions", ".codex-subsessions")
 LEGACY_ROOTS_LABEL = ", ".join(f"./{name}" for name in LEGACY_ROOT_NAMES)
 DEFAULT_MAX_PARALLEL_SESSIONS = 8
+DEFAULT_MAX_RELEASES_PER_CYCLE = 2
+DEFAULT_RELEASE_WINDOW_SECONDS = 15
+DEFAULT_LAST_MESSAGE_BYTES = 128 * 1024
+DEFAULT_JSONL_SCAN_BYTES = 8 * 1024 * 1024
+STDOUT_WARNING_BYTES = 8 * 1024 * 1024
+STDERR_WARNING_BYTES = 4 * 1024 * 1024
 CHILD_RUN_ENV = "TEAM_LEADER_CHILD_RUN"
 QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
 ANSWER_LINE_RE = re.compile(r"^\s*[-*+]\s*`?([a-z0-9][a-z0-9-]*)`?\s*:\s*(.+?)\s*$", re.IGNORECASE)
@@ -63,6 +69,19 @@ def utc_now() -> str:
 
 def epoch_now() -> int:
     return int(time.time())
+
+
+def parse_timestamp_epoch(value: str | None) -> int | None:
+    text = normalize_optional_text(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
 
 
 def slugify(value: str) -> str:
@@ -500,6 +519,10 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("integration_note", None)
         run.setdefault("integration_updated_at", None)
         run.setdefault("changed_paths", [])
+        run.setdefault("artifact_sizes", {})
+        run.setdefault("output_warnings", [])
+        run.setdefault("last_message_truncated", False)
+        run.setdefault("last_message_original_bytes", None)
         if get_session_id(run):
             set_session_id(run, get_session_id(run))
     return data
@@ -576,6 +599,46 @@ def max_parallel_sessions() -> int:
         return max(1, int(raw))
     except ValueError:
         return DEFAULT_MAX_PARALLEL_SESSIONS
+
+
+def max_releases_per_cycle() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_MAX_RELEASES_PER_CYCLE"))
+    if raw is None:
+        return DEFAULT_MAX_RELEASES_PER_CYCLE
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_RELEASES_PER_CYCLE
+
+
+def max_release_window_seconds() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_RELEASE_WINDOW_SECONDS"))
+    if raw is None:
+        return DEFAULT_RELEASE_WINDOW_SECONDS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_RELEASE_WINDOW_SECONDS
+
+
+def max_last_message_bytes() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_MAX_LAST_MESSAGE_BYTES"))
+    if raw is None:
+        return DEFAULT_LAST_MESSAGE_BYTES
+    try:
+        return max(4096, int(raw))
+    except ValueError:
+        return DEFAULT_LAST_MESSAGE_BYTES
+
+
+def max_jsonl_scan_bytes() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_MAX_JSONL_SCAN_BYTES"))
+    if raw is None:
+        return DEFAULT_JSONL_SCAN_BYTES
+    try:
+        return max(131072, int(raw))
+    except ValueError:
+        return DEFAULT_JSONL_SCAN_BYTES
 
 
 def delete_if_exists(path: Path) -> None:
@@ -882,9 +945,13 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     lines.append(f"- Autonomy mode: `{autonomy_mode}`")
     lines.append(f"- Clarification mode: `{clarification_mode}`")
     lines.append(f"- Max parallel sessions: `{max_parallel_sessions()}`")
+    lines.append(f"- Release throttle per cycle: `{max_releases_per_cycle()}`")
+    lines.append(f"- Release throttle window: `{max_release_window_seconds()}` seconds")
     lines.append(f"- Max planner rounds: `{max_planner_rounds}`")
     lines.append(f"- Max auto-fix rounds: `{max_auto_fix_rounds}`")
     lines.append(f"- Completion sentinel: `{completion_sentinel or '-'}`")
+    lines.append(f"- Last message cap: `{max_last_message_bytes()}` bytes")
+    lines.append(f"- Session-id scan cap: `{max_jsonl_scan_bytes()}` bytes")
     lines.extend(["", "## Validation Commands", ""])
     if not validation_commands:
         lines.append("_No validation commands recorded yet._")
@@ -976,6 +1043,9 @@ def project_state_policy_markdown(project_name: str, project_dir: Path) -> list[
         "- Same project name reuses this folder and its tracked history.",
         "- Generated markdown files here are persistent manager state, not disposable temp files.",
         "- Normal continuation: keep the files and let the manager refresh them.",
+        f"- Large child last messages are truncated to `{max_last_message_bytes()}` bytes with head/tail preservation.",
+        f"- Launches are rate-limited to `{max_releases_per_cycle()}` new child sessions per `{max_release_window_seconds()}` seconds.",
+        f"- Session-id log scans are capped at `{max_jsonl_scan_bytes()}` bytes per run refresh.",
         "- Human-edited file: `answers.md`.",
         "- Clean restart: use a new project name instead of deleting generated files by hand.",
         "",
@@ -990,6 +1060,9 @@ def project_state_policy_cli(project_name: str, project_dir: Path) -> list[str]:
         f"- reused_folder={project_dir}",
         "- same project name reuses this folder and tracked history",
         "- generated markdown files are persistent manager state",
+        f"- last messages are capped at {max_last_message_bytes()} bytes with head/tail preservation",
+        f"- launches are capped at {max_releases_per_cycle()} per {max_release_window_seconds()}s window",
+        f"- session-id scans are capped at {max_jsonl_scan_bytes()} bytes",
         "- normal continuation: keep the files; only answers.md is meant for human edits",
         "- clean restart: use a new project name instead of deleting generated files by hand",
     ]
@@ -1121,6 +1194,13 @@ def preview_text(text: str | None, max_lines: int = 6, max_chars: int = 700) -> 
     if len(preview) > max_chars:
         preview = preview[: max_chars - 3].rstrip() + "..."
     return preview or "_No child report yet._"
+
+
+def output_warning_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        run for run in sorted(runs, key=run_sort_key)
+        if normalize_str_list(run.get("output_warnings"), "output_warnings")
+    ]
 
 
 def relative_owned_paths(run: dict[str, Any]) -> list[str]:
@@ -2031,6 +2111,30 @@ def apply_parallel_limit_metadata(index: dict[str, Any]) -> None:
         active_count += 1
 
 
+def apply_release_throttle_metadata(index: dict[str, Any]) -> None:
+    release_budget = max_releases_per_cycle()
+    release_window = max_release_window_seconds()
+    cutoff_epoch = epoch_now() - release_window
+    reserved = sum(
+        1
+        for run in index["runs"]
+        if (
+            (launched_epoch := parse_timestamp_epoch(normalize_optional_text(run.get("launched_at")))) is not None
+            and launched_epoch >= cutoff_epoch
+        )
+    )
+    for run in sorted(index["runs"], key=run_sort_key):
+        if str(run.get("status") or "") not in PRELAUNCH_STATUSES:
+            continue
+        if str(run.get("dispatch_state") or "") != "ready":
+            continue
+        if reserved >= release_budget:
+            run["dispatch_state"] = "queued"
+            run["blocked_on"] = [f"release-throttle:{release_budget}/{release_window}s"]
+            continue
+        reserved += 1
+
+
 def ensure_project_workspace(root: Path, project_name: str, slug: str) -> Path:
     project_dir = project_workspace_dir(root, project_name, slug)
     (project_dir / "reports").mkdir(parents=True, exist_ok=True)
@@ -2206,6 +2310,7 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
     max_auto_fix_rounds = brief.get("max_auto_fix_rounds") if brief else None
     validation_status = normalize_optional_text(validation.get("status")) if validation else None
     integration_issues = integration_alerts(runs)
+    warning_runs = output_warning_runs(runs)
     watcher_line = f"- Manager watcher: `{watcher_state}`"
     if watcher_heartbeat:
         watcher_line += f" (last heartbeat `{watcher_heartbeat}`)"
@@ -2225,6 +2330,9 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             f"- Goal: {goal or '_No goal recorded yet._'}",
             f"- Autonomy mode: `{autonomy_mode or 'manual'}`",
             f"- Clarification mode: `{clarification_mode or 'auto'}`",
+            f"- Max parallel sessions: `{max_parallel_sessions()}`",
+            f"- Release throttle per cycle: `{max_releases_per_cycle()}`",
+            f"- Release throttle window: `{max_release_window_seconds()}` seconds",
             f"- Max auto-fix rounds: `{max_auto_fix_rounds if max_auto_fix_rounds is not None else 2}`",
             f"- Validation status: `{validation_status or 'not-run'}`",
             f"- Current stage: `{stage['current_stage']}`",
@@ -2241,6 +2349,7 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             f"- Failed: `{counts['failed']}`",
             f"- Cancelled: `{counts['cancelled']}`",
             f"- Integration issues: `{len(integration_issues)}`",
+            f"- Output warnings: `{len(warning_runs)}`",
             "",
             "## Files",
             "",
@@ -2320,6 +2429,7 @@ def render_dashboard(
     launch_plan = read_project_launch_plan(project_dir) if project_dir else None
     validation_status = normalize_optional_text(validation.get("status")) if validation else None
     integration_issues = integration_alerts(runs)
+    warning_runs = output_warning_runs(runs)
     for run in sorted(runs, key=run_sort_key):
         rows.append(
             [
@@ -2354,11 +2464,14 @@ def render_dashboard(
         f"- Current focus: {stage['focus']}",
         f"- Progress: {stage['progress']}",
         f"- Manager watcher: `{watcher_state}`",
+        f"- Release throttle per cycle: `{max_releases_per_cycle()}`",
+        f"- Release throttle window: `{max_release_window_seconds()}` seconds",
         f"- Running: `{counts['running']}`",
         f"- Completed: `{counts['completed']}`",
         f"- Failed: `{counts['failed']}`",
         f"- Cancelled: `{counts['cancelled']}`",
         f"- Integration issues: `{len(integration_issues)}`",
+        f"- Output warnings: `{len(warning_runs)}`",
         "",
         "## Planner Output",
         "",
@@ -2477,6 +2590,13 @@ def render_dashboard(
             lines.append(
                 f"- `{conflict['left_run']}` vs `{conflict['right_run']}` on {conflict['paths']}"
             )
+    lines.extend(["", "## Output Warnings", ""])
+    if not warning_runs:
+        lines.append("_No artifact-size warnings._")
+    else:
+        for run in warning_runs:
+            warnings = format_inline_list(normalize_str_list(run.get("output_warnings"), "output_warnings"))
+            lines.append(f"- `{run.get('task_id') or run['run_id']}`: {warnings}")
     lines.append("")
     return "\n".join(lines)
 
@@ -2504,6 +2624,7 @@ def render_manager_summary(
     goal = normalize_optional_text(brief.get("goal")) if brief else None
     launch_plan = read_project_launch_plan(project_dir) if project_dir else None
     validation_status = normalize_optional_text(validation.get("status")) if validation else None
+    warning_runs = output_warning_runs(runs)
     lines = [
         f"# {project_name} Manager Summary",
         "",
@@ -2515,12 +2636,15 @@ def render_manager_summary(
         f"- Next action: {stage['next_action']}",
         f"- Current focus: {stage['focus']}",
         f"- Progress: {stage['progress']}",
+        f"- Release throttle per cycle: `{max_releases_per_cycle()}`",
+        f"- Release throttle window: `{max_release_window_seconds()}` seconds",
         f"- Total runs: `{len(runs)}`",
         f"- Blocked: `{len(blocked)}`",
         f"- Running: `{counts['running']}`",
         f"- Completed: `{counts['completed']}`",
         f"- Failed: `{counts['failed']}`",
         f"- Cancelled: `{counts['cancelled']}`",
+        f"- Output warnings: `{len(warning_runs)}`",
         "",
         "## Planner State",
         "",
@@ -2566,6 +2690,13 @@ def render_manager_summary(
             lines.append(
                 f"- `{run.get('task_id') or run['run_id']}` waiting on {format_inline_list(normalize_str_list(run.get('blocked_on'), 'blocked_on'))}"
             )
+    lines.extend(["", "## Output Warnings", ""])
+    if not warning_runs:
+        lines.append("_No artifact-size warnings._")
+    else:
+        for run in warning_runs:
+            warnings = format_inline_list(normalize_str_list(run.get("output_warnings"), "output_warnings"))
+            lines.append(f"- `{run.get('task_id') or run['run_id']}`: {warnings}")
     lines.extend(["", "## Finished Runs", ""])
     finished = [
         run for run in sorted(runs, key=run_sort_key)
@@ -2718,6 +2849,7 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
     answered = answered_questions(question_records, answers)
     conflicts = detect_conflict_risks(runs)
     integration_issues = integration_alerts(runs)
+    warning_runs = output_warning_runs(runs)
     brief = load_project_brief(project_dir, project_name)
     validation = load_project_validation(project_dir)
     stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
@@ -2742,6 +2874,8 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"autonomy_mode={normalize_optional_text(brief.get('autonomy_mode')) if brief else 'manual'}",
         f"clarification_mode={normalize_optional_text(brief.get('clarification_mode')) if brief else 'auto'}",
         f"parallel_limit={max_parallel_sessions()}",
+        f"release_throttle={max_releases_per_cycle()}",
+        f"release_window_seconds={max_release_window_seconds()}",
         f"max_auto_fix_rounds={brief.get('max_auto_fix_rounds') if brief else 2}",
         f"validation_status={normalize_optional_text(validation.get('status')) if validation else 'not-run'}",
         f"current_stage={stage['current_stage']}",
@@ -2757,7 +2891,8 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
     lines.append(
         "counts="
         f"running:{counts['running']} blocked:{len(blocked)} completed:{counts['completed']} "
-        f"failed:{counts['failed']} cancelled:{counts['cancelled']} integration_issues:{len(integration_issues)}"
+        f"failed:{counts['failed']} cancelled:{counts['cancelled']} integration_issues:{len(integration_issues)} "
+        f"output_warnings:{len(warning_runs)}"
     )
     lines.extend(project_state_policy_cli(project_name, project_dir))
     lines.extend(["", "planner:"])
@@ -2823,6 +2958,13 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
             lines.append(
                 f"- {item['task_id']} [{item['state']}] {short_summary(item['note'], max_chars=90)}"
             )
+    lines.extend(["", "output_warnings:"])
+    if not warning_runs:
+        lines.append("- none")
+    else:
+        for run in warning_runs:
+            warnings = format_inline_list(normalize_str_list(run.get("output_warnings"), "output_warnings"))
+            lines.append(f"- {run.get('task_id') or run['run_id']}: {warnings}")
     return "\n".join(lines)
 
 
@@ -2849,6 +2991,7 @@ def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list
                 f"- Worktree: `{run.get('worktree_path') or '-'}`",
                 f"- Integration: `{run.get('integration_state') or '-'}`",
                 f"- Depends on: {format_inline_list(normalize_str_list(run.get('depends_on'), 'depends_on'))}",
+                f"- Output warnings: {format_inline_list(normalize_str_list(run.get('output_warnings'), 'output_warnings'))}",
                 "",
                 "## Child Output",
                 "",
@@ -2945,6 +3088,7 @@ def sync_projects(root: Path, index: dict[str, Any]) -> None:
 def save_index_and_sync(root: Path, data: dict[str, Any]) -> None:
     update_dispatch_metadata(data)
     apply_parallel_limit_metadata(data)
+    apply_release_throttle_metadata(data)
     save_index(root, data)
     sync_projects(root, data)
 
@@ -3223,13 +3367,14 @@ def read_head_text(path: Path, *, max_bytes: int = 131072) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def read_jsonl_candidates(path: Path, *, max_scan_bytes: int = 8 * 1024 * 1024) -> list[str]:
+def read_jsonl_candidates(path: Path, *, max_scan_bytes: int | None = None) -> list[str]:
     candidates: list[str] = []
     if not path.exists():
         return candidates
+    scan_budget = max_scan_bytes if max_scan_bytes is not None else max_jsonl_scan_bytes()
     scanned = 0
     with path.open("rb") as fh:
-        while scanned < max_scan_bytes:
+        while scanned < scan_budget:
             raw_line = fh.readline()
             if not raw_line:
                 break
@@ -3245,6 +3390,63 @@ def read_jsonl_candidates(path: Path, *, max_scan_bytes: int = 8 * 1024 * 1024) 
             if candidates:
                 break
     return candidates
+
+
+def truncate_text_file_middle(path: Path, *, max_bytes: int) -> tuple[bool, int | None]:
+    if not path.exists():
+        return False, None
+    original_size = path.stat().st_size
+    if original_size <= max_bytes:
+        return False, original_size
+    head_budget = max(1024, (max_bytes // 2) - 256)
+    tail_budget = max(1024, max_bytes - head_budget - 256)
+    head = read_head_text(path, max_bytes=head_budget)
+    tail = read_tail_text(path, max_bytes=tail_budget)
+    marker = (
+        "\n\n[truncated by team-leader: original file exceeded "
+        f"{max_bytes} bytes; middle content omitted]\n\n"
+    )
+    payload = (head + marker + tail).encode("utf-8", errors="replace")
+    if len(payload) > max_bytes:
+        payload = payload[: max_bytes - 4] + b"...\n"
+    path.write_bytes(payload)
+    return True, original_size
+
+
+def refresh_run_artifacts(run: dict[str, Any]) -> None:
+    artifact_sizes: dict[str, int] = {}
+    warnings: list[str] = []
+    stdout_path = Path(run["stdout_path"])
+    stderr_path = Path(run["stderr_log"])
+    last_message_path = Path(run["last_message_path"])
+    for label, path in (
+        ("stdout_jsonl", stdout_path),
+        ("stderr_log", stderr_path),
+        ("last_message", last_message_path),
+    ):
+        if path.exists():
+            artifact_sizes[label] = path.stat().st_size
+    if last_message_path.exists():
+        if str(run.get("status") or "") in TERMINAL_STATUSES:
+            truncated, original_size = truncate_text_file_middle(last_message_path, max_bytes=max_last_message_bytes())
+            artifact_sizes["last_message"] = last_message_path.stat().st_size
+            if truncated:
+                run["last_message_truncated"] = True
+                run["last_message_original_bytes"] = original_size
+            elif not run.get("last_message_truncated"):
+                run["last_message_original_bytes"] = original_size
+        if run.get("last_message_truncated"):
+            warnings.append(
+                f"last_message_truncated:{run.get('last_message_original_bytes') or artifact_sizes.get('last_message') or '-'}"
+            )
+        elif artifact_sizes.get("last_message", 0) > max_last_message_bytes():
+            warnings.append(f"last_message_large:{artifact_sizes['last_message']}")
+    if artifact_sizes.get("stdout_jsonl", 0) >= STDOUT_WARNING_BYTES:
+        warnings.append(f"stdout_jsonl_large:{artifact_sizes['stdout_jsonl']}")
+    if artifact_sizes.get("stderr_log", 0) >= STDERR_WARNING_BYTES:
+        warnings.append(f"stderr_log_large:{artifact_sizes['stderr_log']}")
+    run["artifact_sizes"] = artifact_sizes
+    run["output_warnings"] = unique_preserve_order(warnings)
 
 
 def collect_uuid_candidates(node: Any, out: list[str]) -> None:
@@ -3423,6 +3625,7 @@ def start_run_process(run: dict[str, Any]) -> None:
 def launch_ready_runs(root: Path, index: dict[str, Any]) -> None:
     update_dispatch_metadata(index)
     apply_parallel_limit_metadata(index)
+    apply_release_throttle_metadata(index)
     for run in sorted(index["runs"], key=run_sort_key):
         if str(run.get("status") or "") not in PRELAUNCH_STATUSES:
             continue
@@ -3435,6 +3638,7 @@ def launch_ready_runs(root: Path, index: dict[str, Any]) -> None:
         start_run_process(run)
     update_dispatch_metadata(index)
     apply_parallel_limit_metadata(index)
+    apply_release_throttle_metadata(index)
 
 
 def run_has_provider_artifacts(run: dict[str, Any]) -> bool:
@@ -3474,6 +3678,7 @@ def refresh_run(run: dict[str, Any]) -> None:
         session_id = provider_for_run(run).detect_session_id(run)
         if session_id:
             set_session_id(run, session_id)
+    refresh_run_artifacts(run)
 
 
 def refresh_index_state(root: Path, index: dict[str, Any]) -> None:
