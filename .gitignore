@@ -4,3 +4,6 @@ __pycache__/
 .team-leader/
 .agent-subsessions/
 .codex-subsessions/
+
+TEAM_LEADER_NOTES.md
+XHS_POST_GUIDE.md
