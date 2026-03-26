@@ -1,85 +1,220 @@
-# team-leader
+# Team Leader
 
-Codex-first skill for running a team-leader style manager over real child CLI sessions.
+A Codex skill that manages real child CLI sessions as a team-leader style orchestrator. It launches, tracks, reviews, and aggregates parallel Codex workers through project dashboards, dependency-aware dispatch, and automatic markdown workspaces.
 
-## Skill
+Unlike lightweight built-in subagents, each child session is a full Codex session with its own thread, context window, tool access, and resume lifecycle.
 
-- `skills/team-leader`
-- `skills/team-status`
+## Skills Included
 
-The current implementation ships with a `codex` provider adapter and a control plane that is structured so later adapters can target other CLIs without changing the run registry format.
+| Skill | Purpose |
+|-------|---------|
+| `team-leader` | Planning, dispatch, monitoring, and aggregation of child Codex sessions |
+| `team-status` | Compact progress view for monitoring without opening markdown files |
 
-The controller keeps provider-specific behavior at the adapter boundary: option validation, command construction, session-id detection, and resume command generation. That keeps the run registry and batch manifest format stable when a later `claude`, `cursor`, or other CLI adapter is added.
+## Prerequisites
 
-Invoke the controller by script path, but keep your working directory at the target project unless you pass `--root` and `--cd` explicitly. The default `.team-leader/` root is derived from the current working directory, so running the controller from the installed skill directory is the wrong default.
+- **Python 3.10+** (stdlib only, no pip packages required)
+- **[Codex CLI](https://github.com/openai/codex)** installed and configured
+- **Git** (for worktree-based writer isolation)
 
-Project-linked runs maintain a central markdown workspace under `.team-leader/projects/<project>/` so the manager can track the project brief, planner output, dashboards, collected child reports, human questions, and conflict-risk notes without manually stitching together terminal output. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. Older `.agent-subsessions` and `.codex-subsessions` roots are still recognized automatically.
+## Installation
 
-The current safety defaults are intentionally conservative:
+### Install into Codex (recommended)
 
-- no more than `8` child sessions running at once
-- no more than `2` new child launches every `15` seconds
-- oversized child `last_message.md` files are truncated with head/tail preservation
-- `status --project` and project markdown now surface artifact-size warnings
-- `team-status --project` provides a compact progressive update stream that is safer to use inside captured Codex output
-- non-TTY `watch` falls back to a single snapshot unless explicitly allowed to stream
+From inside a Codex session, ask Codex to install the skill:
 
-The default landing page for each project is `.team-leader/projects/<project>/README.md`. From there:
+```
+Install the team-leader skill from 2Mars4096/team_leader
+```
 
-- `brief.md` records the project goal, repo paths, spec paths, notes, and constraints
-- `launch-plan.md` shows the latest planner-produced child-session launch plan
-- `validation.md` shows validation-command results and machine-evaluable delivery status
-- `metrics.md` shows the project scorecard for speed, human-touch, parallel overlap, and waiting overhead
-- `dashboard.md` shows live run progress, active child notes, and watcher status
-- `tasks.md` shows assignment state and summary titles
-- `manager-summary.md` shows the latest manager aggregation
-- `questions.md` shows human decisions and blockers
-- `answers.md` is the human-edited answer file the manager reads
-- `answers-template.md` gives copy-ready lines for open questions
-- `conflicts.md` shows overlap risk between writers
-- `reports/<run-id>.md` stores one markdown report per child session
-
-The project folder is persistent manager state. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand; let the manager refresh them. The only file intended for direct human editing is `answers.md`. For a clean restart, use a new project name.
-
-While child sessions are running, the manager refreshes those markdown files automatically in the background. Tasks with `depends_on` are held automatically until their prerequisites complete, then the manager launches the next wave on its own. The new default flow is:
-
-1. record the goal, repo paths, and specs with `intake`
-2. let the manager ask a short clarification round first when the brief is still thin
-3. run `orchestrate`
-4. let the planner child produce a launch plan
-5. let the manager auto-dispatch worker children from that plan
-6. answer only the questions that really need a human
-7. let validation failures trigger focused fixer/replan waves in `continuous` mode until delivery or the auto-fix budget is exhausted
-
-Projects can now set both an autonomy mode and a clarification mode:
-
-- `clarification_mode=auto`: the planner may ask a few targeted questions before launching workers
-- `clarification_mode=off`: skip that gate and plan immediately
-
-Projects can also cap automatic recovery work:
-
-- `max_auto_fix_rounds`: how many validation-failure recovery waves the manager may launch on its own
-
-Autonomy modes:
-
-- `manual`: you explicitly run `orchestrate`
-- `guided`: the manager runs validation commands and tracks delivery state, but does not auto-start new planner waves
-- `continuous`: once the brief is present, the manager can auto-start planner waves and keep pushing until validation and completion signals say the project is delivered, or the configured planner-round limit is reached
-
-From the target project root, use `python3 skills/team-leader/scripts/team_leader.py status --project <project>` for the live summary in this repo. When the skill is installed elsewhere, call that installed script path while keeping the working directory anchored to the target project, or pass `--root` and `--cd` explicitly. That prints the current stage, stage reason, next action, current focus, workspace path, dashboard path, active runs, blocked runs, open questions, recent answers, and conflict hints without needing to open the folder manually.
-
-For progressive feedback inside Codex, prefer `python3 skills/team-leader/scripts/team_leader.py team-status --project <project>`. That now defaults to a milestone-style feed: stage transitions, child lifecycle changes, new child notes, newly opened questions, conflicts, integration issues, and warning changes. When stdout is captured, it automatically caps itself unless you override `--max-updates`.
-
-If you want the fuller compact summary instead of milestone mode, add `--full`.
-
-For a concise efficiency scorecard, use `python3 skills/team-leader/scripts/team_leader.py team-metrics --project <project>`. That prints descriptive metrics for project age, time to first useful result, time to validated completion, human-touch count, parallel overlap, and stuck time, and the same content is written to `metrics.md`.
-
-If you want a dedicated monitoring skill chip in Codex, install `skills/team-status` as well. That gives you a `$team-status` skill entry for project progress checks while keeping `$team-leader` focused on planning and dispatch.
-
-For a live terminal panel, use `python3 skills/team-leader/scripts/team_leader.py watch --project <project>`. That repeatedly refreshes the project summary plus per-run lines, including integration state and the latest child note. In captured terminal environments, `watch` now defaults to one snapshot unless you explicitly opt into streaming.
-
-## Install After Pushing
+Codex uses its built-in skill installer to run:
 
 ```bash
-install-skill-from-github.py --repo <owner>/<repo> --path skills/team-leader
+install-skill-from-github.py --repo 2Mars4096/team_leader --path skills/team-leader
 ```
+
+To also install the monitoring-only companion skill:
+
+```bash
+install-skill-from-github.py --repo 2Mars4096/team_leader --path skills/team-leader skills/team-status
+```
+
+Skills are installed into `~/.codex/skills/team-leader/` (and `~/.codex/skills/team-status/`). Restart Codex after installation to pick up new skills.
+
+### Manual installation
+
+Clone the repo and copy the skill directories:
+
+```bash
+git clone git@github.com:2Mars4096/team_leader.git
+cp -r team_leader/skills/team-leader ~/.codex/skills/team-leader
+cp -r team_leader/skills/team-status ~/.codex/skills/team-status
+```
+
+## Quick Start
+
+### Using inside Codex CLI (recommended)
+
+Once installed, the `$team-leader` skill is available in any Codex session. Tell Codex what you want built and ask it to use the skill:
+
+```
+Use $team-leader to refactor the checkout flow. The repo is at /path/to/repo.
+Run tests with "pytest -q" to validate.
+```
+
+Codex reads the skill instructions and drives the controller automatically: it runs `intake` to capture the brief, `orchestrate` to plan and dispatch workers, and monitors progress through `status` and `team-status`.
+
+For monitoring only, use the companion skill:
+
+```
+Use $team-status to check progress on the checkout-refactor project.
+```
+
+### Using the controller script directly
+
+From your **target project directory** (not the skill directory):
+
+```bash
+# 1. Record the project goal
+python3 ~/.codex/skills/team-leader/scripts/team_leader.py intake \
+  --project my-project \
+  --goal "Refactor checkout to reduce payment failures" \
+  --repo-path . \
+  --validation-command "pytest -q"
+
+# 2. Plan and dispatch workers
+python3 ~/.codex/skills/team-leader/scripts/team_leader.py orchestrate \
+  --project my-project
+
+# 3. Check progress
+python3 ~/.codex/skills/team-leader/scripts/team_leader.py status --project my-project
+
+# 4. Watch live updates
+python3 ~/.codex/skills/team-leader/scripts/team_leader.py team-status --project my-project
+```
+
+> **Important:** Always run the controller from the target project directory. The `.team-leader/` state directory is created relative to the current working directory. Do not `cd` into the skill directory to run the script.
+
+## Repository Structure
+
+```
+skills/
+├── team-leader/
+│   ├── SKILL.md                          # Skill instructions for Codex
+│   ├── agents/openai.yaml                # Skill UI metadata
+│   ├── scripts/
+│   │   ├── team_leader.py                # Main controller (~5k lines, stdlib only)
+│   │   └── codex_subsession_manager.py   # Compatibility wrapper
+│   └── references/
+│       ├── example_manifest.json         # Batch dispatch example
+│       ├── provider-adapters.md          # Guide for adding CLI adapters
+│       ├── project-workspaces.md         # Workspace layout documentation
+│       └── prompt-patterns.md            # Prompt templates for child sessions
+└── team-status/
+    ├── SKILL.md                          # Monitoring-only skill instructions
+    └── agents/openai.yaml
+```
+
+**Runtime state** (created per-project, not shipped):
+
+```
+.team-leader/                  # Controller state root (in the target project)
+├── runs/                      # Per-run directories with prompts, logs, PIDs
+└── projects/<project>/        # Per-project markdown workspace
+    ├── README.md              # Landing page
+    ├── brief.md               # Goal, repo paths, specs, constraints
+    ├── launch-plan.md         # Planner-produced child session plan
+    ├── dashboard.md           # Live run progress and child notes
+    ├── tasks.md               # Assignment state and summaries
+    ├── validation.md          # Validation results and delivery status
+    ├── metrics.md             # Efficiency scorecard
+    ├── manager-summary.md     # Aggregated manager report
+    ├── questions.md           # Questions needing human answers
+    ├── answers.md             # Human-edited answers (only file for manual editing)
+    ├── answers-template.md    # Copy-ready answer lines
+    ├── conflicts.md           # Overlap risk between writers
+    └── reports/<run-id>.md    # One report per child session
+```
+
+## CLI Reference
+
+All commands use `python3 <path-to>/team_leader.py <command> [options]`.
+
+| Command | Description |
+|---------|-------------|
+| `init` | Create the `.team-leader/` state directory |
+| `intake` | Record or update a project brief |
+| `orchestrate` | Launch planner and auto-dispatch workers from the brief |
+| `dispatch` | Launch a single child session |
+| `batch` | Launch multiple children from a JSON manifest |
+| `status` | Show tracked runs and project summary |
+| `team-status` | Compact milestone-style progress updates |
+| `team-metrics` | Efficiency scorecard (age, speed, human-touch, overlap) |
+| `watch` | Live terminal view with auto-refresh |
+| `show` | Show details and last message for one run |
+| `tail` | Tail stdout/stderr for a run |
+| `resume-cmd` | Print a resume command for a child session |
+| `cancel` | Stop a child session (`--force` for SIGKILL) |
+| `reconcile` | Refresh status and backfill session IDs |
+| `attach-session` | Manually attach a session ID to a run |
+| `providers` | List available CLI adapters |
+
+### Key options
+
+- `--project <name>` -- link runs to a project workspace
+- `--provider codex` -- CLI adapter (only `codex` is shipped today)
+- `--sandbox read-only|workspace-write` -- child sandbox mode
+- `--full-auto` -- run child in full-auto mode
+- `--root <path>` -- explicit `.team-leader/` path (default: `./.team-leader`)
+- `--cd <path>` -- working directory for child sessions
+- `--depends-on <task-id>` -- hold a task until prerequisites complete
+- `--owned-path <path>` -- declare file ownership for conflict detection
+- `--dry-run` -- preview without launching
+
+## Workflow
+
+### Manager-first flow (recommended)
+
+When the user provides only a goal and context:
+
+1. **`intake`** -- capture the project brief (goal, repo paths, specs, constraints)
+2. **`orchestrate`** -- launch a planner child that produces a task plan, then auto-dispatch workers
+3. **Monitor** -- use `status --project` or `team-status --project` to track progress
+4. **Answer questions** -- check `questions.md`, edit `answers.md` with responses
+5. **Re-orchestrate** -- run `orchestrate` again if the planner needs another round after new answers
+
+### Autonomy modes
+
+| Mode | Behavior |
+|------|----------|
+| `manual` | You explicitly run `orchestrate` each time |
+| `guided` | Manager runs validation and tracks delivery, but won't auto-start new planner waves |
+| `continuous` | Manager auto-starts planner waves and pushes until validation passes or limits are reached |
+
+### Clarification modes
+
+| Mode | Behavior |
+|------|----------|
+| `auto` | Planner may ask targeted questions before launching workers |
+| `off` | Skip clarification and plan immediately |
+
+### Recovery limits
+
+- `--max-auto-fix-rounds` -- caps how many validation-failure recovery waves the manager launches automatically in `continuous` mode
+- `--max-planner-rounds` -- caps how many planner iterations are allowed
+
+## Safety Defaults
+
+- Max **8** concurrent child sessions
+- Max **2** new launches per **15** seconds
+- Oversized child `last_message.md` files are truncated with head/tail preservation
+- `team-status` caps output in captured environments by default
+- Non-TTY `watch` falls back to a single snapshot unless explicitly allowed to stream
+
+## Architecture Notes
+
+The controller keeps provider-specific behavior at the adapter boundary: option validation, command construction, session-ID detection, and resume command generation. The run registry and batch manifest format remain stable when adding a new adapter for another CLI (e.g., `claude`, `cursor`).
+
+Writer children in Git repos are isolated into per-run worktrees. The manager integrates completed work through a project integration worktree before validation runs.
+
+The project workspace (`.team-leader/projects/<project>/`) is persistent state. Reusing the same project name reuses the same folder and history. The only file intended for direct human editing is `answers.md`. For a clean restart, use a new project name.
