@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -38,6 +39,10 @@ DEFAULT_LAST_MESSAGE_BYTES = 128 * 1024
 DEFAULT_JSONL_SCAN_BYTES = 8 * 1024 * 1024
 STDOUT_WARNING_BYTES = 8 * 1024 * 1024
 STDERR_WARNING_BYTES = 4 * 1024 * 1024
+CODEX_BACKEND_HOST = "chatgpt.com"
+CODEX_BACKEND_PORT = 443
+DEFAULT_PROVIDER_PREFLIGHT_OK_SECONDS = 30
+DEFAULT_PROVIDER_PREFLIGHT_FAIL_SECONDS = 5
 CHILD_RUN_ENV = "TEAM_LEADER_CHILD_RUN"
 MONITOR_RUN_ENV = "TEAM_LEADER_MONITOR_RUN"
 QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
@@ -359,6 +364,12 @@ class ProviderAdapter:
     def build_resume_command(self, run: dict[str, Any], exec_mode: bool) -> str:
         raise NotImplementedError
 
+    def launch_preflight(self, run: dict[str, Any]) -> tuple[bool, str | None]:
+        return True, None
+
+    def runtime_launch_failure(self, run: dict[str, Any]) -> str | None:
+        return None
+
 
 class CodexProvider(ProviderAdapter):
     def __init__(self) -> None:
@@ -461,6 +472,51 @@ class CodexProvider(ProviderAdapter):
             return f"cd {cwd} && {provider_bin} exec resume {shlex.quote(session_id)} -"
         return f"cd {cwd} && {provider_bin} resume {shlex.quote(session_id)}"
 
+    def launch_preflight(self, run: dict[str, Any]) -> tuple[bool, str | None]:
+        cwd_raw = normalize_optional_text(run.get("cwd")) or normalize_optional_text(run.get("source_cwd")) or str(Path.cwd())
+        try:
+            resolve_executable(
+                normalize_optional_text(run.get("provider_bin")) or self.resolved_bin(),
+                cwd=Path(cwd_raw),
+            )
+        except RuntimeError as exc:
+            return False, f"provider-bin-unavailable: {short_summary(str(exc), max_chars=140)}"
+        try:
+            with socket.create_connection((CODEX_BACKEND_HOST, CODEX_BACKEND_PORT), timeout=2):
+                pass
+        except OSError as exc:
+            detail = short_summary(str(exc), max_chars=140)
+            return (
+                False,
+                "provider-env: codex backend unreachable "
+                f"({CODEX_BACKEND_HOST}:{CODEX_BACKEND_PORT}) :: {detail}. "
+                "Run team-leader where Codex has network access.",
+            )
+        return True, None
+
+    def runtime_launch_failure(self, run: dict[str, Any]) -> str | None:
+        launched_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("launched_at")))
+        if launched_epoch is None or epoch_now() - launched_epoch < 6:
+            return None
+        stderr_path = Path(run["stderr_log"])
+        if not stderr_path.exists():
+            return None
+        text = read_tail_text(stderr_path, max_bytes=32768).lower()
+        if text.count("failed to connect to websocket") < 2:
+            return None
+        if "backend-api/codex/responses" not in text:
+            return None
+        if (
+            "failed to lookup address information" not in text
+            and "reconnecting..." not in text
+            and "could not create otel exporter" not in text
+        ):
+            return None
+        return (
+            "provider-env: codex child could not reach the backend after launch. "
+            f"Run team-leader where Codex can reach {CODEX_BACKEND_HOST}:{CODEX_BACKEND_PORT}."
+        )
+
 
 PROVIDERS: dict[str, ProviderAdapter] = {
     DEFAULT_PROVIDER: CodexProvider(),
@@ -496,6 +552,28 @@ def set_session_id(run: dict[str, Any], session_id: str | None) -> None:
     run["session_id"] = session_id
     if str(run.get("provider") or DEFAULT_PROVIDER) == "codex":
         run["thread_id"] = session_id
+
+
+def provider_preflight_cache_seconds(run: dict[str, Any]) -> int:
+    status = normalize_optional_text(run.get("provider_preflight_status"))
+    if status == "ok":
+        return provider_preflight_ok_seconds()
+    return provider_preflight_fail_seconds()
+
+
+def provider_launch_ready(run: dict[str, Any]) -> tuple[bool, str | None]:
+    checked_at = normalize_optional_text(run.get("provider_preflight_checked_at"))
+    checked_epoch = parse_timestamp_epoch(checked_at)
+    cache_seconds = provider_preflight_cache_seconds(run)
+    if checked_epoch is not None and epoch_now() - checked_epoch < cache_seconds:
+        status = normalize_optional_text(run.get("provider_preflight_status"))
+        note = normalize_optional_text(run.get("provider_preflight_note"))
+        return status != "blocked", note
+    ok, note = provider_for_run(run).launch_preflight(run)
+    run["provider_preflight_checked_at"] = utc_now()
+    run["provider_preflight_status"] = "ok" if ok else "blocked"
+    run["provider_preflight_note"] = note
+    return ok, note
 
 
 def load_index(root: Path) -> dict[str, Any]:
@@ -555,6 +633,9 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("question_records", [])
         run.setdefault("question_source_bytes", None)
         run.setdefault("question_source_mtime_ns", None)
+        run.setdefault("provider_preflight_status", None)
+        run.setdefault("provider_preflight_checked_at", None)
+        run.setdefault("provider_preflight_note", None)
         run.setdefault("compacted_at", None)
         run.setdefault("compaction_reason", None)
         run.setdefault("compaction_removed", [])
@@ -727,6 +808,26 @@ def max_jsonl_scan_bytes() -> int:
         return max(131072, int(raw))
     except ValueError:
         return DEFAULT_JSONL_SCAN_BYTES
+
+
+def provider_preflight_ok_seconds() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_PROVIDER_PREFLIGHT_OK_SECONDS"))
+    if raw is None:
+        return DEFAULT_PROVIDER_PREFLIGHT_OK_SECONDS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_PROVIDER_PREFLIGHT_OK_SECONDS
+
+
+def provider_preflight_fail_seconds() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_PROVIDER_PREFLIGHT_FAIL_SECONDS"))
+    if raw is None:
+        return DEFAULT_PROVIDER_PREFLIGHT_FAIL_SECONDS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_PROVIDER_PREFLIGHT_FAIL_SECONDS
 
 
 def delete_if_exists(path: Path) -> None:
@@ -2317,6 +2418,9 @@ def compute_dispatch_state(index: dict[str, Any], run: dict[str, Any]) -> tuple[
         for blocker in overlapping_writer_blockers(index, run)
         if blocker not in blocked_on
     )
+    provider_ready, provider_note = provider_launch_ready(run)
+    if not provider_ready and provider_note and provider_note not in blocked_on:
+        blocked_on.append(provider_note)
     if blocked_on:
         return "blocked", blocked_on
     return "ready", []
@@ -4662,6 +4766,25 @@ def run_has_provider_artifacts(run: dict[str, Any]) -> bool:
     return bool(run.get("pid"))
 
 
+def convert_running_launch_failure(run: dict[str, Any], note: str) -> None:
+    pid = run.get("pid")
+    if pid and pid_alive(pid):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+    run["pid"] = None
+    run["status"] = "blocked"
+    run["provider_preflight_status"] = "blocked"
+    run["provider_preflight_checked_at"] = utc_now()
+    run["provider_preflight_note"] = note
+    set_run_dispatch_state(run, "blocked", [note], changed_at=run["provider_preflight_checked_at"])
+    write_text(Path(run["run_dir"]) / "state.txt", "blocked\n")
+
+
 def refresh_run(run: dict[str, Any]) -> None:
     run_dir = Path(run["run_dir"])
     state = read_text_if_exists(run_dir / "state.txt")
@@ -4682,6 +4805,10 @@ def refresh_run(run: dict[str, Any]) -> None:
         run["finished_at"] = finished_at.strip()
     if str(run.get("status") or "") in TERMINAL_STATUSES:
         run["pid"] = None
+    if str(run.get("status") or "") == "running":
+        launch_failure = provider_for_run(run).runtime_launch_failure(run)
+        if launch_failure:
+            convert_running_launch_failure(run, launch_failure)
     if run_has_provider_artifacts(run) and not get_session_id(run):
         session_id = provider_for_run(run).detect_session_id(run)
         if session_id:
