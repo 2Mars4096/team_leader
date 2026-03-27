@@ -44,6 +44,26 @@ QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
 ANSWER_LINE_RE = re.compile(r"^\s*[-*+]\s*`?([a-z0-9][a-z0-9-]*)`?\s*:\s*(.+?)\s*$", re.IGNORECASE)
 PRELAUNCH_STATUSES = {"prepared", "blocked"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "exited"}
+AUTO_COMPACT_RUN_STATUSES = {"completed"}
+DEFAULT_MANUAL_COMPACT_RUN_STATUSES = {"completed", "cancelled", "dry-run"}
+MANUAL_COMPACT_EXTRA_STATUSES = {"failed", "exited"}
+RUN_COMPACT_FILE_NAMES = (
+    "command.txt",
+    "exit_code.txt",
+    "finished_at.txt",
+    "prompt.md",
+    "runner.sh",
+    "started_at.txt",
+    "state.txt",
+    "stderr.log",
+    "stdout.jsonl",
+)
+PROJECT_COMPACT_DELETE_FILES = (
+    "answers-template.md",
+    "conflicts.md",
+    "dashboard.md",
+    "questions.md",
+)
 PROJECT_BRIEF_FILE = "brief.json"
 PROJECT_BRIEF_MD = "brief.md"
 PROJECT_PLAN_FILE = "launch-plan.json"
@@ -417,11 +437,14 @@ class CodexProvider(ProviderAdapter):
         provider_bin = normalize_optional_text(run.get("provider_bin")) or self.resolved_bin()
         if os.path.basename(provider_bin) != "codex":
             return None
+        started_epoch = run.get("started_epoch")
+        if started_epoch is None:
+            return None
         known = known_thread_ids()
-        for candidate in infer_thread_ids_from_logs(int(run["started_epoch"])):
+        for candidate in infer_thread_ids_from_logs(int(started_epoch)):
             if candidate in known:
                 return candidate
-        candidates = infer_thread_ids_from_logs(int(run["started_epoch"]))
+        candidates = infer_thread_ids_from_logs(int(started_epoch))
         if len(candidates) == 1:
             return candidates[0]
         return None
@@ -501,6 +524,7 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("role", None)
         run.setdefault("summary", None)
         run.setdefault("created_at", run.get("launched_at"))
+        run.setdefault("started_epoch", None)
         run.setdefault("owned_paths", [])
         run.setdefault("depends_on", [])
         run.setdefault("dispatch_state", None)
@@ -531,6 +555,11 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("question_records", [])
         run.setdefault("question_source_bytes", None)
         run.setdefault("question_source_mtime_ns", None)
+        run.setdefault("compacted_at", None)
+        run.setdefault("compaction_reason", None)
+        run.setdefault("compaction_removed", [])
+        run.setdefault("workspace_released_at", None)
+        run.setdefault("workspace_release_error", None)
         if get_session_id(run):
             set_session_id(run, get_session_id(run))
     return data
@@ -705,6 +734,11 @@ def delete_if_exists(path: Path) -> None:
         path.unlink()
 
 
+def delete_tree_if_exists(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+
+
 def normalize_optional_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -836,6 +870,18 @@ def project_validation_md_path(project_dir: Path) -> Path:
 
 def project_metrics_md_path(project_dir: Path) -> Path:
     return project_dir / PROJECT_METRICS_MD
+
+
+def project_history_path(project_dir: Path) -> Path:
+    return project_dir / "history.md"
+
+
+def project_default_detail_path(project_dir: Path) -> Path:
+    dashboard = project_dir / "dashboard.md"
+    history = project_history_path(project_dir)
+    if dashboard.exists() or not history.exists():
+        return dashboard
+    return history
 
 
 def default_project_brief(project_name: str) -> dict[str, Any]:
@@ -1117,7 +1163,7 @@ def render_project_launch_plan(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def project_state_policy_markdown(project_name: str, project_dir: Path) -> list[str]:
+def project_state_policy_markdown(project_name: str, project_dir: Path, *, compacted: bool = False) -> list[str]:
     return [
         "## State Policy",
         "",
@@ -1126,10 +1172,16 @@ def project_state_policy_markdown(project_name: str, project_dir: Path) -> list[
         "- Same project name reuses this folder and its tracked history.",
         "- Generated markdown files here are persistent manager state, not disposable temp files.",
         "- Normal continuation: keep the files and let the manager refresh them.",
+        (
+            "- Once a project settles cleanly, team-leader compacts transient dashboards, question scratchpads, per-run reports, and disposable child-run artifacts."
+            if compacted
+            else "- Once a project settles cleanly, team-leader may compact transient dashboards, question scratchpads, per-run reports, and disposable child-run artifacts."
+        ),
         f"- Large child last messages are truncated to `{max_last_message_bytes()}` bytes with head/tail preservation.",
         f"- Launches are rate-limited to `{max_releases_per_cycle()}` new child sessions per `{max_release_window_seconds()}` seconds.",
         f"- Session-id log scans are capped at `{max_jsonl_scan_bytes()}` bytes per run refresh.",
         "- Human-edited file: `answers.md`.",
+        "- Use `cleanup` when you want the manager to compact failed or standalone runs explicitly.",
         "- Clean restart: use a new project name instead of deleting generated files by hand.",
         "",
     ]
@@ -1143,10 +1195,12 @@ def project_state_policy_cli(project_name: str, project_dir: Path) -> list[str]:
         f"- reused_folder={project_dir}",
         "- same project name reuses this folder and tracked history",
         "- generated markdown files are persistent manager state",
+        "- settled projects may be compacted automatically to reduce leftover files",
         f"- last messages are capped at {max_last_message_bytes()} bytes with head/tail preservation",
         f"- launches are capped at {max_releases_per_cycle()} per {max_release_window_seconds()}s window",
         f"- session-id scans are capped at {max_jsonl_scan_bytes()} bytes",
         "- normal continuation: keep the files; only answers.md is meant for human edits",
+        "- use cleanup to compact failed or standalone runs explicitly",
         "- clean restart: use a new project name instead of deleting generated files by hand",
     ]
 
@@ -1484,6 +1538,50 @@ def apply_run_to_integration(root: Path, run: dict[str, Any]) -> None:
 def maybe_integrate_completed_runs(root: Path, index: dict[str, Any]) -> None:
     for run in sorted(index["runs"], key=run_sort_key):
         apply_run_to_integration(root, run)
+
+
+def delete_git_branch_if_present(repo_root: Path, branch_name: str) -> None:
+    git_run(["branch", "-D", branch_name], cwd=repo_root, check=False)
+
+
+def maybe_release_run_worktree(run: dict[str, Any]) -> None:
+    if not run_requires_workspace_isolation(run):
+        return
+    if normalize_optional_text(run.get("workspace_released_at")):
+        return
+    if str(run.get("status") or "") != "completed":
+        return
+    if normalize_optional_text(run.get("integration_state")) not in INTEGRATION_READY_STATES:
+        return
+    repo_root = project_git_root_for_run(run)
+    worktree_path_raw = normalize_optional_text(run.get("worktree_path"))
+    if not repo_root or not worktree_path_raw:
+        return
+    worktree_path = Path(worktree_path_raw)
+    if worktree_path.exists():
+        try:
+            git_run(["worktree", "remove", "--force", str(worktree_path)], cwd=repo_root)
+        except subprocess.CalledProcessError as exc:
+            run["workspace_release_error"] = short_summary(
+                exc.stderr or exc.stdout or f"failed to remove worktree {worktree_path}",
+                max_chars=180,
+            )
+            return
+    git_run(["worktree", "prune"], cwd=repo_root, check=False)
+    delete_git_branch_if_present(repo_root, run_worktree_branch(run))
+    worktrees_dir = worktree_path.parent
+    if worktrees_dir.exists() and not any(worktrees_dir.iterdir()):
+        worktrees_dir.rmdir()
+    source_cwd = normalize_optional_text(run.get("source_cwd"))
+    if source_cwd:
+        run["cwd"] = source_cwd
+    run["workspace_released_at"] = utc_now()
+    run["workspace_release_error"] = None
+
+
+def maybe_release_completed_worktrees(index: dict[str, Any]) -> None:
+    for run in sorted(index["runs"], key=run_sort_key):
+        maybe_release_run_worktree(run)
 
 
 def path_overlaps(left: str, right: str) -> bool:
@@ -2684,7 +2782,13 @@ def render_team_metrics_cli(metrics: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def render_project_overview(project_name: str, project_dir: Path, runs: list[dict[str, Any]]) -> str:
+def render_project_overview(
+    project_name: str,
+    project_dir: Path,
+    runs: list[dict[str, Any]],
+    *,
+    compacted: bool = False,
+) -> str:
     counts = run_status_counts(runs)
     cwd_values = sorted({str(run.get("cwd") or "-") for run in runs})
     watcher_state, watcher_heartbeat = monitor_state(project_dir.parent.parent)
@@ -2706,11 +2810,42 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
     watcher_line = f"- Manager watcher: `{watcher_state}`"
     if watcher_heartbeat:
         watcher_line += f" (last heartbeat `{watcher_heartbeat}`)"
+    intro = (
+        "This project is settled. team-leader compacted the transient dashboard, question scratchpads, and per-run report files. Use `history.md` for the compact run history and `manager-summary.md` for the latest aggregate view."
+        if compacted
+        else "Start here with `dashboard.md` for live progress. While children are active, the manager keeps these markdown files refreshed in the background. Use `manager-summary.md` for the latest manager synthesis and `questions.md` for anything the human needs to answer."
+    )
+    file_lines = [
+        "- `brief.md`: project goal, repo paths, spec paths, notes, and constraints",
+        "- `launch-plan.md`: latest planner-produced child launch plan",
+        "- `validation.md`: latest validation results and delivery status",
+        "- `metrics.md`: scorecard for timing, human-touch, parallelism, and waiting overhead",
+        "- `tasks.md`: task-oriented ledger with summaries and ownership",
+        "- `manager-summary.md`: concise manager snapshot",
+        "- `answers.md`: human-maintained answers keyed by question id",
+    ]
+    if compacted:
+        file_lines.extend(
+            [
+                "- `history.md`: compact single-file run history used after the project settles",
+                "- `integration/`: manager-owned combined checkout for validation and final inspection when writer runs were used",
+            ]
+        )
+    else:
+        file_lines.extend(
+            [
+                "- `dashboard.md`: live run table, active notes, questions, and conflict alerts",
+                "- `questions.md`: human-facing questions and blockers",
+                "- `answers-template.md`: copy-ready answer lines for open questions",
+                "- `conflicts.md`: ownership overlap and conflict-risk notes",
+                "- `reports/`: one markdown report per child run",
+            ]
+        )
     return "\n".join(
         [
             f"# {project_name}",
             "",
-            "Start here with `dashboard.md` for live progress. While children are active, the manager keeps these markdown files refreshed in the background. Use `manager-summary.md` for the latest manager synthesis and `questions.md` for anything the human needs to answer.",
+            intro,
             "",
             "## Metadata",
             "",
@@ -2720,6 +2855,7 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             f"- Launch plan: `{project_launch_plan_md_path(project_dir)}`",
             f"- Validation: `{project_validation_md_path(project_dir)}`",
             f"- Metrics: `{project_metrics_md_path(project_dir)}`",
+            f"- Detail page: `{project_history_path(project_dir) if compacted else project_default_detail_path(project_dir)}`",
             f"- Goal: {goal or '_No goal recorded yet._'}",
             f"- Autonomy mode: `{autonomy_mode or 'manual'}`",
             f"- Clarification mode: `{clarification_mode or 'auto'}`",
@@ -2746,20 +2882,9 @@ def render_project_overview(project_name: str, project_dir: Path, runs: list[dic
             "",
             "## Files",
             "",
-            "- `brief.md`: project goal, repo paths, spec paths, notes, and constraints",
-            "- `launch-plan.md`: latest planner-produced child launch plan",
-            "- `validation.md`: latest validation results and delivery status",
-            "- `metrics.md`: scorecard for timing, human-touch, parallelism, and waiting overhead",
-            "- `dashboard.md`: live run table, active notes, questions, and conflict alerts",
-            "- `tasks.md`: task-oriented ledger with summaries and ownership",
-            "- `manager-summary.md`: concise manager snapshot",
-            "- `questions.md`: human-facing questions and blockers",
-            "- `answers.md`: human-maintained answers keyed by question id",
-            "- `answers-template.md`: copy-ready answer lines for open questions",
-            "- `conflicts.md`: ownership overlap and conflict-risk notes",
-            "- `reports/`: one markdown report per child run",
+            *file_lines,
             "",
-            *project_state_policy_markdown(project_name, project_dir),
+            *project_state_policy_markdown(project_name, project_dir, compacted=compacted),
         ]
     )
 
@@ -3260,7 +3385,7 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"project={project_name}",
         f"workspace={project_dir}",
         f"landing_page={project_dir / 'README.md'}",
-        f"dashboard={project_dir / 'dashboard.md'}",
+        f"dashboard={project_default_detail_path(project_dir)}",
         f"metrics={project_metrics_md_path(project_dir)}",
         f"brief={project_brief_md_path(project_dir)}",
         f"launch_plan={project_launch_plan_md_path(project_dir)}",
@@ -3396,7 +3521,7 @@ def render_team_status_summary(root: Path, project_name: str, runs: list[dict[st
         f"next_action={stage['next_action']}",
         f"current_focus={stage['focus']}",
         f"workspace={project_dir}",
-        f"dashboard={project_dir / 'dashboard.md'}",
+        f"dashboard={project_default_detail_path(project_dir)}",
         f"metrics={project_metrics_md_path(project_dir)}",
     ]
     watcher_line = f"watcher={watcher_state}"
@@ -3707,6 +3832,200 @@ def known_projects(root: Path, index: dict[str, Any]) -> dict[str, str]:
     return {slug: str(payload["name"]) for slug, payload in grouped.items()}
 
 
+def cleanup_allowed_statuses(include_failed: bool) -> set[str]:
+    statuses = set(DEFAULT_MANUAL_COMPACT_RUN_STATUSES)
+    if include_failed:
+        statuses.update(MANUAL_COMPACT_EXTRA_STATUSES)
+    return statuses
+
+
+def compact_run_artifacts(
+    run: dict[str, Any],
+    *,
+    reason: str,
+    include_failed: bool = False,
+) -> tuple[bool, int]:
+    status = str(run.get("status") or "")
+    if reason == "settled-project":
+        allowed_statuses = AUTO_COMPACT_RUN_STATUSES
+    else:
+        allowed_statuses = cleanup_allowed_statuses(include_failed)
+    if status not in allowed_statuses:
+        return False, 0
+    run_dir = Path(run["run_dir"])
+    removed_names: list[str] = []
+    for name in RUN_COMPACT_FILE_NAMES:
+        path = run_dir / name
+        if path.exists():
+            delete_if_exists(path)
+            removed_names.append(name)
+    guard_dir = run_dir / "child-bin"
+    if guard_dir.exists():
+        delete_tree_if_exists(guard_dir)
+        removed_names.append("child-bin/")
+    was_compacted = bool(normalize_optional_text(run.get("compacted_at")))
+    if removed_names or not was_compacted:
+        run["compacted_at"] = utc_now()
+        run["compaction_reason"] = reason
+        run["compaction_removed"] = unique_preserve_order(
+            normalize_str_list(run.get("compaction_removed"), "compaction_removed") + removed_names
+        )
+    refresh_run_artifacts(run)
+    return not was_compacted and bool(normalize_optional_text(run.get("compacted_at"))), len(removed_names)
+
+
+def project_cleanup_state(
+    project_dir: Path,
+    runs: list[dict[str, Any]],
+    *,
+    include_failed: bool,
+) -> dict[str, Any]:
+    question_records = collect_question_records(runs)
+    answers = load_answers(project_dir)
+    open_questions = unanswered_questions(question_records, answers)
+    integration_issues = integration_alerts(runs)
+    validation = load_project_validation(project_dir)
+    validation_status = normalize_optional_text(validation.get("status")) if validation else None
+    blocked_terminal_statuses = {"cancelled", "dry-run"} | MANUAL_COMPACT_EXTRA_STATUSES
+    non_completed_terminal_runs = [
+        run for run in runs
+        if str(run.get("status") or "") in blocked_terminal_statuses
+    ]
+    reason: str | None = None
+    if project_has_unsettled_runs(runs):
+        reason = "project still has active, queued, or blocked runs"
+    elif integration_issues:
+        reason = "project still has integration issues"
+    elif open_questions:
+        reason = "project still has unanswered human questions"
+    elif (validation_status in {"failed", "timeout"}) and not include_failed:
+        reason = f"validation is still `{validation_status}`"
+    elif non_completed_terminal_runs and not include_failed:
+        reason = "project still has cancelled, dry-run, failed, or exited runs"
+    return {
+        "eligible": reason is None,
+        "reason": reason,
+        "question_records": question_records,
+        "answers": answers,
+        "integration_issues": integration_issues,
+    }
+
+
+def render_project_history(runs: list[dict[str, Any]]) -> str:
+    question_records = collect_question_records(runs)
+    by_run: dict[str, list[dict[str, str]]] = {}
+    for record in question_records:
+        by_run.setdefault(record["run_id"], []).append(record)
+    lines = [
+        "# Run History",
+        "",
+        "Settled projects are compacted into this single history file. Per-run reports, live dashboards, and transient question scratchpads are removed once the project is quiet and resolved.",
+        "",
+    ]
+    if not runs:
+        lines.extend(["_No runs recorded yet._", ""])
+        return "\n".join(lines)
+    for run in sorted(runs, key=run_sort_key):
+        run_questions = by_run.get(str(run["run_id"]), [])
+        lines.extend(
+            [
+                f"## {run['run_id']}",
+                "",
+                f"- Task: `{run.get('task_id') or run['run_id']}`",
+                f"- Summary: {run.get('summary') or '-'}",
+                f"- Role: `{run.get('role') or '-'}`",
+                f"- Status: `{run.get('status') or '-'}`",
+                f"- Session: `{run.get('session_id') or '-'}`",
+                f"- Integration: `{run.get('integration_state') or '-'}`",
+                f"- Worktree released: `{run.get('workspace_released_at') or '-'}`",
+                f"- Artifacts compacted: `{run.get('compacted_at') or '-'}`",
+                "",
+                "### Output Preview",
+                "",
+                preview_text(last_message_display_for_run(run), max_lines=8, max_chars=900),
+                "",
+                "### Questions Raised",
+                "",
+            ]
+        )
+        if run_questions:
+            lines.extend(f"- `{record['id']}`: {record['text']}" for record in run_questions)
+        else:
+            lines.append("_No human questions detected from this child._")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def apply_project_workspace_compaction(project_dir: Path, runs: list[dict[str, Any]]) -> None:
+    write_text(project_history_path(project_dir), render_project_history(runs))
+    delete_tree_if_exists(project_dir / "reports")
+    for name in PROJECT_COMPACT_DELETE_FILES:
+        delete_if_exists(project_dir / name)
+    worktrees_dir = project_dir / "worktrees"
+    if worktrees_dir.exists() and not any(worktrees_dir.iterdir()):
+        worktrees_dir.rmdir()
+
+
+def cleanup_root_artifacts(
+    root: Path,
+    index: dict[str, Any],
+    *,
+    project_filter: str | None = None,
+    include_failed: bool = False,
+    include_standalone: bool = False,
+) -> dict[str, Any]:
+    maybe_release_completed_worktrees(index)
+    summary = {
+        "projects_compacted": 0,
+        "runs_compacted": 0,
+        "files_removed": 0,
+        "blocked_projects": [],
+        "standalone_runs_compacted": 0,
+    }
+    allowed_statuses = cleanup_allowed_statuses(include_failed)
+    for slug, project_name in sorted(known_projects(root, index).items()):
+        if project_filter and project_filter not in {project_name, slug}:
+            continue
+        runs = sorted(project_runs(index, project_name), key=run_sort_key)
+        if not runs:
+            continue
+        project_dir = project_workspace_dir(root, project_name, slug)
+        state = project_cleanup_state(project_dir, runs, include_failed=include_failed)
+        if not state["eligible"]:
+            summary["blocked_projects"].append(
+                {"project": project_name, "slug": slug, "reason": state["reason"]}
+            )
+            continue
+        summary["projects_compacted"] += 1
+        for run in runs:
+            if str(run.get("status") or "") not in allowed_statuses:
+                continue
+            run_compacted, removed_count = compact_run_artifacts(
+                run,
+                reason="manual-cleanup" if include_failed else "settled-project",
+                include_failed=include_failed,
+            )
+            if run_compacted:
+                summary["runs_compacted"] += 1
+            summary["files_removed"] += removed_count
+    if include_standalone and not project_filter:
+        for run in sorted(index["runs"], key=run_sort_key):
+            if normalize_optional_text(run.get("project")):
+                continue
+            if str(run.get("status") or "") not in allowed_statuses:
+                continue
+            run_compacted, removed_count = compact_run_artifacts(
+                run,
+                reason="manual-cleanup",
+                include_failed=include_failed,
+            )
+            if run_compacted:
+                summary["runs_compacted"] += 1
+                summary["standalone_runs_compacted"] += 1
+            summary["files_removed"] += removed_count
+    return summary
+
+
 def sync_one_project(root: Path, project_name: str, slug: str, runs: list[dict[str, Any]]) -> None:
     project_dir = ensure_project_workspace(root, project_name, slug)
     brief = load_project_brief(project_dir, project_name)
@@ -3719,32 +4038,43 @@ def sync_one_project(root: Path, project_name: str, slug: str, runs: list[dict[s
         write_text(project_validation_md_path(project_dir), render_project_validation(validation))
     elif not project_validation_md_path(project_dir).exists():
         write_text(project_validation_md_path(project_dir), render_project_validation(default_project_validation()))
-    question_records = write_project_reports(project_dir, runs)
     answers_path = project_dir / "answers.md"
     if not answers_path.exists():
         write_text(answers_path, render_answers_stub())
-    answers = load_answers(project_dir)
+    cleanup_state = project_cleanup_state(project_dir, runs, include_failed=False)
+    if cleanup_state["eligible"]:
+        question_records = cleanup_state["question_records"]
+    else:
+        question_records = write_project_reports(project_dir, runs)
+    answers = cleanup_state["answers"]
     conflicts = detect_conflict_risks(runs)
-    integration_issues = integration_alerts(runs)
+    integration_issues = cleanup_state["integration_issues"]
     metrics = build_project_metrics(root, project_name, runs)
     delete_if_exists(project_dir / "project.md")
-    write_text(project_dir / "README.md", render_project_overview(project_name, project_dir, runs))
-    write_text(project_dir / "tasks.md", render_task_ledger(runs))
     write_text(
-        project_dir / "dashboard.md",
-        render_dashboard(project_name, project_dir, runs, conflicts, question_records, answers),
+        project_dir / "README.md",
+        render_project_overview(project_name, project_dir, runs, compacted=cleanup_state["eligible"]),
     )
+    write_text(project_dir / "tasks.md", render_task_ledger(runs))
     write_text(
         project_dir / "manager-summary.md",
         render_manager_summary(project_name, project_dir, runs, conflicts, question_records, answers),
     )
-    write_text(project_dir / "questions.md", render_questions(question_records, answers))
-    write_text(
-        project_dir / "answers-template.md",
-        render_answers_template(question_records, answers),
-    )
-    write_text(project_dir / "conflicts.md", render_conflicts(conflicts, integration_issues))
     write_text(project_metrics_md_path(project_dir), render_project_metrics(metrics))
+    if cleanup_state["eligible"]:
+        apply_project_workspace_compaction(project_dir, runs)
+    else:
+        delete_if_exists(project_history_path(project_dir))
+        write_text(
+            project_dir / "dashboard.md",
+            render_dashboard(project_name, project_dir, runs, conflicts, question_records, answers),
+        )
+        write_text(project_dir / "questions.md", render_questions(question_records, answers))
+        write_text(
+            project_dir / "answers-template.md",
+            render_answers_template(question_records, answers),
+        )
+        write_text(project_dir / "conflicts.md", render_conflicts(conflicts, integration_issues))
 
 
 def sync_projects(root: Path, index: dict[str, Any]) -> None:
@@ -3765,6 +4095,7 @@ def save_index_and_sync(root: Path, data: dict[str, Any]) -> None:
     update_dispatch_metadata(data)
     apply_parallel_limit_metadata(data)
     apply_release_throttle_metadata(data)
+    cleanup_root_artifacts(root, data)
     save_index(root, data)
     sync_projects(root, data)
 
@@ -4840,7 +5171,7 @@ def materialize_run(
         project_dir = project_workspace_dir(root, options.project, run.get("project_slug"))
         print(f"workspace={project_dir}")
         print(f"landing_page={project_dir / 'README.md'}")
-        print(f"dashboard={project_dir / 'dashboard.md'}")
+        print(f"dashboard={project_default_detail_path(project_dir)}")
     return run
 
 
@@ -5132,7 +5463,14 @@ def cmd_tail(args: argparse.Namespace) -> int:
         run = resolve_run(index, args.run)
         path = Path(run["stderr_log"] if args.stderr else run["stdout_jsonl"])
     if not path.exists():
-        print(f"missing log: {path}", file=sys.stderr)
+        compacted_at = normalize_optional_text(run.get("compacted_at"))
+        if compacted_at:
+            print(
+                f"log was removed during cleanup at {compacted_at}: {path}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"missing log: {path}", file=sys.stderr)
         return 1
     for line in read_tail_lines(path, args.lines):
         print(line)
@@ -5190,6 +5528,37 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         write_text(run_dir / "finished_at.txt", run["finished_at"] + "\n")
         save_index_and_sync(root, index)
     print_run_summary(run)
+    return 0
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    root = resolve_path(args.root) if args.root else default_root()
+    with root_lock(root):
+        index = load_index(root)
+        for run in index["runs"]:
+            refresh_run(run)
+        maybe_integrate_completed_runs(root, index)
+        summary = cleanup_root_artifacts(
+            root,
+            index,
+            project_filter=args.project,
+            include_failed=bool(args.include_failed),
+            include_standalone=bool(args.include_standalone),
+        )
+        save_index(root, index)
+        sync_projects(root, index)
+    print(f"root={root}")
+    if args.project:
+        print(f"project={args.project}")
+    print(f"projects_compacted={summary['projects_compacted']}")
+    print(f"runs_compacted={summary['runs_compacted']}")
+    print(f"standalone_runs_compacted={summary['standalone_runs_compacted']}")
+    print(f"files_removed={summary['files_removed']}")
+    if summary["blocked_projects"]:
+        print()
+        print("blocked_projects:")
+        for item in summary["blocked_projects"]:
+            print(f"- {item['project']} ({item['slug']}): {item['reason']}")
     return 0
 
 
@@ -5411,6 +5780,13 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
     cancel_p.add_argument("--force", action="store_true", help="Use SIGKILL instead of SIGTERM")
     cancel_p.set_defaults(func=cmd_cancel)
+
+    cleanup_p = sub.add_parser("cleanup", help="Compact settled project state and disposable child artifacts")
+    cleanup_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
+    cleanup_p.add_argument("--project", help="Limit cleanup to one project name or project slug")
+    cleanup_p.add_argument("--include-failed", action="store_true", help="Also compact failed or exited runs once the project is otherwise settled")
+    cleanup_p.add_argument("--include-standalone", action="store_true", help="Also compact completed standalone runs that are not attached to a project")
+    cleanup_p.set_defaults(func=cmd_cleanup)
 
     monitor_p = sub.add_parser("monitor", help=argparse.SUPPRESS)
     monitor_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")

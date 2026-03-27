@@ -12,7 +12,7 @@ The default controller root is now `.team-leader/`. Older `.agent-subsessions/` 
 
 Keep your working directory at the target project when you rely on the default root. If you invoke the controller via an absolute path from the installed skill directory, pass `--root` explicitly instead of changing directories into the skill folder.
 
-The manager keeps these files current:
+The manager keeps these files current while a project is active:
 
 - `README.md`: default landing page and file map
 - `brief.md`: project goal, repo paths, spec paths, notes, and constraints
@@ -27,14 +27,22 @@ The manager keeps these files current:
 - `conflicts.md`: owned-path overlap risk
 - `reports/<run-id>.md`: one markdown report per child run
 
+Once a project settles cleanly, the manager compacts the workspace:
+
+- `history.md` replaces the per-run `reports/` directory with a single compact run history
+- transient files such as `dashboard.md`, `questions.md`, `answers-template.md`, and `conflicts.md` are removed
+- disposable run artifacts such as prompts, runner scripts, and raw stdout or stderr logs are removed from settled child run directories
+
 For Git-backed writer runs, the manager also uses:
 
 - per-run worktrees under `projects/<project>/worktrees/`
 - a shared integration worktree under `projects/<project>/integration/`
 
+Per-run worktrees are released automatically once the writer has been integrated cleanly or produced no diff. The shared integration worktree is retained as the manager-owned combined checkout for validation and final inspection.
+
 Validation commands run in the integration worktree when one exists, so delivery gates evaluate the manager-owned combined result instead of a stale source checkout.
 
-This project folder is persistent manager state. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The intended human-edited file is `answers.md`. For a clean restart, use a new project name.
+This project folder is persistent manager state. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The intended human-edited file is `answers.md`. For a clean restart, use a new project name. If you want to compact failed or standalone runs explicitly, use `python3 scripts/team_leader.py cleanup`.
 
 ## Recommended Metadata
 
@@ -61,12 +69,18 @@ Treat the markdown files as the control surface:
 - read `README.md` first as the default landing page
 - read `brief.md` to understand the captured goal and constraints
 - read `launch-plan.md` to see what the manager-planner most recently proposed
-- read `dashboard.md` first for live progress
+- read `dashboard.md` first for live progress while the project is active
 - read `tasks.md` for assignment state
 - read `questions.md` before asking the human anything
 - read `answers.md` after the human responds
 - read `conflicts.md` before launching overlapping writers
 - read `reports/<run-id>.md` when a specific child needs closer review
+
+After the project settles and is compacted:
+
+- read `history.md` for the compact run history
+- read `manager-summary.md` for the latest aggregate view
+- treat the missing live dashboard or per-run reports as a sign that the project has already been compacted
 
 While children are active, the manager refreshes these files automatically in the background. Tasks with `--depends-on` stay blocked until their prerequisites complete, then the manager launches the next wave automatically.
 

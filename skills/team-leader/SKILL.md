@@ -13,7 +13,7 @@ Treat a subsession as a full Codex worker with its own thread, context window, t
 
 Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragments. This path is relative to the skill itself, not the project root. In this repo that file is at `skills/team-leader/scripts/team_leader.py`, and when installed it lives under the Codex skills directory at `.../skills/team-leader/scripts/team_leader.py`. Keep your working directory at the target project unless you pass `--root` and `--cd` explicitly; do not `cd` into the skill directory just to run the controller, because the default `.team-leader/` root is derived from the current working directory. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
-When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. While any child is active, the manager refreshes those markdown files automatically in the background.
+When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. While any child is active, the manager refreshes those markdown files automatically in the background. Once a project settles cleanly, the manager compacts transient dashboards, question scratchpads, per-run reports, and disposable child-run artifacts into a smaller steady-state workspace.
 
 The controller now includes conservative safety defaults aimed at avoiding runaway resource use:
 
@@ -24,7 +24,7 @@ The controller now includes conservative safety defaults aimed at avoiding runaw
 - `team-status --project` gives a compact progressive update stream that is safer in captured Codex output than a full-screen watch
 - non-TTY `watch` falls back to a single snapshot unless explicitly told to stream
 
-That project workspace is persistent state, not a temp folder. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The only file intended for direct human edits is `answers.md`. For a clean restart, use a new project name.
+That project workspace is persistent state, not a temp folder. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The only file intended for direct human edits is `answers.md`. For a clean restart, use a new project name. If you need to compact failed or standalone runs on demand, use `python3 scripts/team_leader.py cleanup`.
 
 Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
 
@@ -149,7 +149,7 @@ python3 scripts/team_leader.py dispatch \
 
 That project link is what enables automatic markdown aggregation, progress visualization, and dependency-aware next-wave launching.
 
-For writer children in Git repos, the manager now isolates each writer into its own worktree and integrates completed changes through the project integration worktree. Overlapping writers are serialized by the manager instead of writing into the same checkout at the same time.
+For writer children in Git repos, the manager now isolates each writer into its own worktree and integrates completed changes through the project integration worktree. Overlapping writers are serialized by the manager instead of writing into the same checkout at the same time. Once a writer has been integrated cleanly or produces no diff, its per-run worktree is released automatically.
 
 ### 5. Track progress
 
@@ -159,7 +159,7 @@ python3 scripts/team_leader.py show 20260324-120000-ui-refactor
 python3 scripts/team_leader.py tail 20260324-120000-ui-refactor
 ```
 
-`status` refreshes run metadata, including completion state and detected session IDs. The project markdown workspace also refreshes automatically while children are running, so you do not have to poll manually just to keep `dashboard.md` current.
+`status` refreshes run metadata, including completion state and detected session IDs. The project markdown workspace also refreshes automatically while children are running, so you do not have to poll manually just to keep `dashboard.md` current. After a project settles and is compacted, the reported detail path may point to `history.md` instead of `dashboard.md`.
 
 For a Codex-native view without opening folders, prefer:
 
