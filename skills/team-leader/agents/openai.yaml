@@ -1,4 +1,4 @@
 interface:
   display_name: "Team Leader"
-  short_description: "Lead Codex child sessions with project dashboards"
-  default_prompt: "Use $team-leader to launch Codex child sessions, keep a project markdown dashboard, and aggregate child reports for parallel work."
+  short_description: "Lead child CLI sessions with project dashboards"
+  default_prompt: "Use $team-leader to launch child CLI sessions, keep a project markdown dashboard, and aggregate child reports for parallel work."

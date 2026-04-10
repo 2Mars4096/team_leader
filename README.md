@@ -1,21 +1,32 @@
 # Team Leader
 
-A Codex skill that manages real child CLI sessions as a team-leader style orchestrator. It launches, tracks, reviews, and aggregates parallel Codex workers through project dashboards, dependency-aware dispatch, and automatic markdown workspaces.
+A Codex skill and standalone controller that manages real child CLI sessions as a team-leader style orchestrator. It launches, tracks, reviews, and aggregates parallel workers through project dashboards, dependency-aware dispatch, and automatic markdown workspaces.
 
-Unlike lightweight built-in subagents, each child session is a full Codex session with its own thread, context window, tool access, and resume lifecycle.
+Unlike lightweight built-in subagents, each child session is a full external CLI session with its own context, tool access, and resume lifecycle.
 
 ## Skills Included
 
 | Skill | Purpose |
 |-------|---------|
-| `team-leader` | Planning, dispatch, monitoring, and aggregation of child Codex sessions |
+| `team-leader` | Planning, dispatch, monitoring, and aggregation of child CLI sessions |
 | `team-status` | Compact progress view for monitoring without opening markdown files |
 
 ## Prerequisites
 
 - **Python 3.10+** (stdlib only, no pip packages required)
-- **[Codex CLI](https://github.com/openai/codex)** installed and configured
+- At least one supported child CLI installed and configured: `codex`, `claude`, `cursor-agent`, or `kiro-cli`
 - **Git** (for worktree-based writer isolation)
+
+## Supported Providers
+
+- `codex` -- native `exec` / `resume` adapter with session IDs and backend reachability checks
+- `claude` -- headless `claude -p` adapter with `claude -r <session-id>` resume
+- `cursor` -- headless `cursor-agent -p` adapter with `--resume <session-id>`
+- `kiro` -- headless `kiro-cli chat --no-interactive` adapter with directory-scoped `--resume`
+
+Common aliases are accepted anywhere a provider name is expected: `cc` or `claude-code` for `claude`, `cursor-agent` for `cursor`, `kiro-cli` for `kiro`, and `codex-cli` or `openai-codex` for `codex`.
+
+`windsurf` and `antigravity` are not shipped as provider adapters yet. This controller only first-classes CLIs with a documented standalone headless launch surface and a resume story the manager can automate safely.
 
 ## Installation
 
@@ -62,7 +73,7 @@ Use $team-leader to refactor the checkout flow. The repo is at /path/to/repo.
 Run tests with "pytest -q" to validate.
 ```
 
-Codex reads the skill instructions and drives the controller automatically: it runs `intake` to capture the brief, `orchestrate` to plan and dispatch workers, and monitors progress through `status` and `team-status`.
+Codex reads the skill instructions and drives the controller automatically: it runs `intake` to capture the brief, `orchestrate` to plan and dispatch workers, and monitors progress through `status` and `team-status`. The manager can stay in Codex while child runs use another provider such as `claude`, `cursor`, or `kiro`.
 
 For monitoring only, use the companion skill:
 
@@ -80,16 +91,29 @@ python3 ~/.codex/skills/team-leader/scripts/team_leader.py intake \
   --project my-project \
   --goal "Refactor checkout to reduce payment failures" \
   --repo-path . \
+  --child-provider claude \
+  --allow-provider codex \
+  --allow-provider claude \
   --validation-command "pytest -q"
 
-# 2. Plan and dispatch workers
+# 2. Validate provider binaries before launch
+python3 ~/.codex/skills/team-leader/scripts/team_leader.py provider-check \
+  --provider codex \
+  --provider claude
+
+# 2b. Optional: verify one provider end to end
+python3 ~/.codex/skills/team-leader/scripts/team_leader.py provider-smoke-test \
+  --provider claude \
+  --timeout 30
+
+# 3. Plan and dispatch workers
 python3 ~/.codex/skills/team-leader/scripts/team_leader.py orchestrate \
   --project my-project
 
-# 3. Check progress
+# 4. Check progress
 python3 ~/.codex/skills/team-leader/scripts/team_leader.py status --project my-project
 
-# 4. Watch live updates
+# 5. Watch live updates
 python3 ~/.codex/skills/team-leader/scripts/team_leader.py team-status --project my-project
 ```
 
@@ -158,11 +182,20 @@ All commands use `python3 <path-to>/team_leader.py <command> [options]`.
 | `reconcile` | Refresh status and backfill session IDs |
 | `attach-session` | Manually attach a session ID to a run |
 | `providers` | List available CLI adapters |
+| `provider-check` | Validate provider executable paths and basic CLI readiness |
+| `provider-smoke-test` | Launch one real child run and wait for an end-to-end result |
+
+`provider-check` exits non-zero when any requested provider is blocked, so it can gate shell scripts and CI preflight cleanly.
 
 ### Key options
 
 - `--project <name>` -- link runs to a project workspace
-- `--provider codex` -- CLI adapter (only `codex` is shipped today)
+- `--provider <name>` -- provider for one direct run or for the planner child
+- `--provider-bin <path>` -- executable override for that provider
+- `--planner-provider <name>` -- persist the planner provider in `brief.md`
+- `--child-provider <name>` -- default provider for planner-produced child runs
+- `--child-provider-bin <path>` -- executable override for the default child provider
+- `--allow-provider <name>` -- constrain planner output to a provider allowlist
 - `--sandbox read-only|workspace-write` -- child sandbox mode
 - `--full-auto` -- run child in full-auto mode
 - `--root <path>` -- explicit `.team-leader/` path (default: `./.team-leader`)
@@ -214,6 +247,10 @@ When the user provides only a goal and context:
 ## Architecture Notes
 
 The controller keeps provider-specific behavior at the adapter boundary: option validation, command construction, session-ID detection, and resume command generation. The run registry and batch manifest format remain stable when adding a new adapter for another CLI (e.g., `claude`, `cursor`).
+
+Provider choice can vary per child run. Planner output may now set `provider` and `provider_bin` for each task, so a Codex manager can launch Claude reviewers, Cursor writers, and Kiro researchers in the same project as long as their CLIs are installed and pass `provider-check`.
+
+All shipped providers now sit on the same adapter contract. Codex still keeps its provider-specific hooks for backend reachability and thread detection so `codex -> codex` preserves the prior behavior while mixed-provider projects stay possible.
 
 Writer children in Git repos are isolated into per-run worktrees. The manager integrates completed work through a project integration worktree before validation runs.
 

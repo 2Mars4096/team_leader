@@ -1,15 +1,15 @@
 ---
 name: team-leader
-description: Use when a user wants a team-leader style Codex manager that launches, tracks, reviews, and aggregates real child Codex sessions, especially when each child should keep full Codex capabilities rather than acting like a lightweight built-in subagent.
+description: Use when a user wants a team-leader style Codex manager that launches, tracks, reviews, and aggregates real child CLI sessions, especially when each child should keep full external CLI capabilities rather than acting like a lightweight built-in subagent.
 ---
 
 # Team Leader
 
 ## Overview
 
-This skill manages real child sessions through a provider adapter layer, with `codex` implemented first via `codex exec` and `codex resume`.
+This skill manages real child sessions through a provider adapter layer. The controller now ships verified adapters for `codex`, `claude`, `cursor`, and `kiro`.
 
-Treat a subsession as a full Codex worker with its own thread, context window, tool use, and follow-up lifecycle. This is more flexible than a lightweight in-process subagent because a child session can keep working independently, be resumed later, and itself act as a manager when useful.
+Treat a subsession as a full child CLI worker with its own session, context window, tool use, and follow-up lifecycle. This is more flexible than a lightweight in-process subagent because a child session can keep working independently, be resumed later, and itself act as a manager when useful.
 
 Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragments. This path is relative to the skill itself, not the project root. In this repo that file is at `skills/team-leader/scripts/team_leader.py`, and when installed it lives under the Codex skills directory at `.../skills/team-leader/scripts/team_leader.py`. Keep your working directory at the target project unless you pass `--root` and `--cd` explicitly; do not `cd` into the skill directory just to run the controller, because the default `.team-leader/` root is derived from the current working directory. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
@@ -26,15 +26,24 @@ The controller now includes conservative safety defaults aimed at avoiding runaw
 
 That project workspace is persistent state, not a temp folder. Reusing the same project name reuses the same folder and tracked history. In normal continuation, do not delete the generated markdown files by hand. The only file intended for direct human edits is `answers.md`. For a clean restart, use a new project name. If you need to compact failed or standalone runs on demand, use `python3 scripts/team_leader.py cleanup`.
 
-Today the only shipped provider is `codex`. The control plane is intentionally shaped so later adapters can target other CLIs without rewriting the registry, batch manifests, or lifecycle commands.
+Shipped providers today:
 
-Keep provider-specific logic inside the adapter layer: option validation, launch command construction, session detection, and resume command generation. Read `references/provider-adapters.md` when you need to extend the script beyond Codex.
+- `codex`
+- `claude`
+- `cursor`
+- `kiro`
+
+Common aliases are accepted anywhere the controller asks for a provider name, including `cc` or `claude-code` for `claude`, `cursor-agent` for `cursor`, `kiro-cli` for `kiro`, and `codex-cli` or `openai-codex` for `codex`.
+
+`windsurf` and `antigravity` are not shipped adapters yet. This controller only first-classes CLIs with a documented standalone headless launch surface and an automatable resume workflow.
+
+Keep provider-specific logic inside the adapter layer: option validation, launch command construction, session detection, and resume command generation. All shipped providers now use the same adapter contract, while Codex keeps provider-specific hooks for backend reachability and thread detection so `codex -> codex` stays behaviorally aligned with the prior flow. Read `references/provider-adapters.md` when you need to extend the script beyond Codex.
 
 ## When To Use
 
-- Launch one or more long-running Codex child sessions from a manager session
-- Split work into independent Codex-run tracks that may later be resumed interactively
-- Run research, implementation, review, or audit workers that need full Codex behavior
+- Launch one or more long-running child CLI sessions from a manager session
+- Split work into independent child-run tracks that may later be resumed interactively
+- Run research, implementation, review, or audit workers that need full provider behavior
 - Dispatch children in the background and poll status while continuing work in the manager
 - Cancel or manually reattach to a child session when the work changes
 
@@ -42,10 +51,10 @@ Keep provider-specific logic inside the adapter layer: option validation, launch
 
 Built-in subagents are lightweight delegated helpers inside the current orchestration model.
 
-Subsessions in this skill are separate Codex sessions:
+Subsessions in this skill are separate provider sessions:
 
-- They run through the normal `codex exec` / `codex resume` surface
-- They can use the same tools and workflows a normal Codex session would use
+- They run through the normal headless/resume surface for the selected provider
+- They can use the same tools and workflows that provider would normally expose
 - They can persist their own thread and be resumed later
 - They can be treated as independent managers rather than one-shot helpers
 
@@ -68,6 +77,9 @@ python3 scripts/team_leader.py intake \
   --project checkout-refactor \
   --goal "Refactor checkout to simplify the flow and reduce payment failures." \
   --repo-path /path/to/repo \
+  --child-provider claude \
+  --allow-provider codex \
+  --allow-provider claude \
   --spec-path /path/to/spec.md \
   --autonomy-mode guided \
   --validation-command "pytest -q" \
@@ -100,7 +112,7 @@ python3 scripts/team_leader.py orchestrate \
   --project checkout-refactor
 ```
 
-`orchestrate` launches a manager-planner child when needed. That planner inspects `brief.md`, the repo paths, and any spec paths, then either asks a concise clarification round or emits a machine-readable launch plan. The manager parses that plan and auto-dispatches child sessions from it. If the planner raises human questions, they land in `questions.md` and `answers-template.md`.
+`orchestrate` launches a manager-planner child when needed. That planner inspects `brief.md`, the repo paths, and any spec paths, then either asks a concise clarification round or emits a machine-readable launch plan. The manager parses that plan and auto-dispatches child sessions from it. Planner output can now choose `provider` and `provider_bin` per child run, subject to the project allowlist and default child provider stored in the brief. If the planner raises human questions, they land in `questions.md` and `answers-template.md`.
 
 ### 4. Dispatch a child run directly when needed
 
@@ -148,6 +160,22 @@ python3 scripts/team_leader.py dispatch \
 ```
 
 That project link is what enables automatic markdown aggregation, progress visualization, and dependency-aware next-wave launching.
+
+When you want a Codex manager to launch another CLI as the child, validate it first:
+
+```bash
+python3 scripts/team_leader.py provider-check --provider claude --provider cursor --provider kiro
+```
+
+`provider-check` exits non-zero when any requested provider is blocked, which makes it suitable for shell gating before a mixed-provider launch.
+
+When you want to verify one provider can complete a real manager-launched child run, use:
+
+```bash
+python3 scripts/team_leader.py provider-smoke-test --provider claude --timeout 30
+```
+
+This command reuses the normal dispatch path, waits for the child to settle, and checks that the final `last_message` matches the expected text. Keep the generated temp root when it fails so you can inspect stdout, stderr, and the captured session ID.
 
 For writer children in Git repos, the manager now isolates each writer into its own worktree and integrates completed changes through the project integration worktree. Overlapping writers are serialized by the manager instead of writing into the same checkout at the same time. Once a writer has been integrated cleanly or produces no diff, its per-run worktree is released automatically.
 
@@ -230,7 +258,12 @@ Print a ready-to-run resume command:
 python3 scripts/team_leader.py resume-cmd 20260324-120000-ui-refactor
 ```
 
-This prints an interactive provider resume command anchored to the original working directory. For the current Codex adapter, that command is `codex resume <thread-id>`.
+This prints an interactive provider resume command anchored to the original working directory. Examples:
+
+- `codex resume <thread-id>`
+- `claude -r <session-id>`
+- `cursor-agent --resume <session-id>`
+- `kiro-cli chat --resume`
 
 For non-interactive follow-up:
 
@@ -254,7 +287,7 @@ For multiple children, create a JSON manifest and dispatch in one command:
 python3 scripts/team_leader.py batch --file references/example_manifest.json --dry-run
 ```
 
-Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions. Read `references/project-workspaces.md` when you want the central-folder workflow and automatic markdown collection behavior. Use `python3 scripts/team_leader.py providers` to inspect the adapters currently available in the script, or `providers --json` when you need machine-readable provider capability details.
+Read `references/prompt-patterns.md` when you need prompt templates for research, implementation, reviewer, or manager-style child sessions. Read `references/project-workspaces.md` when you want the central-folder workflow and automatic markdown collection behavior. Use `python3 scripts/team_leader.py providers` to inspect the adapters currently available in the script, or `providers --json` when you need machine-readable provider capability details. Use `provider-check` before a mixed-CLI wave when you need to verify executable paths and basic CLI readiness.
 
 ## Recommended Manager-First Flow
 

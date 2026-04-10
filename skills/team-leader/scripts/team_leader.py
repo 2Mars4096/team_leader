@@ -17,10 +17,11 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 UUID_RE = re.compile(
@@ -29,6 +30,14 @@ UUID_RE = re.compile(
 )
 INDEX_VERSION = 3
 DEFAULT_PROVIDER = "codex"
+PROVIDER_ALIASES: dict[str, str] = {
+    "openai-codex": "codex",
+    "codex-cli": "codex",
+    "claude-code": "claude",
+    "cc": "claude",
+    "cursor-agent": "cursor",
+    "kiro-cli": "kiro",
+}
 DEFAULT_ROOT_NAME = ".team-leader"
 LEGACY_ROOT_NAMES = (".agent-subsessions", ".codex-subsessions")
 LEGACY_ROOTS_LABEL = ", ".join(f"./{name}" for name in LEGACY_ROOT_NAMES)
@@ -81,8 +90,9 @@ PLANNER_ROLE = "manager"
 PLANNER_SOURCE = "team-leader-planner"
 AUTONOMY_MODES = ("manual", "guided", "continuous")
 CLARIFICATION_MODES = ("auto", "off")
-INTEGRATION_READY_STATES = {"applied", "no-changes"}
-INTEGRATION_BLOCKING_STATES = {"pending", "conflict", "scope-violation", "apply-failed", "commit-failed"}
+INTEGRATION_READY_STATES = {"applied", "applied-subset", "no-changes"}
+INTEGRATION_ALERT_STATES = {"conflict", "scope-violation", "apply-failed", "commit-failed"}
+INTEGRATION_BLOCKING_STATES = {"pending", *INTEGRATION_ALERT_STATES}
 
 
 def utc_now() -> str:
@@ -136,6 +146,57 @@ def resolve_executable(raw: str, *, cwd: Path | None = None) -> str:
     if found:
         return str(Path(found).resolve())
     raise RuntimeError(f"unable to locate executable on PATH: {raw}")
+
+
+def run_command_healthcheck(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: int,
+) -> tuple[bool, str | None]:
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except OSError as exc:
+        return False, short_summary(str(exc), max_chars=180)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout_seconds}s"
+    detail = short_summary((proc.stderr.strip() or proc.stdout.strip() or "").strip(), max_chars=180)
+    if proc.returncode != 0:
+        if detail:
+            return False, f"exit {proc.returncode}: {detail}"
+        return False, f"exit {proc.returncode}"
+    return True, detail
+
+
+def extract_result_text_from_json_stream(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    result: str | None = None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                candidate = payload.get("result")
+                if isinstance(candidate, str) and candidate.strip():
+                    result = candidate
+    except OSError:
+        return None
+    return result
 
 
 def path_looks_like_skill_dir(path: Path) -> bool:
@@ -193,14 +254,43 @@ def git_head(path: Path) -> str | None:
     return value or None
 
 
+def git_common_dir(path: Path) -> Path | None:
+    try:
+        proc = git_run(["rev-parse", "--git-common-dir"], cwd=path)
+    except subprocess.CalledProcessError:
+        return None
+    raw = proc.stdout.strip()
+    if not raw:
+        return None
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = (path / candidate).resolve()
+    return candidate
+
+
 def git_has_tracked_changes(path: Path, base_ref: str) -> tuple[list[str], str]:
     try:
         changed = git_run(["diff", "--name-only", base_ref], cwd=path)
         patch = git_run(["diff", "--binary", base_ref], cwd=path)
+        untracked = git_run(["ls-files", "--others", "--exclude-standard"], cwd=path)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(exc.stderr.strip() or f"git diff failed in {path}") from exc
-    changed_paths = [line.strip() for line in changed.stdout.splitlines() if line.strip()]
-    return changed_paths, patch.stdout
+    tracked_paths = [line.strip() for line in changed.stdout.splitlines() if line.strip()]
+    untracked_paths = [line.strip() for line in untracked.stdout.splitlines() if line.strip()]
+    patch_parts = [patch.stdout]
+    for rel_path in untracked_paths:
+        extra = git_run(
+            ["diff", "--binary", "--no-index", "--", "/dev/null", rel_path],
+            cwd=path,
+            check=False,
+        )
+        if extra.returncode not in {0, 1}:
+            detail = extra.stderr.strip() or extra.stdout.strip() or f"git diff failed for {rel_path}"
+            raise RuntimeError(detail)
+        if extra.stdout:
+            patch_parts.append(extra.stdout)
+    changed_paths = unique_preserve_order(tracked_paths + untracked_paths)
+    return changed_paths, "".join(patch_parts)
 
 
 def path_within_owned_paths(path: str, owned_paths: list[str]) -> bool:
@@ -240,6 +330,7 @@ def root_lock(root: Path) -> Any:
 @dataclass(frozen=True)
 class DispatchOptions:
     provider: str
+    provider_bin: str | None
     name: str | None
     project: str | None
     task_id: str | None
@@ -289,6 +380,7 @@ class ProviderAdapter:
     bin_env_var: str
     default_bin: str
     capabilities: ProviderCapabilities
+    notes: str = ""
 
     def resolved_bin(self) -> str:
         return os.environ.get(self.bin_env_var, self.default_bin)
@@ -331,6 +423,7 @@ class ProviderAdapter:
         capabilities = self.capabilities
         return {
             "name": self.name,
+            "aliases": provider_aliases_for(self.name),
             "session_label": self.session_label,
             "bin_env_var": self.bin_env_var,
             "default_bin": self.default_bin,
@@ -347,7 +440,14 @@ class ProviderAdapter:
             "supports_enable_disable": capabilities.supports_enable_disable,
             "supports_images": capabilities.supports_images,
             "supports_exec_resume": capabilities.supports_exec_resume,
+            "notes": self.notes,
         }
+
+    def preflight_timeout_seconds(self) -> int:
+        return 12
+
+    def build_preflight_command(self, *, real_bin: str, cwd: Path) -> list[str] | None:
+        return [real_bin, "--version"]
 
     def build_exec_command(
         self,
@@ -359,19 +459,157 @@ class ProviderAdapter:
         raise NotImplementedError
 
     def detect_session_id(self, run: dict[str, Any]) -> str | None:
-        raise NotImplementedError
+        stdout_path = Path(run["stdout_path"])
+        json_candidates = read_jsonl_candidates(stdout_path)
+        if json_candidates:
+            return json_candidates[0]
+        return None
+
+    def last_message_from_stdout(self, stdout_path: Path) -> str | None:
+        return extract_result_text_from_json_stream(stdout_path)
+
+    def write_last_message(self, run: dict[str, Any]) -> None:
+        text = self.last_message_from_stdout(Path(run["stdout_path"]))
+        if not text:
+            return
+        write_text(Path(run["last_message_path"]), text.rstrip() + "\n")
 
     def build_resume_command(self, run: dict[str, Any], exec_mode: bool) -> str:
         raise NotImplementedError
 
     def launch_preflight(self, run: dict[str, Any]) -> tuple[bool, str | None]:
+        cwd_raw = normalize_optional_text(run.get("cwd")) or normalize_optional_text(run.get("source_cwd")) or str(Path.cwd())
+        provider_bin_raw = normalize_optional_text(run.get("provider_bin")) or self.resolved_bin()
+        try:
+            real_bin = resolve_executable(provider_bin_raw, cwd=Path(cwd_raw))
+        except RuntimeError as exc:
+            return False, f"provider-bin-unavailable: {short_summary(str(exc), max_chars=140)}"
+        command = self.build_preflight_command(real_bin=real_bin, cwd=Path(cwd_raw))
+        if not command:
+            return True, None
+        ok, detail = run_command_healthcheck(
+            command,
+            cwd=Path(cwd_raw),
+            timeout_seconds=self.preflight_timeout_seconds(),
+        )
+        if not ok:
+            return False, f"provider-env: {detail or 'self-check failed'}"
         return True, None
 
     def runtime_launch_failure(self, run: dict[str, Any]) -> str | None:
         return None
 
 
-class CodexProvider(ProviderAdapter):
+@dataclass(frozen=True)
+class ExecProviderSpec:
+    build_exec_args: Callable[[DispatchOptions, Path, Path], list[str]]
+    build_resume_args: Callable[[dict[str, Any], bool], list[str]]
+    build_preflight_args: Callable[[str, Path], list[str] | None] | None = None
+    last_message_mode: str = "json_result"
+
+
+class ExecProviderAdapter(ProviderAdapter):
+    spec: ExecProviderSpec
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        session_label: str,
+        bin_env_var: str,
+        default_bin: str,
+        capabilities: ProviderCapabilities,
+        notes: str,
+        spec: ExecProviderSpec,
+    ) -> None:
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "session_label", session_label)
+        object.__setattr__(self, "bin_env_var", bin_env_var)
+        object.__setattr__(self, "default_bin", default_bin)
+        object.__setattr__(self, "capabilities", capabilities)
+        object.__setattr__(self, "notes", notes)
+        object.__setattr__(self, "spec", spec)
+
+    def build_preflight_command(self, *, real_bin: str, cwd: Path) -> list[str] | None:
+        builder = self.spec.build_preflight_args
+        if builder is None:
+            return super().build_preflight_command(real_bin=real_bin, cwd=cwd)
+        return builder(real_bin, cwd)
+
+    def build_exec_command(
+        self,
+        *,
+        prompt_path: Path,
+        last_message_path: Path,
+        options: DispatchOptions,
+    ) -> list[str]:
+        return [self.resolved_bin(), *self.spec.build_exec_args(options, prompt_path, last_message_path)]
+
+    def last_message_from_stdout(self, stdout_path: Path) -> str | None:
+        if self.spec.last_message_mode == "stdout_text":
+            return read_text_if_exists(stdout_path)
+        return super().last_message_from_stdout(stdout_path)
+
+    def build_resume_command(self, run: dict[str, Any], exec_mode: bool) -> str:
+        cwd = shlex.quote(run["cwd"])
+        return f"cd {cwd} && {quote_command(self.spec.build_resume_args(run, exec_mode))}"
+
+
+def build_codex_exec_args(
+    options: DispatchOptions,
+    prompt_path: Path,
+    last_message_path: Path,
+) -> list[str]:
+    del prompt_path
+    args = [
+        "exec",
+        "--json",
+        "--output-last-message",
+        str(last_message_path),
+        "--cd",
+        str(options.cd),
+    ]
+    if options.sandbox:
+        args.extend(["--sandbox", options.sandbox])
+    if options.model:
+        args.extend(["--model", options.model])
+    if options.profile:
+        args.extend(["--profile", options.profile])
+    for add_dir in options.add_dirs:
+        args.extend(["--add-dir", str(add_dir)])
+    for config in options.configs:
+        args.extend(["--config", config])
+    for feature in options.enables:
+        args.extend(["--enable", feature])
+    for feature in options.disables:
+        args.extend(["--disable", feature])
+    for image in options.images:
+        args.extend(["--image", str(image)])
+    if options.search:
+        args.append("--search")
+    if options.skip_git_repo_check:
+        args.append("--skip-git-repo-check")
+    if options.ephemeral:
+        args.append("--ephemeral")
+    if options.full_auto:
+        args.append("--full-auto")
+    if options.dangerous:
+        args.append("--dangerously-bypass-approvals-and-sandbox")
+    args.append("-")
+    return args
+
+
+def build_codex_resume_args(run: dict[str, Any], exec_mode: bool) -> list[str]:
+    session_id = require_session_id_for_resume(run)
+    args = [normalize_optional_text(run.get("provider_bin")) or get_provider("codex").resolved_bin()]
+    if exec_mode:
+        args.extend(["exec", "resume", session_id, "-"])
+        return args
+    args.extend(["resume", session_id])
+    return args
+
+
+class CodexProvider(ExecProviderAdapter):
     def __init__(self) -> None:
         super().__init__(
             name="codex",
@@ -393,52 +631,12 @@ class CodexProvider(ProviderAdapter):
                 supports_images=True,
                 supports_exec_resume=True,
             ),
+            notes="Codex exec/resume adapter with preserved backend reachability and thread detection behavior.",
+            spec=ExecProviderSpec(
+                build_exec_args=build_codex_exec_args,
+                build_resume_args=build_codex_resume_args,
+            ),
         )
-
-    def build_exec_command(
-        self,
-        *,
-        prompt_path: Path,
-        last_message_path: Path,
-        options: DispatchOptions,
-    ) -> list[str]:
-        command = [
-            self.resolved_bin(),
-            "exec",
-            "--json",
-            "--output-last-message",
-            str(last_message_path),
-            "--cd",
-            str(options.cd),
-        ]
-        if options.sandbox:
-            command.extend(["--sandbox", options.sandbox])
-        if options.model:
-            command.extend(["--model", options.model])
-        if options.profile:
-            command.extend(["--profile", options.profile])
-        for add_dir in options.add_dirs:
-            command.extend(["--add-dir", str(add_dir)])
-        for config in options.configs:
-            command.extend(["--config", config])
-        for feature in options.enables:
-            command.extend(["--enable", feature])
-        for feature in options.disables:
-            command.extend(["--disable", feature])
-        for image in options.images:
-            command.extend(["--image", str(image)])
-        if options.search:
-            command.append("--search")
-        if options.skip_git_repo_check:
-            command.append("--skip-git-repo-check")
-        if options.ephemeral:
-            command.append("--ephemeral")
-        if options.full_auto:
-            command.append("--full-auto")
-        if options.dangerous:
-            command.append("--dangerously-bypass-approvals-and-sandbox")
-        command.append("-")
-        return command
 
     def detect_session_id(self, run: dict[str, Any]) -> str | None:
         stdout_path = Path(run["stdout_path"])
@@ -460,17 +658,8 @@ class CodexProvider(ProviderAdapter):
             return candidates[0]
         return None
 
-    def build_resume_command(self, run: dict[str, Any], exec_mode: bool) -> str:
-        session_id = get_session_id(run)
-        if not session_id:
-            raise RuntimeError("run has no detected session_id; use reconcile or attach-session first")
-        if exec_mode and not self.capabilities.supports_exec_resume:
-            raise RuntimeError(f"provider {self.name} does not support non-interactive resume")
-        cwd = shlex.quote(run["cwd"])
-        provider_bin = shlex.quote(self.resolved_bin())
-        if exec_mode:
-            return f"cd {cwd} && {provider_bin} exec resume {shlex.quote(session_id)} -"
-        return f"cd {cwd} && {provider_bin} resume {shlex.quote(session_id)}"
+    def write_last_message(self, run: dict[str, Any]) -> None:
+        return
 
     def launch_preflight(self, run: dict[str, Any]) -> tuple[bool, str | None]:
         cwd_raw = normalize_optional_text(run.get("cwd")) or normalize_optional_text(run.get("source_cwd")) or str(Path.cwd())
@@ -518,20 +707,247 @@ class CodexProvider(ProviderAdapter):
         )
 
 
+def require_session_id_for_resume(run: dict[str, Any]) -> str:
+    session_id = get_session_id(run)
+    if not session_id:
+        raise RuntimeError("run has no detected session_id; use reconcile or attach-session first")
+    return session_id
+
+
+def build_claude_exec_args(
+    options: DispatchOptions,
+    prompt_path: Path,
+    last_message_path: Path,
+) -> list[str]:
+    del prompt_path
+    del last_message_path
+    sandbox = options.sandbox or "read-only"
+    args = ["-p", "--verbose", "--output-format", "stream-json"]
+    if options.model:
+        args.extend(["--model", options.model])
+    for add_dir in options.add_dirs:
+        args.extend(["--add-dir", str(add_dir)])
+    if options.dangerous or sandbox == "danger-full-access":
+        args.extend(["--permission-mode", "bypassPermissions"])
+    elif sandbox == "read-only":
+        args.extend(["--permission-mode", "plan"])
+    else:
+        args.extend(
+            [
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                "Bash,Read,Glob,Grep,Edit,Write",
+            ]
+        )
+    return args
+
+
+def build_claude_resume_args(run: dict[str, Any], exec_mode: bool) -> list[str]:
+    session_id = require_session_id_for_resume(run)
+    args = [normalize_optional_text(run.get("provider_bin")) or get_provider("claude").resolved_bin(), "-r", session_id]
+    if exec_mode:
+        args.extend(["--verbose", "--output-format", "stream-json", "-p"])
+    return args
+
+
+def build_cursor_exec_args(
+    options: DispatchOptions,
+    prompt_path: Path,
+    last_message_path: Path,
+) -> list[str]:
+    del prompt_path
+    del last_message_path
+    sandbox = options.sandbox or "read-only"
+    args = ["-p", "--output-format", "stream-json"]
+    if options.model:
+        args.extend(["--model", options.model])
+    if options.full_auto or options.dangerous or sandbox != "read-only":
+        args.append("--force")
+    return args
+
+
+def build_cursor_resume_args(run: dict[str, Any], exec_mode: bool) -> list[str]:
+    session_id = require_session_id_for_resume(run)
+    args = [
+        normalize_optional_text(run.get("provider_bin")) or get_provider("cursor").resolved_bin(),
+        "--resume",
+        session_id,
+    ]
+    if exec_mode:
+        args.extend(["--output-format", "stream-json", "-p"])
+    return args
+
+
+def build_cursor_preflight_args(real_bin: str, cwd: Path) -> list[str] | None:
+    del cwd
+    return [real_bin, "status"]
+
+
+def build_kiro_exec_args(
+    options: DispatchOptions,
+    prompt_path: Path,
+    last_message_path: Path,
+) -> list[str]:
+    del last_message_path
+    sandbox = options.sandbox or "read-only"
+    args = ["chat", "--no-interactive"]
+    if options.dangerous or sandbox == "danger-full-access":
+        args.append("--trust-all-tools")
+    else:
+        trusted_tools = ["read", "glob", "grep"]
+        if options.search:
+            trusted_tools.extend(["web_search", "web_fetch"])
+        if options.full_auto or sandbox != "read-only":
+            trusted_tools.extend(["write", "shell"])
+        args.extend(["--trust-tools", ",".join(unique_preserve_order(trusted_tools))])
+    args.append(prompt_path.read_text(encoding="utf-8"))
+    return args
+
+
+def build_kiro_resume_args(run: dict[str, Any], exec_mode: bool) -> list[str]:
+    args = [normalize_optional_text(run.get("provider_bin")) or get_provider("kiro").resolved_bin(), "chat", "--resume"]
+    if exec_mode:
+        args.append("--no-interactive")
+    return args
+
+
+def build_kiro_preflight_args(real_bin: str, cwd: Path) -> list[str] | None:
+    del cwd
+    return [real_bin, "whoami"]
+
+
+class ClaudeProvider(ExecProviderAdapter):
+    def __init__(self) -> None:
+        super().__init__(
+            name="claude",
+            session_label="session",
+            bin_env_var="CLAUDE_BIN",
+            default_bin="claude",
+            capabilities=ProviderCapabilities(
+                sandbox_modes=("read-only", "workspace-write", "danger-full-access"),
+                supports_full_auto=True,
+                supports_dangerous=True,
+                supports_model=True,
+                supports_add_dir=True,
+                supports_exec_resume=True,
+            ),
+            notes="Claude Code headless adapter using `claude -p` and `claude -r <session-id>`.",
+            spec=ExecProviderSpec(
+                build_exec_args=build_claude_exec_args,
+                build_resume_args=build_claude_resume_args,
+            ),
+        )
+
+
+class CursorProvider(ExecProviderAdapter):
+    def __init__(self) -> None:
+        super().__init__(
+            name="cursor",
+            session_label="session",
+            bin_env_var="CURSOR_AGENT_BIN",
+            default_bin="cursor-agent",
+            capabilities=ProviderCapabilities(
+                sandbox_modes=("read-only", "workspace-write", "danger-full-access"),
+                supports_full_auto=True,
+                supports_dangerous=True,
+                supports_model=True,
+                supports_exec_resume=True,
+            ),
+            notes="Cursor Agent headless adapter using `cursor-agent -p` and `--resume`.",
+            spec=ExecProviderSpec(
+                build_exec_args=build_cursor_exec_args,
+                build_resume_args=build_cursor_resume_args,
+                build_preflight_args=build_cursor_preflight_args,
+            ),
+        )
+
+
+class KiroProvider(ExecProviderAdapter):
+    def __init__(self) -> None:
+        super().__init__(
+            name="kiro",
+            session_label="session",
+            bin_env_var="KIRO_BIN",
+            default_bin="kiro-cli",
+            capabilities=ProviderCapabilities(
+                sandbox_modes=("read-only", "workspace-write", "danger-full-access"),
+                supports_search=True,
+                supports_full_auto=True,
+                supports_dangerous=True,
+                supports_exec_resume=True,
+            ),
+            notes="Kiro CLI headless adapter using `kiro-cli chat --no-interactive`; resume is directory-scoped.",
+            spec=ExecProviderSpec(
+                build_exec_args=build_kiro_exec_args,
+                build_resume_args=build_kiro_resume_args,
+                build_preflight_args=build_kiro_preflight_args,
+                last_message_mode="stdout_text",
+            ),
+        )
+
+
 PROVIDERS: dict[str, ProviderAdapter] = {
     DEFAULT_PROVIDER: CodexProvider(),
+    "claude": ClaudeProvider(),
+    "cursor": CursorProvider(),
+    "kiro": KiroProvider(),
 }
 
 
+def provider_aliases_for(name: str) -> list[str]:
+    return sorted(alias for alias, canonical in PROVIDER_ALIASES.items() if canonical == name)
+
+
+def normalize_provider_alias(name: str | None) -> str | None:
+    value = normalize_optional_text(name)
+    if value is None:
+        return None
+    lowered = value.lower()
+    return PROVIDER_ALIASES.get(lowered, lowered)
+
+
+def provider_names_for_help() -> str:
+    names = []
+    for name in sorted(PROVIDERS):
+        aliases = provider_aliases_for(name)
+        if aliases:
+            names.append(f"{name} ({', '.join(aliases)})")
+        else:
+            names.append(name)
+    return ", ".join(names)
+
+
 def get_provider(name: str | None) -> ProviderAdapter:
-    provider_name = (name or DEFAULT_PROVIDER).strip().lower()
+    provider_name = normalize_provider_alias(name) or DEFAULT_PROVIDER
     adapter = PROVIDERS.get(provider_name)
     if adapter is None:
-        supported = ", ".join(sorted(PROVIDERS))
+        supported = provider_names_for_help()
         raise RuntimeError(
             f"unsupported provider: {provider_name}. supported providers: {supported}"
         )
     return adapter
+
+
+def validate_provider_name(name: str | None, *, field_name: str = "provider") -> str | None:
+    value = normalize_optional_text(name)
+    if value is None:
+        return None
+    provider_name = normalize_provider_alias(value)
+    try:
+        get_provider(provider_name)
+    except RuntimeError as exc:
+        raise RuntimeError(f"invalid {field_name}: {value}. {exc}") from exc
+    return provider_name
+
+
+def normalize_provider_list(value: Any, field_name: str) -> list[str]:
+    names = []
+    for item in normalize_str_list(value, field_name):
+        normalized = validate_provider_name(item, field_name=field_name)
+        if normalized:
+            names.append(normalized)
+    return unique_preserve_order(names)
 
 
 def provider_for_run(run: dict[str, Any]) -> ProviderAdapter:
@@ -576,6 +992,58 @@ def provider_launch_ready(run: dict[str, Any]) -> tuple[bool, str | None]:
     return ok, note
 
 
+def workspace_preflight_cache_seconds(run: dict[str, Any]) -> int:
+    status = normalize_optional_text(run.get("workspace_preflight_status"))
+    if status == "ok":
+        return provider_preflight_ok_seconds()
+    return provider_preflight_fail_seconds()
+
+
+def worktree_write_preflight(run: dict[str, Any]) -> tuple[bool, str | None]:
+    if not run_requires_workspace_isolation(run):
+        return True, None
+    repo_root = project_git_root_for_run(run)
+    if not repo_root:
+        return False, "workspace-preflight: missing source repo root for worktree setup"
+    common_dir = git_common_dir(repo_root)
+    if not common_dir:
+        return False, f"workspace-preflight: unable to resolve git metadata directory for {repo_root}"
+    probe = common_dir / f".team-leader-write-test-{os.getpid()}-{epoch_now()}"
+    try:
+        probe.write_text("ok\n", encoding="utf-8")
+    except OSError as exc:
+        detail = short_summary(str(exc), max_chars=140)
+        return (
+            False,
+            "workspace-preflight: git metadata not writable "
+            f"at {common_dir} :: {detail}. Writer worktrees and integration commits "
+            "need write access there; under Codex workspace-write this may require escalation.",
+        )
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+    return True, None
+
+
+def workspace_launch_ready(run: dict[str, Any]) -> tuple[bool, str | None]:
+    if not run_requires_workspace_isolation(run):
+        return True, None
+    checked_at = normalize_optional_text(run.get("workspace_preflight_checked_at"))
+    checked_epoch = parse_timestamp_epoch(checked_at)
+    cache_seconds = workspace_preflight_cache_seconds(run)
+    if checked_epoch is not None and epoch_now() - checked_epoch < cache_seconds:
+        status = normalize_optional_text(run.get("workspace_preflight_status"))
+        note = normalize_optional_text(run.get("workspace_preflight_note"))
+        return status != "blocked", note
+    ok, note = worktree_write_preflight(run)
+    run["workspace_preflight_checked_at"] = utc_now()
+    run["workspace_preflight_status"] = "ok" if ok else "blocked"
+    run["workspace_preflight_note"] = note
+    return ok, note
+
+
 def load_index(root: Path) -> dict[str, Any]:
     path = index_path(root)
     if not path.exists():
@@ -612,6 +1080,9 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("queued_seconds", 0)
         run.setdefault("planner_source", None)
         run.setdefault("planner_reason", None)
+        run.setdefault("planner_default_child_provider", None)
+        run.setdefault("planner_default_child_provider_bin", None)
+        run.setdefault("planner_allowed_providers", [])
         run.setdefault("plan_applied_at", None)
         run.setdefault("plan_apply_error", None)
         run.setdefault("planned_run_ids", [])
@@ -626,6 +1097,8 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("integration_note", None)
         run.setdefault("integration_updated_at", None)
         run.setdefault("changed_paths", [])
+        run.setdefault("integration_applied_paths", [])
+        run.setdefault("integration_dropped_paths", [])
         run.setdefault("artifact_sizes", {})
         run.setdefault("output_warnings", [])
         run.setdefault("last_message_truncated", False)
@@ -636,6 +1109,9 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("provider_preflight_status", None)
         run.setdefault("provider_preflight_checked_at", None)
         run.setdefault("provider_preflight_note", None)
+        run.setdefault("workspace_preflight_status", None)
+        run.setdefault("workspace_preflight_checked_at", None)
+        run.setdefault("workspace_preflight_note", None)
         run.setdefault("compacted_at", None)
         run.setdefault("compaction_reason", None)
         run.setdefault("compaction_removed", [])
@@ -727,7 +1203,7 @@ def write_text(path: Path, content: str) -> None:
 
 def child_prompt_guard(prompt_text: str) -> str:
     lines = [
-        "You are a child Codex session launched by team-leader.",
+        "You are a child CLI session launched by team-leader.",
         "Do not invoke team-leader, do not start nested team-leader-managed sessions, and do not recursively delegate back into this same manager.",
         "If you believe more delegation or replanning is needed, report that need in your response for the parent manager to handle.",
         "",
@@ -744,6 +1220,9 @@ def write_child_cli_guard(run_dir: Path, adapter: ProviderAdapter, real_bin: str
         os.path.basename(adapter.resolved_bin()),
         os.path.basename(real_bin),
     }
+    for candidate in PROVIDERS.values():
+        blocked_names.add(candidate.default_bin)
+        blocked_names.add(os.path.basename(candidate.resolved_bin()))
     script = "\n".join(
         [
             "#!/usr/bin/env bash",
@@ -1000,6 +1479,11 @@ def default_project_brief(project_name: str) -> dict[str, Any]:
         "completion_sentinel": None,
         "max_planner_rounds": 3,
         "max_auto_fix_rounds": 2,
+        "planner_provider": None,
+        "planner_provider_bin": None,
+        "child_provider": None,
+        "child_provider_bin": None,
+        "allowed_providers": [],
         "updated_at": utc_now(),
     }
 
@@ -1052,6 +1536,20 @@ def load_project_brief(project_dir: Path, project_name: str | None = None) -> di
     except (TypeError, ValueError):
         max_auto_fix_rounds = 2
     brief["max_auto_fix_rounds"] = max(0, max_auto_fix_rounds)
+    brief["planner_provider"] = validate_provider_name(
+        normalize_optional_text(payload.get("planner_provider")),
+        field_name="planner_provider",
+    )
+    brief["planner_provider_bin"] = normalize_optional_text(payload.get("planner_provider_bin"))
+    brief["child_provider"] = validate_provider_name(
+        normalize_optional_text(payload.get("child_provider")),
+        field_name="child_provider",
+    )
+    brief["child_provider_bin"] = normalize_optional_text(payload.get("child_provider_bin"))
+    brief["allowed_providers"] = normalize_provider_list(
+        payload.get("allowed_providers"),
+        "allowed_providers",
+    )
     brief["updated_at"] = normalize_optional_text(payload.get("updated_at")) or utc_now()
     return brief
 
@@ -1081,6 +1579,11 @@ def merge_project_brief(
     completion_sentinel: str | None = None,
     max_planner_rounds: int | None = None,
     max_auto_fix_rounds: int | None = None,
+    planner_provider: str | None = None,
+    planner_provider_bin: str | None = None,
+    child_provider: str | None = None,
+    child_provider_bin: str | None = None,
+    allowed_providers: list[str] | None = None,
 ) -> dict[str, Any]:
     brief = dict(existing or default_project_brief(project_name))
     brief["project"] = project_name
@@ -1125,6 +1628,25 @@ def merge_project_brief(
         brief["max_planner_rounds"] = max(1, int(max_planner_rounds))
     if max_auto_fix_rounds is not None:
         brief["max_auto_fix_rounds"] = max(0, int(max_auto_fix_rounds))
+    if planner_provider is not None:
+        brief["planner_provider"] = validate_provider_name(
+            planner_provider,
+            field_name="planner_provider",
+        )
+    if planner_provider_bin is not None:
+        brief["planner_provider_bin"] = normalize_optional_text(planner_provider_bin)
+    if child_provider is not None:
+        brief["child_provider"] = validate_provider_name(
+            child_provider,
+            field_name="child_provider",
+        )
+    if child_provider_bin is not None:
+        brief["child_provider_bin"] = normalize_optional_text(child_provider_bin)
+    if allowed_providers is not None:
+        brief["allowed_providers"] = normalize_provider_list(
+            allowed_providers,
+            "allowed_providers",
+        )
     brief["updated_at"] = utc_now()
     return brief
 
@@ -1141,6 +1663,17 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     completion_sentinel = normalize_optional_text(brief.get("completion_sentinel"))
     max_planner_rounds = brief.get("max_planner_rounds")
     max_auto_fix_rounds = brief.get("max_auto_fix_rounds")
+    planner_provider = validate_provider_name(
+        normalize_optional_text(brief.get("planner_provider")),
+        field_name="planner_provider",
+    )
+    planner_provider_bin = normalize_optional_text(brief.get("planner_provider_bin"))
+    child_provider = validate_provider_name(
+        normalize_optional_text(brief.get("child_provider")),
+        field_name="child_provider",
+    )
+    child_provider_bin = normalize_optional_text(brief.get("child_provider_bin"))
+    allowed_providers = normalize_provider_list(brief.get("allowed_providers"), "allowed_providers")
     lines = [
         f"# {brief.get('project') or 'Project'} Brief",
         "",
@@ -1180,6 +1713,13 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     lines.append(f"- Max planner rounds: `{max_planner_rounds}`")
     lines.append(f"- Max auto-fix rounds: `{max_auto_fix_rounds}`")
     lines.append(f"- Completion sentinel: `{completion_sentinel or '-'}`")
+    lines.append(f"- Planner provider: `{planner_provider or DEFAULT_PROVIDER}`")
+    lines.append(f"- Planner provider bin: `{planner_provider_bin or '-'}`")
+    lines.append(f"- Default child provider: `{child_provider or planner_provider or DEFAULT_PROVIDER}`")
+    lines.append(f"- Default child provider bin: `{child_provider_bin or '-'}`")
+    lines.append(
+        f"- Allowed child providers: {format_inline_list(allowed_providers or sorted(PROVIDERS))}"
+    )
     lines.append(f"- Last message cap: `{max_last_message_bytes()}` bytes")
     lines.append(f"- Session-id scan cap: `{max_jsonl_scan_bytes()}` bytes")
     lines.extend(["", "## Validation Commands", ""])
@@ -1247,6 +1787,7 @@ def render_project_launch_plan(payload: dict[str, Any]) -> str:
             continue
         rows.append(
             [
+                str(item.get("provider") or "-"),
                 str(item.get("task_id") or "-"),
                 short_summary(normalize_optional_text(item.get("summary")), max_chars=48),
                 str(item.get("role") or "-"),
@@ -1257,7 +1798,10 @@ def render_project_launch_plan(payload: dict[str, Any]) -> str:
         )
     lines.extend(
         [
-            markdown_table(["task", "summary", "role", "sandbox", "depends_on", "owned_paths"], rows or [["-", "-", "-", "-", "-", "-"]]),
+            markdown_table(
+                ["provider", "task", "summary", "role", "sandbox", "depends_on", "owned_paths"],
+                rows or [["-", "-", "-", "-", "-", "-", "-"]],
+            ),
             "",
         ]
     )
@@ -1541,6 +2085,8 @@ def prepare_run_workspace(root: Path, run: dict[str, Any]) -> None:
     run["integration_state"] = run.get("integration_state") or "pending"
     run["integration_note"] = None
     run["integration_updated_at"] = utc_now()
+    run["integration_applied_paths"] = []
+    run["integration_dropped_paths"] = []
 
 
 def overlapping_writer_blockers(index: dict[str, Any], run: dict[str, Any]) -> list[str]:
@@ -1570,6 +2116,61 @@ def overlapping_writer_blockers(index: dict[str, Any], run: dict[str, Any]) -> l
     return blockers
 
 
+def mark_integration_state(run: dict[str, Any], state: str, note: str | None) -> None:
+    run["integration_state"] = state
+    run["integration_note"] = note
+    run["integration_updated_at"] = utc_now()
+
+
+def integration_apply_args(paths: list[str]) -> list[str]:
+    args = ["apply", "--3way", "--whitespace=nowarn"]
+    for rel_path in paths:
+        args.append(f"--include={rel_path}")
+    args.append("-")
+    return args
+
+
+def clean_integration_workspace(integration_dir: Path) -> None:
+    git_run(["reset", "--hard", "HEAD"], cwd=integration_dir, check=False)
+    git_run(["clean", "-fd"], cwd=integration_dir, check=False)
+
+
+def git_error_looks_like_write_failure(message: str | None) -> bool:
+    text = (message or "").lower()
+    if not text:
+        return False
+    return any(
+        needle in text
+        for needle in (
+            "index.lock",
+            "permission denied",
+            "operation not permitted",
+            "unable to create",
+            "could not write",
+            "read-only file system",
+        )
+    )
+
+
+def repair_run_integration(root: Path, run: dict[str, Any], *, retry_conflict: bool = False) -> None:
+    if not run_requires_workspace_isolation(run):
+        raise RuntimeError("run does not use an isolated worktree")
+    if str(run.get("status") or "") != "completed":
+        raise RuntimeError("run is not completed yet")
+    state = normalize_optional_text(run.get("integration_state")) or "pending"
+    if state in INTEGRATION_READY_STATES:
+        return
+    if state == "conflict" and not retry_conflict:
+        raise RuntimeError(
+            "integration state is conflict; retry with --retry-conflict after you have manually "
+            "prepared the worktree or integration branch. Not every worktree conflict is safely auto-retryable."
+        )
+    mark_integration_state(run, "pending", "manual retry requested")
+    run["integration_applied_paths"] = []
+    run["integration_dropped_paths"] = []
+    apply_run_to_integration(root, run)
+
+
 def apply_run_to_integration(root: Path, run: dict[str, Any]) -> None:
     if not run_requires_workspace_isolation(run):
         return
@@ -1578,7 +2179,7 @@ def apply_run_to_integration(root: Path, run: dict[str, Any]) -> None:
     integration_state = normalize_optional_text(run.get("integration_state"))
     if integration_state in INTEGRATION_READY_STATES:
         return
-    if integration_state in {"conflict", "scope-violation", "apply-failed", "commit-failed"}:
+    if integration_state in INTEGRATION_ALERT_STATES:
         return
     worktree_path_raw = normalize_optional_text(run.get("worktree_path"))
     base_ref = normalize_optional_text(run.get("workspace_base_ref"))
@@ -1586,34 +2187,51 @@ def apply_run_to_integration(root: Path, run: dict[str, Any]) -> None:
         return
     worktree_path = Path(worktree_path_raw)
     if not worktree_path.exists():
-        run["integration_state"] = "apply-failed"
-        run["integration_note"] = "worktree path is missing"
-        run["integration_updated_at"] = utc_now()
+        mark_integration_state(run, "apply-failed", "worktree path is missing")
         return
-    changed_paths, patch = git_has_tracked_changes(worktree_path, base_ref)
+    try:
+        changed_paths, patch = git_has_tracked_changes(worktree_path, base_ref)
+    except RuntimeError as exc:
+        mark_integration_state(run, "apply-failed", short_summary(str(exc), max_chars=180))
+        return
     run["changed_paths"] = changed_paths
+    run["integration_applied_paths"] = []
+    run["integration_dropped_paths"] = []
     if not patch.strip():
-        run["integration_state"] = "no-changes"
-        run["integration_note"] = "writer completed without diff against the integration base"
-        run["integration_updated_at"] = utc_now()
+        mark_integration_state(run, "no-changes", "writer completed without diff against the integration base")
         return
     owned_paths = relative_owned_paths(run)
-    outside_scope = [path for path in changed_paths if owned_paths and not path_within_owned_paths(path, owned_paths)]
-    if outside_scope:
-        run["integration_state"] = "scope-violation"
-        run["integration_note"] = "changed paths outside declared ownership: " + ", ".join(outside_scope[:6])
-        run["integration_updated_at"] = utc_now()
+    selected_paths = list(changed_paths)
+    outside_scope: list[str] = []
+    if owned_paths:
+        selected_paths = [path for path in changed_paths if path_within_owned_paths(path, owned_paths)]
+        outside_scope = [path for path in changed_paths if path not in selected_paths]
+    run["integration_applied_paths"] = list(selected_paths)
+    run["integration_dropped_paths"] = list(outside_scope)
+    if outside_scope and not selected_paths:
+        mark_integration_state(
+            run,
+            "scope-violation",
+            "all changed paths were outside declared ownership: " + ", ".join(outside_scope[:6]),
+        )
         return
-    integration_dir = ensure_integration_workspace(root, run)
     try:
-        git_run(["apply", "--3way", "--whitespace=nowarn", "-"], cwd=integration_dir, input_text=patch)
+        integration_dir = ensure_integration_workspace(root, run)
+    except RuntimeError as exc:
+        mark_integration_state(run, "apply-failed", short_summary(str(exc), max_chars=180))
+        return
+    clean_integration_workspace(integration_dir)
+    try:
+        git_run(integration_apply_args(selected_paths), cwd=integration_dir, input_text=patch)
     except subprocess.CalledProcessError as exc:
-        run["integration_state"] = "conflict"
-        run["integration_note"] = short_summary(exc.stderr or exc.stdout or "git apply failed", max_chars=180)
-        run["integration_updated_at"] = utc_now()
+        clean_integration_workspace(integration_dir)
+        detail = exc.stderr or exc.stdout or "git apply failed"
+        failure_state = "apply-failed" if git_error_looks_like_write_failure(detail) else "conflict"
+        mark_integration_state(run, failure_state, short_summary(detail, max_chars=180))
         return
     try:
         git_run(["add", "-A"], cwd=integration_dir)
+        commit_prefix = "team-leader integrate subset" if outside_scope else "team-leader integrate"
         git_run(
             [
                 "-c",
@@ -1622,18 +2240,23 @@ def apply_run_to_integration(root: Path, run: dict[str, Any]) -> None:
                 "user.email=team-leader@local",
                 "commit",
                 "-m",
-                f"team-leader integrate {run['run_id']}: {short_summary(normalize_optional_text(run.get('summary')), max_chars=72)}",
+                f"{commit_prefix} {run['run_id']}: {short_summary(normalize_optional_text(run.get('summary')), max_chars=72)}",
             ],
             cwd=integration_dir,
         )
     except subprocess.CalledProcessError as exc:
-        run["integration_state"] = "commit-failed"
-        run["integration_note"] = short_summary(exc.stderr or exc.stdout or "git commit failed", max_chars=180)
-        run["integration_updated_at"] = utc_now()
+        clean_integration_workspace(integration_dir)
+        mark_integration_state(run, "commit-failed", short_summary(exc.stderr or exc.stdout or "git commit failed", max_chars=180))
         return
-    run["integration_state"] = "applied"
-    run["integration_note"] = f"applied into {integration_dir}"
-    run["integration_updated_at"] = utc_now()
+    if outside_scope:
+        mark_integration_state(
+            run,
+            "applied-subset",
+            "applied owned subset into "
+            f"{integration_dir}; dropped out-of-scope paths: {', '.join(outside_scope[:6])}",
+        )
+        return
+    mark_integration_state(run, "applied", f"applied into {integration_dir}")
 
 
 def maybe_integrate_completed_runs(root: Path, index: dict[str, Any]) -> None:
@@ -1806,6 +2429,11 @@ def normalize_plan_item(item: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(prompt, str) or not prompt.strip():
         raise RuntimeError("launch plan item must include a non-empty prompt")
     normalized = {
+        "provider": validate_provider_name(
+            normalize_optional_text(item.get("provider")),
+            field_name="plan provider",
+        ),
+        "provider_bin": normalize_optional_text(item.get("provider_bin")),
         "task_id": normalize_optional_text(item.get("task_id")),
         "name": normalize_optional_text(item.get("name")),
         "role": normalize_optional_text(item.get("role")) or "research",
@@ -2040,6 +2668,13 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
     completion_sentinel = normalize_optional_text(brief.get("completion_sentinel"))
     max_planner_rounds = brief.get("max_planner_rounds")
     max_auto_fix_rounds = brief.get("max_auto_fix_rounds")
+    planner_provider = validate_provider_name(
+        normalize_optional_text(brief.get("planner_provider")),
+        field_name="planner_provider",
+    ) or DEFAULT_PROVIDER
+    default_child_provider = default_child_provider_for_context(brief)
+    default_child_provider_bin = default_child_provider_bin_for_context(brief)
+    allowed_child_providers = allowed_child_providers_for_context(brief)
     previous_workers = [run for run in existing_runs if not run_is_planner(run)]
     validation = load_project_validation(project_dir) or default_project_validation()
     validation_status = normalize_optional_text(validation.get("status")) or "not-run"
@@ -2087,6 +2722,12 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
     lines.append(f"- max_planner_rounds={max_planner_rounds}")
     lines.append(f"- max_auto_fix_rounds={max_auto_fix_rounds}")
     lines.append(f"- completion_sentinel={completion_sentinel or '-'}")
+    lines.extend(["", *provider_policy_lines(
+        allowed_providers=allowed_child_providers,
+        default_child_provider=default_child_provider,
+        default_child_provider_bin=default_child_provider_bin,
+        planner_provider=planner_provider,
+    )])
     lines.extend(["", "Validation commands:"])
     if validation_commands:
         for item in validation_commands:
@@ -2130,6 +2771,9 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             "- First decide whether the brief is clear enough to launch workers safely.",
             "- If the brief is missing key repo/spec context or important constraints, ask at most 3 concise questions under a `Questions For Humans` heading and do not emit a launch plan in the same response.",
             "- Do not invoke team-leader or create nested team-leader-managed sessions from inside this child session.",
+            f"- Only use child providers from this allowed list: {format_inline_list(allowed_child_providers)}.",
+            f"- If a run omits `provider`, the manager will use `{default_child_provider}` by default.",
+            "- Set `provider_bin` only when the user explicitly asked for a non-default executable path.",
             "- Use as few child sessions as necessary.",
             "- Split writers by disjoint file ownership whenever possible.",
             "- Prefer read-only research or review children if write boundaries are unclear.",
@@ -2146,6 +2790,8 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             '  "plan_summary": "one short summary",',
             '  "runs": [',
             "    {",
+            f'      "provider": "{default_child_provider}",',
+            '      "provider_bin": "/optional/custom/provider/path",',
             '      "task_id": "stable-task-id",',
             '      "name": "short-run-name",',
             '      "role": "research|implementation|reviewer|manager",',
@@ -2361,7 +3007,7 @@ def integration_alerts(runs: list[dict[str, Any]]) -> list[dict[str, str]]:
     alerts: list[dict[str, str]] = []
     for run in sorted(runs, key=run_sort_key):
         state = normalize_optional_text(run.get("integration_state"))
-        if not state or state in INTEGRATION_READY_STATES:
+        if state not in INTEGRATION_ALERT_STATES:
             continue
         alerts.append(
             {
@@ -2418,6 +3064,9 @@ def compute_dispatch_state(index: dict[str, Any], run: dict[str, Any]) -> tuple[
         for blocker in overlapping_writer_blockers(index, run)
         if blocker not in blocked_on
     )
+    workspace_ready, workspace_note = workspace_launch_ready(run)
+    if not workspace_ready and workspace_note and workspace_note not in blocked_on:
+        blocked_on.append(workspace_note)
     provider_ready, provider_note = provider_launch_ready(run)
     if not provider_ready and provider_note and provider_note not in blocked_on:
         blocked_on.append(provider_note)
@@ -2519,7 +3168,7 @@ def project_stage_snapshot(
     clarification_mode = normalize_optional_text(brief.get("clarification_mode")) if brief else None
     integration_conflicts = [
         run for run in sorted(runs, key=run_sort_key)
-        if normalize_optional_text(run.get("integration_state")) in {"conflict", "scope-violation", "apply-failed", "commit-failed"}
+        if normalize_optional_text(run.get("integration_state")) in INTEGRATION_ALERT_STATES
     ]
     total = len(runs)
     progress = (
@@ -4231,6 +4880,84 @@ def project_extra_add_dirs(default_cd: Path, brief: dict[str, Any] | None) -> li
     return extras
 
 
+def allowed_child_providers_for_context(
+    brief: dict[str, Any] | None,
+    planner_run: dict[str, Any] | None = None,
+) -> list[str]:
+    providers = []
+    if planner_run is not None:
+        providers = normalize_provider_list(
+            planner_run.get("planner_allowed_providers"),
+            "planner_allowed_providers",
+        )
+    if not providers and brief:
+        providers = normalize_provider_list(brief.get("allowed_providers"), "allowed_providers")
+    return providers or sorted(PROVIDERS)
+
+
+def default_child_provider_for_context(
+    brief: dict[str, Any] | None,
+    planner_run: dict[str, Any] | None = None,
+) -> str:
+    provider_name = None
+    if planner_run is not None:
+        provider_name = validate_provider_name(
+            normalize_optional_text(planner_run.get("planner_default_child_provider")),
+            field_name="planner_default_child_provider",
+        )
+    if provider_name is None and brief:
+        provider_name = validate_provider_name(
+            normalize_optional_text(brief.get("child_provider")),
+            field_name="child_provider",
+        )
+    if provider_name is None and planner_run is not None:
+        provider_name = validate_provider_name(
+            normalize_optional_text(planner_run.get("provider")),
+            field_name="provider",
+        )
+    return provider_name or DEFAULT_PROVIDER
+
+
+def default_child_provider_bin_for_context(
+    brief: dict[str, Any] | None,
+    planner_run: dict[str, Any] | None = None,
+) -> str | None:
+    if planner_run is not None:
+        value = normalize_optional_text(planner_run.get("planner_default_child_provider_bin"))
+        if value:
+            return value
+    if brief:
+        value = normalize_optional_text(brief.get("child_provider_bin"))
+        if value:
+            return value
+    return None
+
+
+def provider_policy_lines(
+    *,
+    allowed_providers: list[str],
+    default_child_provider: str,
+    default_child_provider_bin: str | None,
+    planner_provider: str,
+) -> list[str]:
+    lines = [
+        "Child CLI policy:",
+        f"- planner_provider={planner_provider}",
+        f"- default_child_provider={default_child_provider}",
+        f"- default_child_provider_bin={default_child_provider_bin or '-'}",
+        f"- allowed_child_providers={format_inline_list(allowed_providers)}",
+        "",
+        "Available providers:",
+    ]
+    for name in allowed_providers:
+        adapter = get_provider(name)
+        sandboxes = ",".join(adapter.capabilities.sandbox_modes) or "-"
+        lines.append(
+            f"- {name}: sandboxes={sandboxes} session_label={adapter.session_label} notes={adapter.notes}"
+        )
+    return lines
+
+
 def dispatch_options_from_plan_item(
     item: dict[str, Any],
     *,
@@ -4248,8 +4975,25 @@ def dispatch_options_from_plan_item(
     add_dirs.extend(resolve_path(path) for path in normalize_str_list(planner_run.get("add_dirs"), "add_dirs"))
     add_dirs = [path for idx, path in enumerate(add_dirs) if path not in add_dirs[:idx]]
     sandbox = infer_plan_sandbox(item)
+    default_child_provider = default_child_provider_for_context(brief, planner_run)
+    allowed_child_providers = allowed_child_providers_for_context(brief, planner_run)
+    provider_name = (
+        validate_provider_name(normalize_optional_text(item.get("provider")), field_name="plan provider")
+        or default_child_provider
+    )
+    if provider_name not in allowed_child_providers:
+        allowed = ", ".join(allowed_child_providers)
+        raise RuntimeError(
+            f"launch plan selected disallowed provider {provider_name!r}; allowed providers: {allowed}"
+        )
+    provider_bin = normalize_optional_text(item.get("provider_bin"))
+    if provider_bin is None and provider_name == default_child_provider:
+        provider_bin = default_child_provider_bin_for_context(brief, planner_run)
+    if provider_bin is None and provider_name == str(planner_run.get("provider") or DEFAULT_PROVIDER):
+        provider_bin = normalize_optional_text(planner_run.get("provider_bin"))
     return DispatchOptions(
-        provider=str(planner_run.get("provider") or DEFAULT_PROVIDER),
+        provider=provider_name,
+        provider_bin=provider_bin,
         name=normalize_optional_text(item.get("name")) or normalize_optional_text(item.get("task_id")),
         project=project_name,
         task_id=normalize_optional_text(item.get("task_id")),
@@ -4300,15 +5044,31 @@ def apply_planner_run(root: Path, index: dict[str, Any], run: dict[str, Any]) ->
     planned_ids: list[str] = []
     existing_task_ids = {normalize_optional_text(item.get("task_id")) for item in index["runs"]}
     normalized_runs: list[dict[str, Any]] = []
-    for item in plan["runs"]:
-        normalized_runs.append(dict(item))
-        task_id = normalize_optional_text(item.get("task_id"))
-        if task_id and task_id in existing_task_ids:
-            continue
-        options = dispatch_options_from_plan_item(item, project_name=project_name, brief=brief, planner_run=run)
-        child = materialize_run(root, index, options, announce=False)
-        planned_ids.append(str(child["run_id"]))
-        existing_task_ids.add(normalize_optional_text(child.get("task_id")))
+    try:
+        for item in plan["runs"]:
+            normalized_runs.append(dict(item))
+            task_id = normalize_optional_text(item.get("task_id"))
+            if task_id and task_id in existing_task_ids:
+                continue
+            options = dispatch_options_from_plan_item(item, project_name=project_name, brief=brief, planner_run=run)
+            child = materialize_run(root, index, options, announce=False)
+            planned_ids.append(str(child["run_id"]))
+            existing_task_ids.add(normalize_optional_text(child.get("task_id")))
+    except RuntimeError as exc:
+        run["plan_applied_at"] = None
+        run["plan_apply_error"] = short_summary(str(exc), max_chars=180)
+        run["planned_run_ids"] = planned_ids
+        save_project_launch_plan(
+            project_dir,
+            {
+                "source_run_id": run["run_id"],
+                "plan_summary": plan["plan_summary"],
+                "runs": normalized_runs,
+                "applied_at": None,
+                "updated_at": utc_now(),
+            },
+        )
+        return planned_ids
     run["plan_applied_at"] = utc_now()
     run["plan_apply_error"] = None
     run["planned_run_ids"] = planned_ids
@@ -4392,8 +5152,13 @@ def spawn_planner_run(
 ) -> dict[str, Any]:
     runs = project_runs(index, project_name)
     project_cd = project_default_cwd(brief)
+    planner_provider = validate_provider_name(
+        normalize_optional_text(brief.get("planner_provider")),
+        field_name="planner_provider",
+    ) or DEFAULT_PROVIDER
     planner_options = DispatchOptions(
-        provider=DEFAULT_PROVIDER,
+        provider=planner_provider,
+        provider_bin=normalize_optional_text(brief.get("planner_provider_bin")),
         name=next_planner_task_id(runs),
         project=project_name,
         task_id=next_planner_task_id(runs),
@@ -4423,7 +5188,13 @@ def spawn_planner_run(
         index,
         planner_options,
         announce=False,
-        extra_fields={"planner_source": PLANNER_SOURCE, "planner_reason": planner_reason},
+        extra_fields={
+            "planner_source": PLANNER_SOURCE,
+            "planner_reason": planner_reason,
+            "planner_default_child_provider": default_child_provider_for_context(brief),
+            "planner_default_child_provider_bin": default_child_provider_bin_for_context(brief),
+            "planner_allowed_providers": allowed_child_providers_for_context(brief),
+        },
     )
 
 
@@ -4708,7 +5479,12 @@ def monitor_state(root: Path) -> tuple[str, str | None]:
 
 def start_run_process(run: dict[str, Any]) -> None:
     root = Path(run["run_dir"]).parent.parent
-    prepare_run_workspace(root, run)
+    try:
+        prepare_run_workspace(root, run)
+    except RuntimeError as exc:
+        run["status"] = "blocked"
+        set_run_dispatch_state(run, "blocked", [f"workspace-setup:{short_summary(str(exc), max_chars=140)}"])
+        return
     refresh_runner_for_run(run)
     stdout_path = Path(run["stdout_path"])
     stderr_path = Path(run["stderr_log"])
@@ -4813,6 +5589,8 @@ def refresh_run(run: dict[str, Any]) -> None:
         session_id = provider_for_run(run).detect_session_id(run)
         if session_id:
             set_session_id(run, session_id)
+    if run_has_provider_artifacts(run):
+        provider_for_run(run).write_last_message(run)
     refresh_run_artifacts(run)
 
 
@@ -4872,6 +5650,7 @@ def dispatch_options_for_run(run: dict[str, Any]) -> DispatchOptions:
     prompt_text = read_text_if_exists(Path(run["prompt_path"])) or ""
     return DispatchOptions(
         provider=str(run.get("provider") or DEFAULT_PROVIDER),
+        provider_bin=normalize_optional_text(run.get("provider_bin")),
         name=normalize_optional_text(run.get("name")),
         project=normalize_optional_text(run.get("project")),
         task_id=normalize_optional_text(run.get("task_id")),
@@ -5005,6 +5784,55 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_provider_bin_overrides(items: list[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for raw in items:
+        if "=" not in raw:
+            raise RuntimeError("provider bin overrides must use provider=path format")
+        provider_raw, path_raw = raw.split("=", 1)
+        provider_name = validate_provider_name(provider_raw, field_name="provider bin override")
+        if provider_name is None:
+            raise RuntimeError("provider bin override is missing provider name")
+        path_text = path_raw.strip()
+        if not path_text:
+            raise RuntimeError(f"provider bin override for {provider_name} is missing a path")
+        overrides[provider_name] = path_text
+    return overrides
+
+
+def provider_check_record(
+    provider_name: str,
+    *,
+    cwd: Path,
+    provider_bin: str | None = None,
+) -> dict[str, Any]:
+    adapter = get_provider(provider_name)
+    raw_bin = provider_bin or adapter.resolved_bin()
+    resolved_bin: str | None = None
+    try:
+        resolved_bin = resolve_executable(raw_bin, cwd=cwd)
+    except RuntimeError:
+        resolved_bin = None
+    ok, note = adapter.launch_preflight(
+        {
+            "provider": provider_name,
+            "provider_bin": raw_bin,
+            "cwd": str(cwd),
+            "source_cwd": str(cwd),
+        }
+    )
+    return {
+        "provider": provider_name,
+        "provider_bin": raw_bin,
+        "resolved_bin": resolved_bin,
+        "status": "ok" if ok else "blocked",
+        "note": note,
+        "notes": adapter.notes,
+        "session_label": adapter.session_label,
+        "supported_sandbox_modes": list(adapter.capabilities.sandbox_modes),
+    }
+
+
 def cmd_providers(args: argparse.Namespace) -> int:
     payload = []
     for name in sorted(PROVIDERS):
@@ -5018,12 +5846,209 @@ def cmd_providers(args: argparse.Namespace) -> int:
     for record in payload:
         suffix = " (default)" if record["default"] else ""
         sandboxes = ",".join(record["supported_sandbox_modes"]) or "-"
+        aliases = ",".join(record.get("aliases") or []) or "-"
         print(
             f"{record['name']}{suffix}: session_label={record['session_label']} "
             f"bin_env={record['bin_env_var']} default_bin={record['default_bin']} "
-            f"sandboxes={sandboxes} exec_resume={str(record['supports_exec_resume']).lower()}"
+            f"sandboxes={sandboxes} exec_resume={str(record['supports_exec_resume']).lower()} "
+            f"aliases={aliases} notes={record['notes']}"
         )
     return 0
+
+
+def cmd_provider_check(args: argparse.Namespace) -> int:
+    cwd = resolve_path(args.cd) if args.cd else Path.cwd()
+    overrides = parse_provider_bin_overrides(list(args.bin))
+    provider_names = (
+        [validate_provider_name(name, field_name="provider") for name in args.provider]
+        if args.provider
+        else sorted(PROVIDERS)
+    )
+    payload = [
+        provider_check_record(name, cwd=cwd, provider_bin=overrides.get(name))
+        for name in provider_names
+    ]
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+        return 0 if all(item["status"] == "ok" for item in payload) else 1
+    for item in payload:
+        sandboxes = ",".join(item["supported_sandbox_modes"]) or "-"
+        print(
+            f"{item['provider']}: status={item['status']} "
+            f"bin={item['provider_bin']} resolved={item['resolved_bin'] or '-'} "
+            f"session_label={item['session_label']} sandboxes={sandboxes} "
+            f"note={item['note'] or 'ok'}"
+        )
+    return 0 if all(item["status"] == "ok" for item in payload) else 1
+
+
+def default_smoke_prompt(expected_text: str) -> str:
+    return (
+        "Reply with exactly the following text and nothing else:\n\n"
+        f"{expected_text}\n"
+    )
+
+
+def smoke_test_options(
+    *,
+    provider_name: str,
+    provider_bin: str | None,
+    cwd: Path,
+    prompt_text: str,
+    sandbox: str,
+) -> DispatchOptions:
+    return DispatchOptions(
+        provider=provider_name,
+        provider_bin=provider_bin,
+        name=f"smoke-{provider_name}",
+        project=None,
+        task_id=None,
+        role="reviewer",
+        summary=derive_summary(prompt_text),
+        prompt_text=prompt_text,
+        cd=cwd,
+        sandbox=sandbox,
+        model=None,
+        profile=None,
+        add_dirs=[],
+        configs=[],
+        enables=[],
+        disables=[],
+        images=[],
+        search=False,
+        skip_git_repo_check=False,
+        ephemeral=False,
+        full_auto=False,
+        dangerous=False,
+        dry_run=False,
+        owned_paths=[],
+        depends_on=[],
+    )
+
+
+def wait_for_run_settle(
+    *,
+    root: Path,
+    run_id: str,
+    timeout_seconds: int,
+    poll_interval_seconds: float = 1.0,
+) -> tuple[dict[str, Any], bool]:
+    deadline = time.time() + max(1, timeout_seconds)
+    last_run: dict[str, Any] | None = None
+    while True:
+        with root_lock(root):
+            index = load_index(root)
+            refresh_index_state(root, index)
+            run = resolve_run(index, run_id)
+            last_run = dict(run)
+        status = str(last_run.get("status") or "")
+        dispatch_state = str(last_run.get("dispatch_state") or "")
+        if status in TERMINAL_STATUSES or dispatch_state == "blocked":
+            return last_run, False
+        if time.time() >= deadline:
+            return last_run, True
+        time.sleep(max(0.2, poll_interval_seconds))
+
+
+def smoke_test_payload(
+    *,
+    root: Path,
+    run: dict[str, Any],
+    provider_check: dict[str, Any],
+    expected_text: str | None,
+    timed_out: bool,
+) -> dict[str, Any]:
+    last_message = normalize_optional_text(last_message_for_run(run))
+    expected = normalize_optional_text(expected_text)
+    matched = expected is None or last_message == expected
+    status = str(run.get("status") or "")
+    success = (not timed_out) and status == "completed" and matched
+    return {
+        "provider": str(run.get("provider") or provider_check.get("provider") or ""),
+        "success": success,
+        "timed_out": timed_out,
+        "root": str(root),
+        "provider_check": provider_check,
+        "run_id": str(run["run_id"]),
+        "status": status,
+        "dispatch_state": str(run.get("dispatch_state") or ""),
+        "exit_code": run.get("exit_code"),
+        "session_id": get_session_id(run),
+        "expected_text": expected,
+        "matched_expected_text": matched,
+        "last_message": last_message,
+    }
+
+
+def cmd_provider_smoke_test(args: argparse.Namespace) -> int:
+    provider_name = validate_provider_name(args.provider, field_name="provider") or DEFAULT_PROVIDER
+    cwd = resolve_path(args.cd) if args.cd else Path.cwd()
+    root = resolve_path(args.root) if args.root else Path(tempfile.mkdtemp(prefix=f"team-leader-smoke-{provider_name}-"))
+    provider_bin = normalize_optional_text(args.provider_bin)
+    provider_check = provider_check_record(provider_name, cwd=cwd, provider_bin=provider_bin)
+    if provider_check["status"] != "ok":
+        payload = {
+            "provider": provider_name,
+            "success": False,
+            "timed_out": False,
+            "root": str(root),
+            "provider_check": provider_check,
+            "run_id": None,
+            "status": "preflight-blocked",
+            "dispatch_state": "blocked",
+            "exit_code": None,
+            "session_id": None,
+            "expected_text": normalize_optional_text(args.expect_text),
+            "matched_expected_text": False,
+            "last_message": None,
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+        else:
+            print(
+                f"{provider_name}: smoke_test=false status=preflight-blocked "
+                f"root={root} note={provider_check['note'] or 'preflight blocked'}"
+            )
+        return 1
+    prompt_text = args.prompt or default_smoke_prompt(args.expect_text)
+    options = smoke_test_options(
+        provider_name=provider_name,
+        provider_bin=provider_bin,
+        cwd=cwd,
+        prompt_text=prompt_text,
+        sandbox=args.sandbox,
+    )
+    with root_lock(root):
+        index = load_index(root)
+        run = materialize_run(root, index, options, announce=False)
+    settled_run, timed_out = wait_for_run_settle(
+        root=root,
+        run_id=str(run["run_id"]),
+        timeout_seconds=args.timeout,
+        poll_interval_seconds=max(0.2, float(args.poll_interval)),
+    )
+    payload = smoke_test_payload(
+        root=root,
+        run=settled_run,
+        provider_check=provider_check,
+        expected_text=args.expect_text,
+        timed_out=timed_out,
+    )
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(
+            f"{provider_name}: smoke_test={str(payload['success']).lower()} "
+            f"status={payload['status']} exit={payload['exit_code'] if payload['exit_code'] is not None else '-'} "
+            f"session={payload['session_id'] or '-'} root={root}"
+        )
+        if payload["last_message"]:
+            print(payload["last_message"])
+    if payload["success"]:
+        return 0
+    if payload["timed_out"]:
+        return 124
+    return 1
 
 
 def cmd_intake(args: argparse.Namespace) -> int:
@@ -5046,6 +6071,11 @@ def cmd_intake(args: argparse.Namespace) -> int:
             completion_sentinel=normalize_optional_text(args.completion_sentinel),
             max_planner_rounds=args.max_planner_rounds,
             max_auto_fix_rounds=args.max_auto_fix_rounds,
+            planner_provider=normalize_optional_text(args.planner_provider),
+            planner_provider_bin=normalize_optional_text(args.planner_provider_bin),
+            child_provider=normalize_optional_text(args.child_provider),
+            child_provider_bin=normalize_optional_text(args.child_provider_bin),
+            allowed_providers=list(args.allow_provider) if args.allow_provider else None,
         )
         if not normalize_optional_text(brief.get("goal")):
             raise RuntimeError("project brief still has no goal; provide --goal")
@@ -5078,6 +6108,11 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
             completion_sentinel=normalize_optional_text(args.completion_sentinel),
             max_planner_rounds=args.max_planner_rounds,
             max_auto_fix_rounds=args.max_auto_fix_rounds,
+            planner_provider=normalize_optional_text(args.planner_provider),
+            planner_provider_bin=normalize_optional_text(args.planner_provider_bin),
+            child_provider=normalize_optional_text(args.child_provider),
+            child_provider_bin=normalize_optional_text(args.child_provider_bin),
+            allowed_providers=list(args.allow_provider) if args.allow_provider else None,
         )
         if not normalize_optional_text(brief.get("goal")):
             raise RuntimeError("project brief still has no goal; provide --goal")
@@ -5116,8 +6151,21 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
         add_dirs.extend(resolve_path(path) for path in args.add_dir)
         add_dirs = [path for idx, path in enumerate(add_dirs) if path not in add_dirs[:idx]]
         planner_task_id = next_planner_task_id(runs)
+        planner_provider = (
+            validate_provider_name(normalize_optional_text(args.provider), field_name="provider")
+            or validate_provider_name(normalize_optional_text(brief.get("planner_provider")), field_name="planner_provider")
+            or DEFAULT_PROVIDER
+        )
+        planner_provider_bin = normalize_optional_text(args.provider_bin) or normalize_optional_text(brief.get("planner_provider_bin"))
+        default_child_provider = (
+            validate_provider_name(normalize_optional_text(brief.get("child_provider")), field_name="child_provider")
+            or planner_provider
+        )
+        default_child_provider_bin = normalize_optional_text(brief.get("child_provider_bin"))
+        allowed_child_providers = normalize_provider_list(brief.get("allowed_providers"), "allowed_providers")
         planner_options = DispatchOptions(
-            provider=args.provider,
+            provider=planner_provider,
+            provider_bin=planner_provider_bin,
             name=planner_task_id,
             project=project_name,
             task_id=planner_task_id,
@@ -5146,7 +6194,13 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
             root,
             index,
             planner_options,
-            extra_fields={"planner_source": PLANNER_SOURCE, "planner_reason": "manual-orchestrate"},
+            extra_fields={
+                "planner_source": PLANNER_SOURCE,
+                "planner_reason": "manual-orchestrate",
+                "planner_default_child_provider": default_child_provider,
+                "planner_default_child_provider_bin": default_child_provider_bin,
+                "planner_allowed_providers": allowed_child_providers,
+            },
         )
     return 0
 
@@ -5196,7 +6250,7 @@ def materialize_run(
         last_message_path=last_message_path,
         options=options,
     )
-    provider_bin_raw = adapter.resolved_bin()
+    provider_bin_raw = options.provider_bin or adapter.resolved_bin()
     real_provider_bin = resolve_executable(provider_bin_raw, cwd=options.cd)
     command[0] = real_provider_bin
     guard_dir = write_child_cli_guard(run_dir, adapter, real_provider_bin)
@@ -5283,6 +6337,11 @@ def materialize_run(
         "integration_note": None,
         "integration_updated_at": None,
         "changed_paths": [],
+        "integration_applied_paths": [],
+        "integration_dropped_paths": [],
+        "workspace_preflight_status": None,
+        "workspace_preflight_checked_at": None,
+        "workspace_preflight_note": None,
     }
     if extra_fields:
         run.update(extra_fields)
@@ -5313,7 +6372,8 @@ def parse_prompt(args: argparse.Namespace) -> str:
 def common_dispatch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "options": DispatchOptions(
-            provider=args.provider,
+            provider=validate_provider_name(args.provider, field_name="provider") or DEFAULT_PROVIDER,
+            provider_bin=normalize_optional_text(getattr(args, "provider_bin", None)),
             name=args.name,
             project=normalize_optional_text(args.project),
             task_id=normalize_optional_text(args.task_id),
@@ -5395,6 +6455,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
             temp_args.prompt = prompt
             temp_args.prompt_file = prompt_file
             temp_args.provider = spec.get("provider", args.provider)
+            temp_args.provider_bin = spec.get("provider_bin", getattr(args, "provider_bin", None))
             temp_args.cd = spec.get("cd", args.cd)
             temp_args.sandbox = spec.get("sandbox", args.sandbox)
             temp_args.model = spec.get("model", args.model)
@@ -5637,6 +6698,18 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_repair_integration(args: argparse.Namespace) -> int:
+    root = resolve_path(args.root) if args.root else default_root()
+    with root_lock(root):
+        index = load_index(root)
+        run = resolve_run(index, args.run)
+        refresh_run(run)
+        repair_run_integration(root, run, retry_conflict=bool(args.retry_conflict))
+        save_index_and_sync(root, index)
+    print_run_summary(run)
+    return 0
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     root = resolve_path(args.root) if args.root else default_root()
     with root_lock(root):
@@ -5717,10 +6790,11 @@ def add_common_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
     parser.add_argument(
         "--provider",
-        choices=sorted(PROVIDERS),
         default=DEFAULT_PROVIDER,
-        help="CLI provider adapter. Currently codex is implemented; the control plane is shaped for future providers.",
+        metavar="PROVIDER",
+        help=f"CLI provider adapter for this run. Supported names: {provider_names_for_help()}",
     )
+    parser.add_argument("--provider-bin", help="Executable override for the selected provider")
     parser.add_argument("--name", help="Human-friendly run label")
     parser.add_argument("--project", help="Project name for automatic markdown aggregation and dashboards")
     parser.add_argument("--task-id", help="Stable task id inside the project workspace")
@@ -5772,16 +6846,36 @@ def add_project_capture_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--completion-sentinel", help="Text marker that indicates delivery is complete when found in child output")
     parser.add_argument("--max-planner-rounds", type=int, help="Maximum number of manager planning rounds before stopping")
     parser.add_argument("--max-auto-fix-rounds", type=int, help="Maximum automatic validation-fix or recovery planning rounds")
+    parser.add_argument(
+        "--planner-provider",
+        metavar="PROVIDER",
+        help=f"Provider to use for future planner runs for this project. Supported names: {provider_names_for_help()}",
+    )
+    parser.add_argument("--planner-provider-bin", help="Executable override for the planner provider")
+    parser.add_argument(
+        "--child-provider",
+        metavar="PROVIDER",
+        help=f"Default provider for child runs launched from planner output. Supported names: {provider_names_for_help()}",
+    )
+    parser.add_argument("--child-provider-bin", help="Executable override for the default child provider")
+    parser.add_argument(
+        "--allow-provider",
+        action="append",
+        metavar="PROVIDER",
+        default=[],
+        help=f"Limit planner-produced child runs to these providers. Supported names: {provider_names_for_help()}",
+    )
 
 
 def add_orchestrate_options(parser: argparse.ArgumentParser) -> None:
     add_project_capture_options(parser)
     parser.add_argument(
         "--provider",
-        choices=sorted(PROVIDERS),
-        default=DEFAULT_PROVIDER,
-        help="CLI provider adapter to use for the manager planner child",
+        default=None,
+        metavar="PROVIDER",
+        help=f"CLI provider adapter to use for the manager planner child. Supported names: {provider_names_for_help()}",
     )
+    parser.add_argument("--provider-bin", help="Executable override for the planner child provider")
     parser.add_argument("--cd", help="Working directory for the planner child")
     parser.add_argument("--sandbox", help="Sandbox mode for the planner child")
     parser.add_argument("--model", help="Provider model override")
@@ -5801,7 +6895,7 @@ def add_orchestrate_options(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manage real child sessions as subsessions, with a Codex provider implemented first.",
+        description="Manage real child CLI sessions as subsessions through a provider adapter layer.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -5812,6 +6906,36 @@ def build_parser() -> argparse.ArgumentParser:
     providers_p = sub.add_parser("providers", help="List supported provider adapters")
     providers_p.add_argument("--json", action="store_true", help="Print provider metadata as JSON")
     providers_p.set_defaults(func=cmd_providers)
+
+    provider_check_p = sub.add_parser("provider-check", help="Validate provider executables and basic CLI readiness")
+    provider_check_p.add_argument(
+        "--provider",
+        action="append",
+        metavar="PROVIDER",
+        help=f"Provider to check (repeatable; default: all). Supported names: {provider_names_for_help()}",
+    )
+    provider_check_p.add_argument("--bin", action="append", default=[], help="Override executable using provider=path")
+    provider_check_p.add_argument("--cd", help="Working directory used for relative executable paths")
+    provider_check_p.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    provider_check_p.set_defaults(func=cmd_provider_check)
+
+    provider_smoke_p = sub.add_parser("provider-smoke-test", help="Launch one real child run and wait for a terminal smoke-test result")
+    provider_smoke_p.add_argument(
+        "--provider",
+        required=True,
+        metavar="PROVIDER",
+        help=f"Provider to validate end to end. Supported names: {provider_names_for_help()}",
+    )
+    provider_smoke_p.add_argument("--provider-bin", help="Executable override for the selected provider")
+    provider_smoke_p.add_argument("--root", help="Controller root used for the smoke-test run (default: a fresh temp directory)")
+    provider_smoke_p.add_argument("--cd", help="Working directory for the child run")
+    provider_smoke_p.add_argument("--sandbox", default="read-only", help="Sandbox mode for the child run")
+    provider_smoke_p.add_argument("--prompt", help="Explicit smoke-test prompt to send instead of the default exact-text prompt")
+    provider_smoke_p.add_argument("--expect-text", default="OK", help="Exact text expected in the final last_message")
+    provider_smoke_p.add_argument("--timeout", type=int, default=60, help="Maximum seconds to wait for a terminal result")
+    provider_smoke_p.add_argument("--poll-interval", type=float, default=1.0, help="Polling interval in seconds while waiting")
+    provider_smoke_p.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    provider_smoke_p.set_defaults(func=cmd_provider_smoke_test)
 
     intake_p = sub.add_parser("intake", help="Record or update a project brief from goal, paths, and notes")
     add_project_capture_options(intake_p)
@@ -5901,6 +7025,16 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_p.add_argument("run", nargs="?", help="Optional run id or unique prefix")
     reconcile_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
     reconcile_p.set_defaults(func=cmd_reconcile)
+
+    repair_integration_p = sub.add_parser("repair-integration", help="Retry one run's integration after a failed or manual-review state")
+    repair_integration_p.add_argument("run", help="Run id or unique prefix")
+    repair_integration_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
+    repair_integration_p.add_argument(
+        "--retry-conflict",
+        action="store_true",
+        help="Allow retrying a run currently in `conflict`; use this only after manual cleanup because not every worktree conflict is safely retryable",
+    )
+    repair_integration_p.set_defaults(func=cmd_repair_integration)
 
     cancel_p = sub.add_parser("cancel", help="Cancel a running child session")
     cancel_p.add_argument("run", help="Run id or unique prefix")

@@ -12,7 +12,7 @@
       "depends_on": [
         "plan-approved"
       ],
-      "provider": "codex",
+      "provider": "claude",
       "name": "schema-audit",
       "sandbox": "read-only",
       "full_auto": true,
@@ -29,7 +29,7 @@
       "depends_on": [
         "schema-audit"
       ],
-      "provider": "codex",
+      "provider": "cursor",
       "name": "ui-owner",
       "sandbox": "workspace-write",
       "full_auto": true,
