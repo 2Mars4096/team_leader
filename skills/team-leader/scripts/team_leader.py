@@ -46,6 +46,8 @@ DEFAULT_MAX_RELEASES_PER_CYCLE = 2
 DEFAULT_RELEASE_WINDOW_SECONDS = 15
 DEFAULT_LAST_MESSAGE_BYTES = 128 * 1024
 DEFAULT_JSONL_SCAN_BYTES = 8 * 1024 * 1024
+DEFAULT_RUN_HEARTBEAT_INTERVAL_SECONDS = 10
+DEFAULT_RUN_HEARTBEAT_STALE_SECONDS = 45
 STDOUT_WARNING_BYTES = 8 * 1024 * 1024
 STDERR_WARNING_BYTES = 4 * 1024 * 1024
 CODEX_BACKEND_HOST = "chatgpt.com"
@@ -65,6 +67,7 @@ RUN_COMPACT_FILE_NAMES = (
     "command.txt",
     "exit_code.txt",
     "finished_at.txt",
+    "heartbeat.txt",
     "prompt.md",
     "runner.sh",
     "started_at.txt",
@@ -1103,6 +1106,11 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("output_warnings", [])
         run.setdefault("last_message_truncated", False)
         run.setdefault("last_message_original_bytes", None)
+        run.setdefault("heartbeat_path", str(Path(run["run_dir"]) / "heartbeat.txt"))
+        run.setdefault("heartbeat_at", None)
+        run.setdefault("heartbeat_lag_seconds", None)
+        run.setdefault("runtime_health", None)
+        run.setdefault("runtime_health_note", None)
         run.setdefault("question_records", [])
         run.setdefault("question_source_bytes", None)
         run.setdefault("question_source_mtime_ns", None)
@@ -1287,6 +1295,27 @@ def max_jsonl_scan_bytes() -> int:
         return max(131072, int(raw))
     except ValueError:
         return DEFAULT_JSONL_SCAN_BYTES
+
+
+def run_heartbeat_interval_seconds() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_RUN_HEARTBEAT_INTERVAL_SECONDS"))
+    if raw is None:
+        return DEFAULT_RUN_HEARTBEAT_INTERVAL_SECONDS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_RUN_HEARTBEAT_INTERVAL_SECONDS
+
+
+def run_heartbeat_stale_seconds() -> int:
+    fallback = max(DEFAULT_RUN_HEARTBEAT_STALE_SECONDS, run_heartbeat_interval_seconds() * 3)
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_RUN_HEARTBEAT_STALE_SECONDS"))
+    if raw is None:
+        return fallback
+    try:
+        return max(run_heartbeat_interval_seconds() + 2, int(raw))
+    except ValueError:
+        return fallback
 
 
 def provider_preflight_ok_seconds() -> int:
@@ -5333,6 +5362,11 @@ def refresh_run_artifacts(run: dict[str, Any]) -> None:
         warnings.append(f"stdout_jsonl_large:{artifact_sizes['stdout_jsonl']}")
     if artifact_sizes.get("stderr_log", 0) >= STDERR_WARNING_BYTES:
         warnings.append(f"stderr_log_large:{artifact_sizes['stderr_log']}")
+    runtime_health = normalize_optional_text(run.get("runtime_health"))
+    if runtime_health == "heartbeat-missing":
+        warnings.append("heartbeat_missing")
+    elif runtime_health == "heartbeat-stale":
+        warnings.append("heartbeat_stale")
     run["artifact_sizes"] = artifact_sizes
     run["output_warnings"] = unique_preserve_order(warnings)
 
@@ -5418,6 +5452,31 @@ def pid_alive(pid: int | None) -> bool:
         return True
     except OSError:
         return False
+
+
+def run_heartbeat_path(run: dict[str, Any]) -> Path:
+    raw = normalize_optional_text(run.get("heartbeat_path"))
+    if raw:
+        return Path(raw)
+    return Path(run["run_dir"]) / "heartbeat.txt"
+
+
+def run_runtime_health(run: dict[str, Any], *, now_epoch: int | None = None) -> tuple[str | None, str | None, int | None]:
+    if str(run.get("status") or "") != "running":
+        return None, None, None
+    current_epoch = now_epoch or epoch_now()
+    heartbeat_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("heartbeat_at")))
+    launched_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("launched_at")))
+    stale_after = run_heartbeat_stale_seconds()
+    baseline_epoch = heartbeat_epoch or launched_epoch
+    lag_seconds = None if baseline_epoch is None else max(0, current_epoch - baseline_epoch)
+    if heartbeat_epoch is not None:
+        if lag_seconds is not None and lag_seconds > stale_after:
+            return "heartbeat-stale", f"last heartbeat {lag_seconds}s ago", lag_seconds
+        return "healthy", "heartbeat active", lag_seconds
+    if launched_epoch is not None and lag_seconds is not None and lag_seconds > stale_after:
+        return "heartbeat-missing", f"no heartbeat observed for {lag_seconds}s after launch", lag_seconds
+    return "healthy", "within heartbeat grace window", lag_seconds
 
 
 def monitor_pid_path(root: Path) -> Path:
@@ -5566,6 +5625,7 @@ def refresh_run(run: dict[str, Any]) -> None:
     state = read_text_if_exists(run_dir / "state.txt")
     exit_code = read_text_if_exists(run_dir / "exit_code.txt")
     finished_at = read_text_if_exists(run_dir / "finished_at.txt")
+    heartbeat_at = read_text_if_exists(run_heartbeat_path(run))
     if state:
         run["status"] = state.strip()
         if str(run.get("status") or "") in TERMINAL_STATUSES:
@@ -5579,12 +5639,17 @@ def refresh_run(run: dict[str, Any]) -> None:
         run["exit_code"] = int(exit_code.strip())
     if finished_at:
         run["finished_at"] = finished_at.strip()
+    run["heartbeat_at"] = heartbeat_at.strip() if heartbeat_at else None
     if str(run.get("status") or "") in TERMINAL_STATUSES:
         run["pid"] = None
     if str(run.get("status") or "") == "running":
         launch_failure = provider_for_run(run).runtime_launch_failure(run)
         if launch_failure:
             convert_running_launch_failure(run, launch_failure)
+    runtime_health, runtime_health_note, heartbeat_lag_seconds = run_runtime_health(run)
+    run["runtime_health"] = runtime_health
+    run["runtime_health_note"] = runtime_health_note
+    run["heartbeat_lag_seconds"] = heartbeat_lag_seconds
     if run_has_provider_artifacts(run) and not get_session_id(run):
         session_id = provider_for_run(run).detect_session_id(run)
         if session_id:
@@ -5613,10 +5678,13 @@ def build_runner_script(
     exit_code_path: Path,
     started_path: Path,
     finished_path: Path,
+    heartbeat_path: Path,
+    heartbeat_interval_seconds: int,
     env_exports: dict[str, str] | None = None,
     path_prefix: Path | None = None,
 ) -> str:
     cmd = quote_command(command)
+    heartbeat_q = shlex.quote(str(heartbeat_path))
     lines = [
         "#!/usr/bin/env bash",
         "set -uo pipefail",
@@ -5630,8 +5698,21 @@ def build_runner_script(
         [
             f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {shlex.quote(str(started_path))}",
             f"printf '%s\\n' running > {shlex.quote(str(state_path))}",
-            f"{cmd} < {shlex.quote(str(prompt_path))}",
+            f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {heartbeat_q}",
+            f"({cmd} < {shlex.quote(str(prompt_path))}) &",
+            "child_pid=$!",
+            "(",
+            "  while kill -0 \"$child_pid\" 2>/dev/null; do",
+            f"    printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {heartbeat_q}",
+            f"    sleep {max(1, heartbeat_interval_seconds)}",
+            "  done",
+            ") &",
+            "heartbeat_pid=$!",
+            "wait \"$child_pid\"",
             "status=$?",
+            "kill \"$heartbeat_pid\" 2>/dev/null || true",
+            "wait \"$heartbeat_pid\" 2>/dev/null || true",
+            f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {heartbeat_q}",
             f"printf '%s\\n' \"$status\" > {shlex.quote(str(exit_code_path))}",
             "if [ \"$status\" -eq 0 ]; then",
             f"  printf '%s\\n' completed > {shlex.quote(str(state_path))}",
@@ -5701,6 +5782,8 @@ def refresh_runner_for_run(run: dict[str, Any]) -> None:
             exit_code_path=run_dir / "exit_code.txt",
             started_path=run_dir / "started_at.txt",
             finished_path=run_dir / "finished_at.txt",
+            heartbeat_path=run_heartbeat_path(run),
+            heartbeat_interval_seconds=run_heartbeat_interval_seconds(),
             env_exports={
                 adapter.bin_env_var: guard_target,
             },
@@ -5726,9 +5809,18 @@ def run_summary_text(run: dict[str, Any]) -> str:
     if blocked_on:
         dispatch_state = f"{dispatch_state}:{','.join(blocked_on[:2])}"
     integration_state = normalize_optional_text(run.get("integration_state")) or "-"
+    runtime_health = normalize_optional_text(run.get("runtime_health"))
+    if str(run.get("status") or "") == "running":
+        heartbeat_text = {
+            "healthy": "ok",
+            "heartbeat-missing": "missing",
+            "heartbeat-stale": "stale",
+        }.get(runtime_health or "", runtime_health or "ok")
+    else:
+        heartbeat_text = "-"
     return (
         f"{run['run_id']:<30} {run['status']:<10} provider={run.get('provider', DEFAULT_PROVIDER):<6} "
-        f"pid={run.get('pid') or '-':<8} exit={exit_text:<4} task={task_text:<18} "
+        f"pid={run.get('pid') or '-':<8} hb={heartbeat_text:<8} exit={exit_text:<4} task={task_text:<18} "
         f"dispatch={dispatch_state:<18} integration={integration_state:<14} "
         f"session={session_id} summary={summary_text}"
     )
@@ -6241,6 +6333,7 @@ def materialize_run(
     exit_code_path = run_dir / "exit_code.txt"
     started_path = run_dir / "started_at.txt"
     finished_path = run_dir / "finished_at.txt"
+    heartbeat_path = run_dir / "heartbeat.txt"
     runner_path = run_dir / "runner.sh"
 
     write_text(prompt_path, child_prompt_guard(options.prompt_text))
@@ -6265,6 +6358,8 @@ def materialize_run(
             exit_code_path=exit_code_path,
             started_path=started_path,
             finished_path=finished_path,
+            heartbeat_path=heartbeat_path,
+            heartbeat_interval_seconds=run_heartbeat_interval_seconds(),
             env_exports={
                 adapter.bin_env_var: guard_target,
             },
@@ -6299,6 +6394,7 @@ def materialize_run(
         "stdout_jsonl": str(stdout_path),
         "stderr_log": str(stderr_path),
         "last_message_path": str(last_message_path),
+        "heartbeat_path": str(heartbeat_path),
         "runner_path": str(runner_path),
         "session_id": None,
         "thread_id": None,
@@ -6339,6 +6435,10 @@ def materialize_run(
         "changed_paths": [],
         "integration_applied_paths": [],
         "integration_dropped_paths": [],
+        "heartbeat_at": None,
+        "heartbeat_lag_seconds": None,
+        "runtime_health": None,
+        "runtime_health_note": None,
         "workspace_preflight_status": None,
         "workspace_preflight_checked_at": None,
         "workspace_preflight_note": None,

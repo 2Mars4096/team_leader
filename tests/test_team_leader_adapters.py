@@ -246,6 +246,55 @@ class TeamLeaderAdapterTests(unittest.TestCase):
             exit_code = team_leader.cmd_provider_check(args)
         self.assertEqual(exit_code, 1)
 
+    def test_build_runner_script_includes_heartbeat_loop(self):
+        script = team_leader.build_runner_script(
+            command=["demo-cli", "exec", "-"],
+            prompt_path=Path("/tmp/prompt.md"),
+            state_path=Path("/tmp/state.txt"),
+            exit_code_path=Path("/tmp/exit_code.txt"),
+            started_path=Path("/tmp/started_at.txt"),
+            finished_path=Path("/tmp/finished_at.txt"),
+            heartbeat_path=Path("/tmp/heartbeat.txt"),
+            heartbeat_interval_seconds=7,
+        )
+        self.assertIn("child_pid=$!", script)
+        self.assertIn("heartbeat_pid=$!", script)
+        self.assertIn("/tmp/heartbeat.txt", script)
+        self.assertIn("sleep 7", script)
+
+    def test_run_runtime_health_detects_healthy_and_stale_states(self):
+        healthy_now = team_leader.parse_timestamp_epoch("2026-01-01T00:00:35Z")
+        missing_now = team_leader.parse_timestamp_epoch("2026-01-01T00:00:40Z")
+        stale_now = team_leader.parse_timestamp_epoch("2026-01-01T00:00:50Z")
+        with mock.patch.object(team_leader, "run_heartbeat_stale_seconds", return_value=30):
+            healthy_state = team_leader.run_runtime_health(
+                {
+                    "status": "running",
+                    "launched_at": "2026-01-01T00:00:00Z",
+                    "heartbeat_at": "2026-01-01T00:00:20Z",
+                },
+                now_epoch=healthy_now,
+            )
+            missing_state = team_leader.run_runtime_health(
+                {
+                    "status": "running",
+                    "launched_at": "2026-01-01T00:00:00Z",
+                    "heartbeat_at": None,
+                },
+                now_epoch=missing_now,
+            )
+            stale_state = team_leader.run_runtime_health(
+                {
+                    "status": "running",
+                    "launched_at": "2026-01-01T00:00:00Z",
+                    "heartbeat_at": "2026-01-01T00:00:10Z",
+                },
+                now_epoch=stale_now,
+            )
+        self.assertEqual(healthy_state[0], "healthy")
+        self.assertEqual(missing_state[0], "heartbeat-missing")
+        self.assertEqual(stale_state[0], "heartbeat-stale")
+
     def test_smoke_test_payload_requires_exact_last_message(self):
         with mock.patch.object(team_leader, "last_message_for_run", return_value="OK"):
             payload = team_leader.smoke_test_payload(

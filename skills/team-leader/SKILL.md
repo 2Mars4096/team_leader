@@ -19,6 +19,7 @@ The controller now includes conservative safety defaults aimed at avoiding runaw
 
 - at most `8` child sessions running in parallel by default
 - at most `2` new child launches per `15` seconds by default
+- per-run child heartbeats with stale-run detection for long-running sessions
 - child `last_message.md` files truncated to a bounded size with head/tail preservation
 - bounded session-id scans and bounded log tail reads
 - `team-status --project` gives a compact progressive update stream that is safer in captured Codex output than a full-screen watch
@@ -36,6 +37,8 @@ Shipped providers today:
 Common aliases are accepted anywhere the controller asks for a provider name, including `cc` or `claude-code` for `claude`, `cursor-agent` for `cursor`, `kiro-cli` for `kiro`, and `codex-cli` or `openai-codex` for `codex`.
 
 `windsurf` and `antigravity` are not shipped adapters yet. This controller only first-classes CLIs with a documented standalone headless launch surface and an automatable resume workflow.
+
+Heartbeat tuning is available through `TEAM_LEADER_RUN_HEARTBEAT_INTERVAL_SECONDS` and `TEAM_LEADER_RUN_HEARTBEAT_STALE_SECONDS` when a provider needs a slower cadence or a looser stale threshold.
 
 Keep provider-specific logic inside the adapter layer: option validation, launch command construction, session detection, and resume command generation. All shipped providers now use the same adapter contract, while Codex keeps provider-specific hooks for backend reachability and thread detection so `codex -> codex` stays behaviorally aligned with the prior flow. Read `references/provider-adapters.md` when you need to extend the script beyond Codex.
 

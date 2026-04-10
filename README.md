@@ -4,6 +4,8 @@ A Codex skill and standalone controller that manages real child CLI sessions as 
 
 Unlike lightweight built-in subagents, each child session is a full external CLI session with its own context, tool access, and resume lifecycle.
 
+Long-running child runs now emit a per-run heartbeat file. The manager records heartbeat metadata, surfaces heartbeat state in `status` and `watch`, and flags stale or missing heartbeats through the existing warning paths instead of leaving a hung run indistinguishable from a healthy long-running run.
+
 ## Skills Included
 
 | Skill | Purpose |
@@ -27,6 +29,8 @@ Unlike lightweight built-in subagents, each child session is a full external CLI
 Common aliases are accepted anywhere a provider name is expected: `cc` or `claude-code` for `claude`, `cursor-agent` for `cursor`, `kiro-cli` for `kiro`, and `codex-cli` or `openai-codex` for `codex`.
 
 `windsurf` and `antigravity` are not shipped as provider adapters yet. This controller only first-classes CLIs with a documented standalone headless launch surface and a resume story the manager can automate safely.
+
+Heartbeat tuning is available through `TEAM_LEADER_RUN_HEARTBEAT_INTERVAL_SECONDS` and `TEAM_LEADER_RUN_HEARTBEAT_STALE_SECONDS` when a provider needs a slower cadence or a looser stale threshold.
 
 ## Installation
 
