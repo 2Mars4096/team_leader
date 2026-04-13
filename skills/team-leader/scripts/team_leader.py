@@ -354,6 +354,7 @@ class DispatchOptions:
     ephemeral: bool
     full_auto: bool
     dangerous: bool
+    max_run_seconds: int | None
     dry_run: bool
     owned_paths: list[str]
     depends_on: list[str]
@@ -1106,6 +1107,7 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("output_warnings", [])
         run.setdefault("last_message_truncated", False)
         run.setdefault("last_message_original_bytes", None)
+        run.setdefault("max_run_seconds", None)
         run.setdefault("heartbeat_path", str(Path(run["run_dir"]) / "heartbeat.txt"))
         run.setdefault("heartbeat_at", None)
         run.setdefault("heartbeat_lag_seconds", None)
@@ -1355,6 +1357,20 @@ def normalize_optional_text(value: Any) -> str | None:
     return text or None
 
 
+def normalize_optional_positive_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{field_name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise RuntimeError(f"{field_name} must be a positive integer")
+    return parsed
+
+
 def normalize_str_list(value: Any, field_name: str) -> list[str]:
     if value is None:
         return []
@@ -1506,6 +1522,7 @@ def default_project_brief(project_name: str) -> dict[str, Any]:
         "clarification_mode": "auto",
         "validation_commands": [],
         "completion_sentinel": None,
+        "max_work_seconds": None,
         "max_planner_rounds": 3,
         "max_auto_fix_rounds": 2,
         "planner_provider": None,
@@ -1553,6 +1570,10 @@ def load_project_brief(project_dir: Path, project_name: str | None = None) -> di
         normalize_str_list(payload.get("validation_commands"), "validation_commands")
     )
     brief["completion_sentinel"] = normalize_optional_text(payload.get("completion_sentinel"))
+    brief["max_work_seconds"] = normalize_optional_positive_int(
+        payload.get("max_work_seconds"),
+        "max_work_seconds",
+    )
     max_rounds_raw = payload.get("max_planner_rounds")
     try:
         max_rounds = int(max_rounds_raw)
@@ -1606,6 +1627,7 @@ def merge_project_brief(
     clarification_mode: str | None = None,
     validation_commands: list[str] | None = None,
     completion_sentinel: str | None = None,
+    max_work_seconds: int | None = None,
     max_planner_rounds: int | None = None,
     max_auto_fix_rounds: int | None = None,
     planner_provider: str | None = None,
@@ -1653,6 +1675,11 @@ def merge_project_brief(
     )
     if completion_sentinel is not None:
         brief["completion_sentinel"] = completion_sentinel
+    if max_work_seconds is not None:
+        brief["max_work_seconds"] = normalize_optional_positive_int(
+            max_work_seconds,
+            "max_work_seconds",
+        )
     if max_planner_rounds is not None:
         brief["max_planner_rounds"] = max(1, int(max_planner_rounds))
     if max_auto_fix_rounds is not None:
@@ -1690,6 +1717,7 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) or "manual"
     clarification_mode = normalize_optional_text(brief.get("clarification_mode")) or "auto"
     completion_sentinel = normalize_optional_text(brief.get("completion_sentinel"))
+    max_work_seconds = normalize_optional_positive_int(brief.get("max_work_seconds"), "max_work_seconds")
     max_planner_rounds = brief.get("max_planner_rounds")
     max_auto_fix_rounds = brief.get("max_auto_fix_rounds")
     planner_provider = validate_provider_name(
@@ -1739,6 +1767,7 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     lines.append(f"- Max parallel sessions: `{max_parallel_sessions()}`")
     lines.append(f"- Release throttle per cycle: `{max_releases_per_cycle()}`")
     lines.append(f"- Release throttle window: `{max_release_window_seconds()}` seconds")
+    lines.append(f"- Max project work time: `{format_duration(max_work_seconds) if max_work_seconds is not None else '-'}`")
     lines.append(f"- Max planner rounds: `{max_planner_rounds}`")
     lines.append(f"- Max auto-fix rounds: `{max_auto_fix_rounds}`")
     lines.append(f"- Completion sentinel: `{completion_sentinel or '-'}`")
@@ -3195,6 +3224,8 @@ def project_stage_snapshot(
     validation_status = normalize_optional_text(validation.get("status")) if validation else None
     autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) if brief else None
     clarification_mode = normalize_optional_text(brief.get("clarification_mode")) if brief else None
+    project_budget_reached = project_time_budget_reached(brief, runs)
+    remaining_work_seconds = project_remaining_work_seconds(brief, runs)
     integration_conflicts = [
         run for run in sorted(runs, key=run_sort_key)
         if normalize_optional_text(run.get("integration_state")) in INTEGRATION_ALERT_STATES
@@ -3223,6 +3254,11 @@ def project_stage_snapshot(
         stage_reason = f"{len(open_questions)} human decision(s) still open"
         next_action = f"Answer `{first_question['id']}` for `{first_question['task_id']}`"
         focus = short_summary(first_question["text"], max_chars=96)
+    elif project_budget_reached:
+        current_stage = "time-budget-reached"
+        stage_reason = "The configured project work budget has been exhausted"
+        next_action = "Review current outputs or increase `max_work_seconds` before launching more work"
+        focus = format_duration(remaining_work_seconds)
     elif active:
         current_stage = "running-children"
         first_active = active[0]
@@ -3319,6 +3355,46 @@ def project_start_timestamp(brief: dict[str, Any] | None, runs: list[dict[str, A
     if not candidates:
         return None
     return min(candidates, key=lambda item: item[0])[1]
+
+
+def project_work_budget_seconds(brief: dict[str, Any] | None) -> int | None:
+    if not brief:
+        return None
+    return normalize_optional_positive_int(brief.get("max_work_seconds"), "max_work_seconds")
+
+
+def project_elapsed_seconds(
+    brief: dict[str, Any] | None,
+    runs: list[dict[str, Any]],
+    *,
+    now_epoch: int | None = None,
+) -> int | None:
+    started_at = project_start_timestamp(brief, runs)
+    started_epoch = parse_timestamp_epoch(started_at)
+    if started_epoch is None:
+        return None
+    current_epoch = now_epoch or epoch_now()
+    return max(0, current_epoch - started_epoch)
+
+
+def project_remaining_work_seconds(
+    brief: dict[str, Any] | None,
+    runs: list[dict[str, Any]],
+    *,
+    now_epoch: int | None = None,
+) -> int | None:
+    budget_seconds = project_work_budget_seconds(brief)
+    if budget_seconds is None:
+        return None
+    elapsed_seconds = project_elapsed_seconds(brief, runs, now_epoch=now_epoch)
+    if elapsed_seconds is None:
+        return budget_seconds
+    return max(0, budget_seconds - elapsed_seconds)
+
+
+def project_time_budget_reached(brief: dict[str, Any] | None, runs: list[dict[str, Any]]) -> bool:
+    remaining_seconds = project_remaining_work_seconds(brief, runs)
+    return remaining_seconds is not None and remaining_seconds <= 0
 
 
 def first_useful_result_timestamp(runs: list[dict[str, Any]]) -> str | None:
@@ -5043,6 +5119,7 @@ def dispatch_options_from_plan_item(
         ephemeral=bool(planner_run.get("ephemeral")),
         full_auto=bool(item.get("full_auto")) or bool(planner_run.get("full_auto")),
         dangerous=bool(item.get("dangerous")) or bool(planner_run.get("dangerous")),
+        max_run_seconds=normalize_optional_positive_int(item.get("max_run_seconds"), "max_run_seconds"),
         dry_run=False,
         owned_paths=normalize_str_list(item.get("owned_paths"), "owned_paths"),
         depends_on=normalize_str_list(item.get("depends_on"), "depends_on"),
@@ -5126,6 +5203,8 @@ def apply_planner_outputs(root: Path, index: dict[str, Any]) -> None:
 def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], runs: list[dict[str, Any]]) -> tuple[bool, str]:
     if not normalize_optional_text(brief.get("goal")):
         return False, "missing-goal"
+    if project_time_budget_reached(brief, runs):
+        return False, "max-work-seconds-reached"
     open_questions = unanswered_questions(collect_question_records(runs), load_answers(project_dir))
     if open_questions:
         return False, "waiting-for-human"
@@ -5208,6 +5287,7 @@ def spawn_planner_run(
         ephemeral=False,
         full_auto=True,
         dangerous=False,
+        max_run_seconds=project_remaining_work_seconds(brief, runs),
         dry_run=False,
         owned_paths=[],
         depends_on=[],
@@ -5752,6 +5832,7 @@ def dispatch_options_for_run(run: dict[str, Any]) -> DispatchOptions:
         ephemeral=bool(run.get("ephemeral")),
         full_auto=bool(run.get("full_auto")),
         dangerous=bool(run.get("dangerous")),
+        max_run_seconds=normalize_optional_positive_int(run.get("max_run_seconds"), "max_run_seconds"),
         dry_run=False,
         owned_paths=normalize_str_list(run.get("owned_paths"), "owned_paths"),
         depends_on=normalize_str_list(run.get("depends_on"), "depends_on"),
@@ -6012,6 +6093,7 @@ def smoke_test_options(
         ephemeral=False,
         full_auto=False,
         dangerous=False,
+        max_run_seconds=None,
         dry_run=False,
         owned_paths=[],
         depends_on=[],
@@ -6161,6 +6243,7 @@ def cmd_intake(args: argparse.Namespace) -> int:
             clarification_mode=normalize_optional_text(args.clarification_mode),
             validation_commands=list(args.validation_command),
             completion_sentinel=normalize_optional_text(args.completion_sentinel),
+            max_work_seconds=args.max_work_seconds,
             max_planner_rounds=args.max_planner_rounds,
             max_auto_fix_rounds=args.max_auto_fix_rounds,
             planner_provider=normalize_optional_text(args.planner_provider),
@@ -6198,6 +6281,7 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
             clarification_mode=normalize_optional_text(args.clarification_mode),
             validation_commands=list(args.validation_command),
             completion_sentinel=normalize_optional_text(args.completion_sentinel),
+            max_work_seconds=args.max_work_seconds,
             max_planner_rounds=args.max_planner_rounds,
             max_auto_fix_rounds=args.max_auto_fix_rounds,
             planner_provider=normalize_optional_text(args.planner_provider),
@@ -6278,6 +6362,7 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
             ephemeral=bool(args.ephemeral),
             full_auto=True,
             dangerous=bool(args.dangerous),
+            max_run_seconds=project_remaining_work_seconds(brief, runs),
             dry_run=bool(args.dry_run),
             owned_paths=[],
             depends_on=[],
@@ -6308,6 +6393,22 @@ def materialize_run(
     ensure_root(root)
     adapter = get_provider(options.provider)
     adapter.validate_options(options)
+    project_dir: Path | None = None
+    brief: dict[str, Any] | None = None
+    effective_max_run_seconds = options.max_run_seconds
+    if options.project:
+        project_dir = ensure_project_workspace(root, options.project, project_slug(options.project))
+        brief = load_project_brief(project_dir, options.project)
+        remaining_work_seconds = project_remaining_work_seconds(brief, project_runs(index, options.project))
+        if remaining_work_seconds is not None:
+            if remaining_work_seconds <= 0:
+                raise RuntimeError(
+                    f"project {options.project!r} has exhausted max_work_seconds; increase the budget before launching more work"
+                )
+            if effective_max_run_seconds is None:
+                effective_max_run_seconds = remaining_work_seconds
+            else:
+                effective_max_run_seconds = min(effective_max_run_seconds, remaining_work_seconds)
     repo_root = git_toplevel(options.cd)
     source_repo_rel_cwd: str | None = None
     workspace_mode = "direct"
@@ -6322,7 +6423,8 @@ def materialize_run(
     run_dir = root / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     if workspace_mode == "worktree" and options.project:
-        project_dir = ensure_project_workspace(root, options.project, project_slug(options.project))
+        if project_dir is None:
+            project_dir = ensure_project_workspace(root, options.project, project_slug(options.project))
         worktree_path = str(project_dir / "worktrees" / run_id)
 
     prompt_path = run_dir / "prompt.md"
@@ -6412,6 +6514,7 @@ def materialize_run(
         "ephemeral": options.ephemeral,
         "full_auto": options.full_auto,
         "dangerous": options.dangerous,
+        "max_run_seconds": effective_max_run_seconds,
         "add_dirs": [str(path) for path in options.add_dirs],
         "configs": list(options.configs),
         "enables": list(options.enables),
@@ -6494,6 +6597,7 @@ def common_dispatch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             ephemeral=bool(args.ephemeral),
             full_auto=bool(args.full_auto),
             dangerous=bool(args.dangerous),
+            max_run_seconds=normalize_optional_positive_int(getattr(args, "max_run_seconds", None), "max_run_seconds"),
             dry_run=bool(args.dry_run),
             owned_paths=normalize_str_list(args.owned_path, "owned_paths"),
             depends_on=normalize_str_list(args.depends_on, "depends_on"),
@@ -6929,6 +7033,7 @@ def add_common_run_options(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Run child with provider dangerous no-sandbox mode",
     )
+    parser.add_argument("--max-run-seconds", type=int, help="Maximum wall-clock seconds this child run may execute before timeout")
     parser.add_argument("--dry-run", action="store_true", help="Create the run directory but do not launch the provider CLI")
 
 
@@ -6944,6 +7049,7 @@ def add_project_capture_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--clarification-mode", choices=CLARIFICATION_MODES, help="Whether the planner should clarify the brief before launching workers")
     parser.add_argument("--validation-command", action="append", default=[], help="Validation command to run when a project wave settles")
     parser.add_argument("--completion-sentinel", help="Text marker that indicates delivery is complete when found in child output")
+    parser.add_argument("--max-work-seconds", type=int, help="Maximum total wall-clock seconds the project may keep launching work before timing out")
     parser.add_argument("--max-planner-rounds", type=int, help="Maximum number of manager planning rounds before stopping")
     parser.add_argument("--max-auto-fix-rounds", type=int, help="Maximum automatic validation-fix or recovery planning rounds")
     parser.add_argument(

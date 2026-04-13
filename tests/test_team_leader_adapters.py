@@ -41,6 +41,7 @@ class TeamLeaderAdapterTests(unittest.TestCase):
             "ephemeral": True,
             "full_auto": True,
             "dangerous": True,
+            "max_run_seconds": None,
             "dry_run": False,
             "owned_paths": ["src"],
             "depends_on": ["plan"],
@@ -208,12 +209,33 @@ class TeamLeaderAdapterTests(unittest.TestCase):
                 "dispatch",
                 "--provider",
                 "cc",
+                "--max-run-seconds",
+                "90",
                 "--prompt",
                 "Review only.",
             ]
         )
         payload = team_leader.common_dispatch_kwargs(args)
         self.assertEqual(payload["options"].provider, "claude")
+        self.assertEqual(payload["options"].max_run_seconds, 90)
+
+    def test_project_remaining_work_seconds_uses_project_start(self):
+        brief = {
+            "created_at": "2026-01-01T00:00:00Z",
+            "max_work_seconds": 600,
+        }
+        runs = [
+            {
+                "created_at": "2026-01-01T00:02:00Z",
+                "launched_at": "2026-01-01T00:02:10Z",
+            }
+        ]
+        remaining = team_leader.project_remaining_work_seconds(
+            brief,
+            runs,
+            now_epoch=team_leader.parse_timestamp_epoch("2026-01-01T00:05:00Z"),
+        )
+        self.assertEqual(remaining, 300)
 
     def test_provider_check_returns_nonzero_when_any_provider_is_blocked(self):
         args = SimpleNamespace(provider=["cc", "codex-cli"], bin=[], cd=None, json=False)
