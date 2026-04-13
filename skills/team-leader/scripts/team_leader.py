@@ -1108,6 +1108,8 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("last_message_truncated", False)
         run.setdefault("last_message_original_bytes", None)
         run.setdefault("max_run_seconds", None)
+        run.setdefault("timed_out_at", None)
+        run.setdefault("timeout_reason", None)
         run.setdefault("heartbeat_path", str(Path(run["run_dir"]) / "heartbeat.txt"))
         run.setdefault("heartbeat_at", None)
         run.setdefault("heartbeat_lag_seconds", None)
@@ -5442,6 +5444,8 @@ def refresh_run_artifacts(run: dict[str, Any]) -> None:
         warnings.append(f"stdout_jsonl_large:{artifact_sizes['stdout_jsonl']}")
     if artifact_sizes.get("stderr_log", 0) >= STDERR_WARNING_BYTES:
         warnings.append(f"stderr_log_large:{artifact_sizes['stderr_log']}")
+    if normalize_optional_text(run.get("timed_out_at")):
+        warnings.append("run_timed_out")
     runtime_health = normalize_optional_text(run.get("runtime_health"))
     if runtime_health == "heartbeat-missing":
         warnings.append("heartbeat_missing")
@@ -5541,7 +5545,38 @@ def run_heartbeat_path(run: dict[str, Any]) -> Path:
     return Path(run["run_dir"]) / "heartbeat.txt"
 
 
+def run_elapsed_seconds(run: dict[str, Any], *, now_epoch: int | None = None) -> int | None:
+    launched_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("launched_at")))
+    if launched_epoch is None:
+        return None
+    if normalize_optional_text(run.get("finished_at")):
+        end_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("finished_at")))
+    else:
+        end_epoch = now_epoch or epoch_now()
+    if end_epoch is None:
+        return None
+    return max(0, end_epoch - launched_epoch)
+
+
+def run_timeout_seconds(run: dict[str, Any]) -> int | None:
+    return normalize_optional_positive_int(run.get("max_run_seconds"), "max_run_seconds")
+
+
+def run_timeout_note(run: dict[str, Any], *, now_epoch: int | None = None) -> str | None:
+    timeout_seconds = run_timeout_seconds(run)
+    if timeout_seconds is None:
+        return None
+    elapsed_seconds = run_elapsed_seconds(run, now_epoch=now_epoch)
+    if elapsed_seconds is None or elapsed_seconds <= timeout_seconds:
+        return None
+    return f"run exceeded max_run_seconds ({elapsed_seconds}s > {timeout_seconds}s)"
+
+
 def run_runtime_health(run: dict[str, Any], *, now_epoch: int | None = None) -> tuple[str | None, str | None, int | None]:
+    timed_out_at = normalize_optional_text(run.get("timed_out_at"))
+    timeout_reason = normalize_optional_text(run.get("timeout_reason"))
+    if timed_out_at:
+        return "timed-out", timeout_reason or "run exceeded its time budget", None
     if str(run.get("status") or "") != "running":
         return None, None, None
     current_epoch = now_epoch or epoch_now()
@@ -5700,6 +5735,33 @@ def convert_running_launch_failure(run: dict[str, Any], note: str) -> None:
     write_text(Path(run["run_dir"]) / "state.txt", "blocked\n")
 
 
+def convert_running_timeout(run: dict[str, Any], note: str) -> None:
+    pid = run.get("pid")
+    if pid and pid_alive(pid):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+    timestamp = utc_now()
+    run["pid"] = None
+    run["status"] = "failed"
+    run["exit_code"] = 124
+    run["finished_at"] = timestamp
+    run["timed_out_at"] = timestamp
+    run["timeout_reason"] = note
+    run["runtime_health"] = "timed-out"
+    run["runtime_health_note"] = note
+    run["heartbeat_lag_seconds"] = None
+    set_run_dispatch_state(run, "failed", [], changed_at=timestamp)
+    run_dir = Path(run["run_dir"])
+    write_text(run_dir / "state.txt", "failed\n")
+    write_text(run_dir / "exit_code.txt", "124\n")
+    write_text(run_dir / "finished_at.txt", timestamp + "\n")
+
+
 def refresh_run(run: dict[str, Any]) -> None:
     run_dir = Path(run["run_dir"])
     state = read_text_if_exists(run_dir / "state.txt")
@@ -5726,6 +5788,10 @@ def refresh_run(run: dict[str, Any]) -> None:
         launch_failure = provider_for_run(run).runtime_launch_failure(run)
         if launch_failure:
             convert_running_launch_failure(run, launch_failure)
+    if str(run.get("status") or "") == "running":
+        timeout_note = run_timeout_note(run)
+        if timeout_note:
+            convert_running_timeout(run, timeout_note)
     runtime_health, runtime_health_note, heartbeat_lag_seconds = run_runtime_health(run)
     run["runtime_health"] = runtime_health
     run["runtime_health_note"] = runtime_health_note
@@ -5891,11 +5957,14 @@ def run_summary_text(run: dict[str, Any]) -> str:
         dispatch_state = f"{dispatch_state}:{','.join(blocked_on[:2])}"
     integration_state = normalize_optional_text(run.get("integration_state")) or "-"
     runtime_health = normalize_optional_text(run.get("runtime_health"))
-    if str(run.get("status") or "") == "running":
+    if runtime_health == "timed-out":
+        heartbeat_text = "timeout"
+    elif str(run.get("status") or "") == "running":
         heartbeat_text = {
             "healthy": "ok",
             "heartbeat-missing": "missing",
             "heartbeat-stale": "stale",
+            "timed-out": "timeout",
         }.get(runtime_health or "", runtime_health or "ok")
     else:
         heartbeat_text = "-"
@@ -6538,6 +6607,8 @@ def materialize_run(
         "changed_paths": [],
         "integration_applied_paths": [],
         "integration_dropped_paths": [],
+        "timed_out_at": None,
+        "timeout_reason": None,
         "heartbeat_at": None,
         "heartbeat_lag_seconds": None,
         "runtime_health": None,

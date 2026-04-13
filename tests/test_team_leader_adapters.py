@@ -317,6 +317,46 @@ class TeamLeaderAdapterTests(unittest.TestCase):
         self.assertEqual(missing_state[0], "heartbeat-missing")
         self.assertEqual(stale_state[0], "heartbeat-stale")
 
+    def test_run_timeout_note_and_runtime_health_track_timeout(self):
+        timeout_note = team_leader.run_timeout_note(
+            {
+                "launched_at": "2026-01-01T00:00:00Z",
+                "max_run_seconds": 30,
+            },
+            now_epoch=team_leader.parse_timestamp_epoch("2026-01-01T00:00:45Z"),
+        )
+        self.assertEqual(timeout_note, "run exceeded max_run_seconds (45s > 30s)")
+
+        health = team_leader.run_runtime_health(
+            {
+                "status": "failed",
+                "timed_out_at": "2026-01-01T00:00:45Z",
+                "timeout_reason": timeout_note,
+            }
+        )
+        self.assertEqual(health[0], "timed-out")
+        self.assertEqual(health[1], timeout_note)
+
+    def test_run_summary_shows_timeout_marker(self):
+        text = team_leader.run_summary_text(
+            {
+                "run_id": "run-1",
+                "status": "failed",
+                "provider": "codex",
+                "pid": None,
+                "exit_code": 124,
+                "task_id": "worker",
+                "summary": "Timed out worker",
+                "dispatch_state": "failed",
+                "blocked_on": [],
+                "integration_state": None,
+                "runtime_health": "timed-out",
+                "session_id": None,
+                "thread_id": None,
+            }
+        )
+        self.assertIn("hb=timeout", text)
+
     def test_smoke_test_payload_requires_exact_last_message(self):
         with mock.patch.object(team_leader, "last_message_for_run", return_value="OK"):
             payload = team_leader.smoke_test_payload(
