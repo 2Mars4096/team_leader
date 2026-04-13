@@ -6,6 +6,8 @@ Unlike lightweight built-in subagents, each child session is a full external CLI
 
 Long-running child runs now emit a per-run heartbeat file. The manager records heartbeat metadata, surfaces heartbeat state in `status` and `watch`, and flags stale or missing heartbeats through the existing warning paths instead of leaving a hung run indistinguishable from a healthy long-running run.
 
+Goal-oriented orchestration can now be bounded by time. Set `--max-work-seconds` on a project brief to cap how long the manager may keep launching work toward that goal, and use `--max-run-seconds` when one child needs a stricter wall-clock limit than the overall project budget.
+
 ## Skills Included
 
 | Skill | Purpose |
@@ -94,6 +96,7 @@ From your **target project directory** (not the skill directory):
 python3 ~/.codex/skills/team-leader/scripts/team_leader.py intake \
   --project my-project \
   --goal "Refactor checkout to reduce payment failures" \
+  --max-work-seconds 7200 \
   --repo-path . \
   --child-provider claude \
   --allow-provider codex \
@@ -200,6 +203,8 @@ All commands use `python3 <path-to>/team_leader.py <command> [options]`.
 - `--child-provider <name>` -- default provider for planner-produced child runs
 - `--child-provider-bin <path>` -- executable override for the default child provider
 - `--allow-provider <name>` -- constrain planner output to a provider allowlist
+- `--max-work-seconds <n>` -- cap total project work time for goal-oriented orchestration
+- `--max-run-seconds <n>` -- cap one child run's wall-clock execution time
 - `--sandbox read-only|workspace-write` -- child sandbox mode
 - `--full-auto` -- run child in full-auto mode
 - `--root <path>` -- explicit `.team-leader/` path (default: `./.team-leader`)

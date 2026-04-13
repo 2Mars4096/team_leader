@@ -13,6 +13,8 @@ Treat a subsession as a full child CLI worker with its own session, context wind
 
 Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragments. This path is relative to the skill itself, not the project root. In this repo that file is at `skills/team-leader/scripts/team_leader.py`, and when installed it lives under the Codex skills directory at `.../skills/team-leader/scripts/team_leader.py`. Keep your working directory at the target project unless you pass `--root` and `--cd` explicitly; do not `cd` into the skill directory just to run the controller, because the default `.team-leader/` root is derived from the current working directory. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
+Goal-oriented orchestration can now be bounded by time. Set `--max-work-seconds` on the project brief when the user wants the manager to pursue a goal autonomously but stop after a fixed safety budget, and use `--max-run-seconds` when one direct child should have a tighter wall-clock limit.
+
 When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. While any child is active, the manager refreshes those markdown files automatically in the background. Once a project settles cleanly, the manager compacts transient dashboards, question scratchpads, per-run reports, and disposable child-run artifacts into a smaller steady-state workspace.
 
 The controller now includes conservative safety defaults aimed at avoiding runaway resource use:
@@ -79,6 +81,7 @@ When the user can only give you the project goal, a few constraints, and some pa
 python3 scripts/team_leader.py intake \
   --project checkout-refactor \
   --goal "Refactor checkout to simplify the flow and reduce payment failures." \
+  --max-work-seconds 7200 \
   --repo-path /path/to/repo \
   --child-provider claude \
   --allow-provider codex \
