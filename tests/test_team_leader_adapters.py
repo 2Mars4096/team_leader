@@ -637,6 +637,203 @@ class TeamLeaderAdapterTests(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertIn("fallback path", records[0]["text"])
 
+    def test_dashboard_render_is_stable_across_monitor_heartbeat_updates(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            runs = [
+                {
+                    "run_id": "run-1",
+                    "task_id": "run-1",
+                    "summary": "Running task",
+                    "role": "implementation",
+                    "status": "running",
+                    "dispatch_state": "running",
+                    "integration_state": None,
+                    "session_id": None,
+                    "owned_paths": [],
+                    "launched_at": None,
+                    "workspace_mode": "direct",
+                    "run_dir": str(project_dir / "runs" / "run-1"),
+                    "stdout_path": str(project_dir / "runs" / "run-1" / "stdout.jsonl"),
+                    "last_message_path": str(project_dir / "runs" / "run-1" / "last_message.md"),
+                }
+            ]
+            with mock.patch.object(team_leader, "monitor_state", return_value=("active", "2026-01-01T00:00:00Z")):
+                first = team_leader.render_dashboard("demo", project_dir, runs, [], [], {})
+            with mock.patch.object(team_leader, "monitor_state", return_value=("active", "2026-01-01T00:00:30Z")):
+                second = team_leader.render_dashboard("demo", project_dir, runs, [], [], {})
+            self.assertEqual(first, second)
+
+    def test_project_overview_render_is_stable_across_monitor_heartbeat_updates(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            runs = [
+                {
+                    "run_id": "run-1",
+                    "task_id": "run-1",
+                    "summary": "Running task",
+                    "role": "implementation",
+                    "status": "running",
+                    "dispatch_state": "running",
+                    "cwd": "/repo",
+                    "stdout_path": str(project_dir / "runs" / "run-1" / "stdout.jsonl"),
+                    "last_message_path": str(project_dir / "runs" / "run-1" / "last_message.md"),
+                }
+            ]
+            with mock.patch.object(team_leader, "monitor_state", return_value=("active", "2026-01-01T00:00:00Z")):
+                first = team_leader.render_project_overview("demo", project_dir, runs)
+            with mock.patch.object(team_leader, "monitor_state", return_value=("active", "2026-01-01T00:00:30Z")):
+                second = team_leader.render_project_overview("demo", project_dir, runs)
+            self.assertEqual(first, second)
+
+    def test_project_metrics_are_quantized_while_runs_are_active(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".team-leader"
+            team_leader.ensure_root(root)
+            runs = [
+                {
+                    "run_id": "run-1",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "status": "running",
+                    "dispatch_state": "running",
+                    "created_at": "2026-01-01T00:00:05Z",
+                    "launched_at": "2026-01-01T00:00:10Z",
+                    "last_message_path": str(root / "runs" / "run-1" / "last_message.md"),
+                }
+            ]
+            with mock.patch.object(team_leader, "epoch_now", return_value=61):
+                first = team_leader.build_project_metrics(root, "demo", runs)
+            with mock.patch.object(team_leader, "epoch_now", return_value=119):
+                second = team_leader.build_project_metrics(root, "demo", runs)
+            self.assertEqual(first["updated_at"], second["updated_at"])
+            self.assertEqual(first["project_age_seconds"], second["project_age_seconds"])
+
+    def test_worktree_cap_queues_extra_writer_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".team-leader"
+            held_worktree = root / "projects" / "demo" / "worktrees" / "run-held"
+            held_worktree.mkdir(parents=True, exist_ok=True)
+            (held_worktree / ".git").write_text("gitdir: /tmp/demo\n", encoding="utf-8")
+            index = {
+                "version": 1,
+                "runs": [
+                    {
+                        "run_id": "run-held",
+                        "status": "running",
+                        "dispatch_state": "running",
+                        "project": "demo",
+                        "project_slug": "demo",
+                        "workspace_mode": "worktree",
+                        "worktree_path": str(held_worktree),
+                        "workspace_released_at": None,
+                        "created_at": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "run_id": "run-next",
+                        "status": "blocked",
+                        "dispatch_state": "ready",
+                        "dispatch_state_changed_at": "2026-01-01T00:01:00Z",
+                        "blocked_on": [],
+                        "project": "demo",
+                        "project_slug": "demo",
+                        "workspace_mode": "worktree",
+                        "worktree_path": str(root / "projects" / "demo" / "worktrees" / "run-next"),
+                        "workspace_released_at": None,
+                        "created_at": "2026-01-01T00:01:00Z",
+                    },
+                ],
+            }
+            with mock.patch.object(team_leader, "max_project_worktrees", return_value=1):
+                team_leader.apply_worktree_cap_metadata(index)
+            self.assertEqual(index["runs"][1]["dispatch_state"], "queued")
+            self.assertEqual(index["runs"][1]["blocked_on"], ["worktree-cap:1"])
+
+    def test_active_project_artifact_budget_compacts_older_terminal_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".team-leader"
+            team_leader.ensure_root(root)
+
+            def make_run(run_id: str, created_at: str) -> dict[str, str | None]:
+                run_dir = root / "runs" / run_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                last_message_path = run_dir / "last_message.md"
+                last_message_path.write_text(f"{run_id} output\n", encoding="utf-8")
+                return {
+                    "run_id": run_id,
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": run_id,
+                    "summary": run_id,
+                    "run_dir": str(run_dir),
+                    "stdout_path": str(run_dir / "stdout.jsonl"),
+                    "stderr_log": str(run_dir / "stderr.log"),
+                    "last_message_path": str(last_message_path),
+                    "workspace_mode": "direct",
+                    "compacted_at": None,
+                    "compaction_removed": [],
+                    "created_at": created_at,
+                }
+
+            run1 = make_run("run-1", "2026-01-01T00:00:00Z")
+            run2 = make_run("run-2", "2026-01-01T00:01:00Z")
+            run3 = make_run("run-3", "2026-01-01T00:02:00Z")
+            index = {"version": 1, "runs": [run1, run2, run3]}
+            with mock.patch.object(team_leader, "max_project_active_run_artifacts", return_value=1):
+                team_leader.apply_active_project_artifact_budgets(root, index)
+            self.assertIsNotNone(run1["compacted_at"])
+            self.assertIsNotNone(run2["compacted_at"])
+            self.assertIsNone(run3["compacted_at"])
+            self.assertFalse(Path(run1["run_dir"]).exists())
+            self.assertFalse(Path(run2["run_dir"]).exists())
+            self.assertTrue(Path(run3["run_dir"]).exists())
+            self.assertIn("run-1 output", team_leader.last_message_display_for_run(run1) or "")
+
+    def test_write_project_reports_prunes_old_terminal_reports(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            reports_dir = project_dir / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+
+            def make_run(run_id: str, created_at: str) -> dict[str, str | None]:
+                run_dir = project_dir / "runs" / run_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                last_message_path = run_dir / "last_message.md"
+                last_message_path.write_text(f"{run_id} report\n", encoding="utf-8")
+                return {
+                    "run_id": run_id,
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "task_id": run_id,
+                    "summary": run_id,
+                    "role": "implementation",
+                    "session_id": None,
+                    "owned_paths": [],
+                    "workspace_mode": "direct",
+                    "worktree_path": None,
+                    "integration_state": None,
+                    "depends_on": [],
+                    "output_warnings": [],
+                    "run_dir": str(run_dir),
+                    "last_message_path": str(last_message_path),
+                    "created_at": created_at,
+                }
+
+            runs = [
+                make_run("run-1", "2026-01-01T00:00:00Z"),
+                make_run("run-2", "2026-01-01T00:01:00Z"),
+                make_run("run-3", "2026-01-01T00:02:00Z"),
+            ]
+            for run in runs:
+                (reports_dir / f"{run['run_id']}.md").write_text("stale\n", encoding="utf-8")
+            with mock.patch.object(team_leader, "max_project_report_files", return_value=1):
+                team_leader.write_project_reports(project_dir, runs)
+            self.assertFalse((reports_dir / "run-1.md").exists())
+            self.assertFalse((reports_dir / "run-2.md").exists())
+            self.assertTrue((reports_dir / "run-3.md").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

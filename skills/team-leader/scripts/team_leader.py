@@ -47,6 +47,11 @@ DEFAULT_RELEASE_WINDOW_SECONDS = 15
 DEFAULT_MAX_PLAN_RUNS_PER_WAVE = 24
 DEFAULT_PROJECT_MAX_PLANNER_ROUNDS = 12
 DEFAULT_PROJECT_MAX_AUTO_FIX_ROUNDS = 8
+DEFAULT_MAX_PROJECT_WORKTREES = 1
+DEFAULT_MAX_PROJECT_ACTIVE_RUN_ARTIFACTS = 12
+DEFAULT_MAX_PROJECT_REPORT_FILES = 24
+DEFAULT_PROJECT_METRICS_GRANULARITY_SECONDS = 60
+DEFAULT_MONITOR_HEARTBEAT_WRITE_SECONDS = 15
 DEFAULT_LAST_MESSAGE_BYTES = 128 * 1024
 DEFAULT_JSONL_SCAN_BYTES = 8 * 1024 * 1024
 DEFAULT_RUN_HEARTBEAT_INTERVAL_SECONDS = 10
@@ -107,6 +112,15 @@ AUTO_FIX_PLANNER_REASONS = {"failed-runs", "validation-failed", "waiting-for-sen
 def utc_now() -> str:
     return (
         datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def utc_from_epoch(epoch_value: int) -> str:
+    return (
+        datetime.fromtimestamp(int(epoch_value), tz=timezone.utc)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
@@ -1339,6 +1353,56 @@ def run_heartbeat_stale_seconds() -> int:
         return fallback
 
 
+def project_metrics_granularity_seconds() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_PROJECT_METRICS_GRANULARITY_SECONDS"))
+    if raw is None:
+        return DEFAULT_PROJECT_METRICS_GRANULARITY_SECONDS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_PROJECT_METRICS_GRANULARITY_SECONDS
+
+
+def monitor_heartbeat_write_seconds() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_MONITOR_HEARTBEAT_WRITE_SECONDS"))
+    if raw is None:
+        return DEFAULT_MONITOR_HEARTBEAT_WRITE_SECONDS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MONITOR_HEARTBEAT_WRITE_SECONDS
+
+
+def max_project_worktrees() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_MAX_PROJECT_WORKTREES"))
+    if raw is None:
+        return DEFAULT_MAX_PROJECT_WORKTREES
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_PROJECT_WORKTREES
+
+
+def max_project_active_run_artifacts() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_MAX_PROJECT_ACTIVE_RUN_ARTIFACTS"))
+    if raw is None:
+        return DEFAULT_MAX_PROJECT_ACTIVE_RUN_ARTIFACTS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_PROJECT_ACTIVE_RUN_ARTIFACTS
+
+
+def max_project_report_files() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_MAX_PROJECT_REPORT_FILES"))
+    if raw is None:
+        return DEFAULT_MAX_PROJECT_REPORT_FILES
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_PROJECT_REPORT_FILES
+
+
 def provider_preflight_ok_seconds() -> int:
     raw = normalize_optional_text(os.environ.get("TEAM_LEADER_PROVIDER_PREFLIGHT_OK_SECONDS"))
     if raw is None:
@@ -1901,6 +1965,9 @@ def project_state_policy_markdown(project_name: str, project_dir: Path, *, compa
             else "- Once a project settles cleanly, team-leader may compact transient dashboards, question scratchpads, per-run reports, and disposable child-run artifacts."
         ),
         f"- Planner waves are capped at `{max_plan_runs_per_wave()}` child runs.",
+        f"- Project writer worktrees are capped at `{max_project_worktrees()}` unreleased child worktree(s) at a time.",
+        f"- Active projects retain full child artifacts for only the latest `{max_project_active_run_artifacts()}` terminal runs before compacting older ones.",
+        f"- Active projects retain per-run report files for only the latest `{max_project_report_files()}` settled runs.",
         f"- Large child last messages are truncated to `{max_last_message_bytes()}` bytes with head/tail preservation.",
         f"- Launches are rate-limited to `{max_releases_per_cycle()}` new child sessions per `{max_release_window_seconds()}` seconds.",
         f"- Session-id log scans are capped at `{max_jsonl_scan_bytes()}` bytes per run refresh.",
@@ -1921,6 +1988,9 @@ def project_state_policy_cli(project_name: str, project_dir: Path) -> list[str]:
         "- generated markdown files are persistent manager state",
         "- settled projects may be compacted automatically to reduce leftover files",
         f"- planner waves are capped at {max_plan_runs_per_wave()} child runs",
+        f"- writer worktrees are capped at {max_project_worktrees()} unreleased child worktree(s) per project",
+        f"- active projects keep full artifacts for the latest {max_project_active_run_artifacts()} terminal runs",
+        f"- active projects keep per-run reports for the latest {max_project_report_files()} settled runs",
         f"- last messages are capped at {max_last_message_bytes()} bytes with head/tail preservation",
         f"- launches are capped at {max_releases_per_cycle()} per {max_release_window_seconds()}s window",
         f"- session-id scans are capped at {max_jsonl_scan_bytes()} bytes",
@@ -2041,6 +2111,14 @@ def run_is_unsettled(run: dict[str, Any]) -> bool:
     if status in {"running", "prepared", "blocked"}:
         return True
     return dispatch_state in {"ready", "blocked", "queued"}
+
+
+def project_metrics_observation_epoch(runs: list[dict[str, Any]], *, now_epoch: int | None = None) -> int:
+    current_epoch = now_epoch or epoch_now()
+    if not any(run_is_unsettled(run) for run in runs):
+        return current_epoch
+    granularity = project_metrics_granularity_seconds()
+    return current_epoch - (current_epoch % granularity)
 
 
 def markdown_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -3229,6 +3307,42 @@ def apply_release_throttle_metadata(index: dict[str, Any]) -> None:
         reserved += 1
 
 
+def run_holds_worktree_slot(run: dict[str, Any]) -> bool:
+    if not run_requires_workspace_isolation(run):
+        return False
+    if normalize_optional_text(run.get("workspace_released_at")):
+        return False
+    worktree_path_raw = normalize_optional_text(run.get("worktree_path"))
+    if not worktree_path_raw:
+        return False
+    return (Path(worktree_path_raw) / ".git").exists()
+
+
+def apply_worktree_cap_metadata(index: dict[str, Any]) -> None:
+    cap = max_project_worktrees()
+    reserved_by_project: dict[str, int] = {}
+    for run in index["runs"]:
+        project_name = normalize_optional_text(run.get("project"))
+        if not project_name or not run_holds_worktree_slot(run):
+            continue
+        reserved_by_project[project_name] = reserved_by_project.get(project_name, 0) + 1
+    for run in sorted(index["runs"], key=run_sort_key):
+        if str(run.get("status") or "") not in PRELAUNCH_STATUSES:
+            continue
+        if str(run.get("dispatch_state") or "") != "ready":
+            continue
+        if not run_requires_workspace_isolation(run):
+            continue
+        project_name = normalize_optional_text(run.get("project"))
+        if not project_name:
+            continue
+        reserved = reserved_by_project.get(project_name, 0)
+        if reserved >= cap:
+            set_run_dispatch_state(run, "queued", [f"worktree-cap:{cap}"])
+            continue
+        reserved_by_project[project_name] = reserved + 1
+
+
 def ensure_project_workspace(root: Path, project_name: str, slug: str) -> Path:
     project_dir = project_workspace_dir(root, project_name, slug)
     (project_dir / "reports").mkdir(parents=True, exist_ok=True)
@@ -3550,7 +3664,7 @@ def build_project_metrics(root: Path, project_name: str, runs: list[dict[str, An
     open_questions = unanswered_questions(question_records, answers)
     answered = answered_questions(question_records, answers)
     counts = run_status_counts(runs)
-    now_epoch = epoch_now()
+    now_epoch = project_metrics_observation_epoch(runs)
     start_at = project_start_timestamp(brief, runs)
     start_epoch = parse_timestamp_epoch(start_at)
     first_result_at = first_useful_result_timestamp(runs)
@@ -3566,7 +3680,7 @@ def build_project_metrics(root: Path, project_name: str, runs: list[dict[str, An
     waits = project_wait_metrics(runs, now_epoch=now_epoch)
     return {
         "project": project_name,
-        "updated_at": utc_now(),
+        "updated_at": utc_from_epoch(now_epoch),
         "workspace": str(project_dir),
         "metrics_file": str(project_metrics_md_path(project_dir)),
         "project_started_at": start_at,
@@ -3702,7 +3816,7 @@ def render_project_overview(
 ) -> str:
     counts = run_status_counts(runs)
     cwd_values = sorted({str(run.get("cwd") or "-") for run in runs})
-    watcher_state, watcher_heartbeat = monitor_state(project_dir.parent.parent)
+    watcher_state, _watcher_heartbeat = monitor_state(project_dir.parent.parent)
     blocked_count = sum(1 for run in runs if str(run.get("dispatch_state") or "") == "blocked")
     question_records = collect_question_records(runs)
     answers = load_answers(project_dir)
@@ -3719,8 +3833,6 @@ def render_project_overview(
     integration_issues = integration_alerts(runs)
     warning_runs = output_warning_runs(runs)
     watcher_line = f"- Manager watcher: `{watcher_state}`"
-    if watcher_heartbeat:
-        watcher_line += f" (last heartbeat `{watcher_heartbeat}`)"
     intro = (
         "This project is settled. team-leader compacted the transient dashboard, question scratchpads, and per-run report files. Use `history.md` for the compact run history and `manager-summary.md` for the latest aggregate view."
         if compacted
@@ -3760,7 +3872,6 @@ def render_project_overview(
             "",
             "## Metadata",
             "",
-            f"- Updated: `{utc_now()}`",
             f"- Project folder: `{project_dir}`",
             f"- Brief file: `{project_brief_md_path(project_dir)}`",
             f"- Launch plan: `{project_launch_plan_md_path(project_dir)}`",
@@ -3847,9 +3958,8 @@ def render_dashboard(
     if project_dir is None and runs:
         project_dir = project_root(Path(runs[0]["run_dir"]).parent.parent, runs[0])
     watcher_state = "idle"
-    watcher_heartbeat = None
     if project_dir is not None:
-        watcher_state, watcher_heartbeat = monitor_state(project_dir.parent.parent)
+        watcher_state, _watcher_heartbeat = monitor_state(project_dir.parent.parent)
     rows: list[list[str]] = []
     active: list[dict[str, Any]] = []
     completed: list[dict[str, Any]] = []
@@ -3889,7 +3999,6 @@ def render_dashboard(
     lines = [
         f"# {project_name} Dashboard",
         "",
-        f"- Updated: `{utc_now()}`",
         f"- Goal: {goal or '_No goal recorded yet._'}",
         f"- Validation status: `{validation_status or 'not-run'}`",
         f"- Current stage: `{stage['current_stage']}`",
@@ -3946,8 +4055,6 @@ def render_dashboard(
         for item in integration_issues:
             lines.append(f"- `{item['task_id']}` / `{item['run_id']}`: `{item['state']}` {item['note']}")
     lines.extend(["", "## Active Runs", ""])
-    if watcher_heartbeat:
-        lines.insert(3, f"- Last watcher heartbeat: `{watcher_heartbeat}`")
     if not active:
         lines.append("_No active runs._")
     else:
@@ -4062,7 +4169,6 @@ def render_manager_summary(
     lines = [
         f"# {project_name} Manager Summary",
         "",
-        f"- Updated: `{utc_now()}`",
         f"- Goal: {goal or '_No goal recorded yet._'}",
         f"- Validation status: `{validation_status or 'not-run'}`",
         f"- Current stage: `{stage['current_stage']}`",
@@ -4159,8 +4265,6 @@ def render_questions(question_records: list[dict[str, str]], answers: dict[str, 
     lines = [
         "# Questions For Humans",
         "",
-        f"_Updated: `{utc_now()}`_",
-        "",
         "Copy any line from `answers-template.md` into `answers.md` and replace `TODO` with the human answer.",
         "",
         "## Open",
@@ -4243,8 +4347,6 @@ def render_answers_template(question_records: list[dict[str, str]], answers: dic
 def render_conflicts(conflicts: list[dict[str, str]], integration_issues: list[dict[str, str]]) -> str:
     lines = [
         "# Conflict Risks",
-        "",
-        f"_Updated: `{utc_now()}`_",
         "",
     ]
     if conflicts:
@@ -4688,18 +4790,36 @@ def render_team_status_milestones(previous: dict[str, Any] | None, current: dict
 
 def write_project_reports(project_dir: Path, runs: list[dict[str, Any]]) -> list[dict[str, str]]:
     question_records = collect_question_records(runs)
+    retained_report_ids: set[str] = {str(run.get("run_id") or "") for run in runs if run_is_unsettled(run)}
+    terminal_budget = max_project_report_files()
+    for run in sorted(runs, key=run_sort_key, reverse=True):
+        run_id = str(run.get("run_id") or "")
+        if not run_id or run_id in retained_report_ids:
+            continue
+        if terminal_budget <= 0:
+            break
+        retained_report_ids.add(run_id)
+        terminal_budget -= 1
+    reports_dir = project_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    for path in reports_dir.glob("*.md"):
+        if path.stem not in retained_report_ids:
+            delete_if_exists(path)
     by_run: dict[str, list[dict[str, str]]] = {}
     for record in question_records:
         by_run.setdefault(record["run_id"], []).append(record)
     for run in runs:
-        report_path = project_dir / "reports" / f"{run['run_id']}.md"
+        run_id = str(run["run_id"])
+        if run_id not in retained_report_ids:
+            continue
+        report_path = reports_dir / f"{run_id}.md"
         last_message = last_message_display_for_run(run)
-        run_questions = by_run.get(str(run["run_id"]), [])
+        run_questions = by_run.get(run_id, [])
         content = "\n".join(
             [
-                f"# {run['run_id']}",
+                f"# {run_id}",
                 "",
-                f"- Task: `{run.get('task_id') or run['run_id']}`",
+                f"- Task: `{run.get('task_id') or run_id}`",
                 f"- Summary: {run.get('summary') or '-'}",
                 f"- Role: `{run.get('role') or '-'}`",
                 f"- Status: `{run.get('status') or '-'}`",
@@ -4765,7 +4885,7 @@ def compact_run_artifacts(
     include_failed: bool = False,
 ) -> tuple[bool, int]:
     status = str(run.get("status") or "")
-    if reason == "settled-project":
+    if reason in {"settled-project", "active-project-retention"}:
         allowed_statuses = AUTO_COMPACT_RUN_STATUSES
     else:
         allowed_statuses = cleanup_allowed_statuses(include_failed)
@@ -4883,6 +5003,27 @@ def apply_project_workspace_compaction(project_dir: Path, runs: list[dict[str, A
     worktrees_dir = project_dir / "worktrees"
     if worktrees_dir.exists() and not any(worktrees_dir.iterdir()):
         worktrees_dir.rmdir()
+
+
+def apply_active_project_artifact_budgets(root: Path, index: dict[str, Any]) -> None:
+    terminal_artifact_budget = max_project_active_run_artifacts()
+    projects = known_projects(root, index)
+    for slug in sorted(projects):
+        runs = sorted(
+            [
+                run
+                for run in index["runs"]
+                if normalize_optional_text(run.get("project_slug")) == slug
+            ],
+            key=run_sort_key,
+        )
+        uncompacted_terminal_runs = [
+            run
+            for run in sorted(runs, key=run_sort_key, reverse=True)
+            if not run_is_unsettled(run) and not normalize_optional_text(run.get("compacted_at"))
+        ]
+        for run in uncompacted_terminal_runs[terminal_artifact_budget:]:
+            compact_run_artifacts(run, reason="active-project-retention", include_failed=True)
 
 
 def cleanup_root_artifacts(
@@ -5014,7 +5155,13 @@ def save_index_and_sync(root: Path, data: dict[str, Any]) -> None:
     update_dispatch_metadata(data)
     apply_parallel_limit_metadata(data)
     apply_release_throttle_metadata(data)
+    apply_worktree_cap_metadata(data)
+    apply_active_project_artifact_budgets(root, data)
     cleanup_root_artifacts(root, data)
+    update_dispatch_metadata(data)
+    apply_parallel_limit_metadata(data)
+    apply_release_throttle_metadata(data)
+    apply_worktree_cap_metadata(data)
     save_index(root, data)
     sync_projects(root, data)
 
@@ -5775,6 +5922,7 @@ def launch_ready_runs(root: Path, index: dict[str, Any]) -> None:
     update_dispatch_metadata(index)
     apply_parallel_limit_metadata(index)
     apply_release_throttle_metadata(index)
+    apply_worktree_cap_metadata(index)
     for run in sorted(index["runs"], key=run_sort_key):
         if str(run.get("status") or "") not in PRELAUNCH_STATUSES:
             continue
@@ -5788,6 +5936,7 @@ def launch_ready_runs(root: Path, index: dict[str, Any]) -> None:
     update_dispatch_metadata(index)
     apply_parallel_limit_metadata(index)
     apply_release_throttle_metadata(index)
+    apply_worktree_cap_metadata(index)
 
 
 def run_has_provider_artifacts(run: dict[str, Any]) -> bool:
@@ -7125,13 +7274,20 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     pid_path = monitor_pid_path(root)
     heartbeat_path = monitor_heartbeat_path(root)
     current_pid = os.getpid()
+    last_heartbeat_write_epoch: int | None = None
     write_text(pid_path, f"{current_pid}\n")
     try:
         while True:
             with root_lock(root):
                 index = load_index(root)
                 refresh_index_state(root, index)
-                write_text(heartbeat_path, utc_now() + "\n")
+                current_epoch = epoch_now()
+                if (
+                    last_heartbeat_write_epoch is None
+                    or current_epoch - last_heartbeat_write_epoch >= monitor_heartbeat_write_seconds()
+                ):
+                    write_text(heartbeat_path, utc_from_epoch(current_epoch) + "\n")
+                    last_heartbeat_write_epoch = current_epoch
                 if not index_has_unsettled_runs(index):
                     break
             time.sleep(max(1, int(args.interval)))
