@@ -44,6 +44,9 @@ LEGACY_ROOTS_LABEL = ", ".join(f"./{name}" for name in LEGACY_ROOT_NAMES)
 DEFAULT_MAX_PARALLEL_SESSIONS = 8
 DEFAULT_MAX_RELEASES_PER_CYCLE = 2
 DEFAULT_RELEASE_WINDOW_SECONDS = 15
+DEFAULT_MAX_PLAN_RUNS_PER_WAVE = 24
+DEFAULT_PROJECT_MAX_PLANNER_ROUNDS = 12
+DEFAULT_PROJECT_MAX_AUTO_FIX_ROUNDS = 8
 DEFAULT_LAST_MESSAGE_BYTES = 128 * 1024
 DEFAULT_JSONL_SCAN_BYTES = 8 * 1024 * 1024
 DEFAULT_RUN_HEARTBEAT_INTERVAL_SECONDS = 10
@@ -60,14 +63,16 @@ QUESTION_SECTION_HINTS = ("question", "blocker", "human", "decision")
 ANSWER_LINE_RE = re.compile(r"^\s*[-*+]\s*`?([a-z0-9][a-z0-9-]*)`?\s*:\s*(.+?)\s*$", re.IGNORECASE)
 PRELAUNCH_STATUSES = {"prepared", "blocked"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "exited"}
-AUTO_COMPACT_RUN_STATUSES = {"completed"}
 DEFAULT_MANUAL_COMPACT_RUN_STATUSES = {"completed", "cancelled", "dry-run"}
 MANUAL_COMPACT_EXTRA_STATUSES = {"failed", "exited"}
+AUTO_COMPACT_RUN_STATUSES = DEFAULT_MANUAL_COMPACT_RUN_STATUSES | MANUAL_COMPACT_EXTRA_STATUSES
 RUN_COMPACT_FILE_NAMES = (
     "command.txt",
     "exit_code.txt",
     "finished_at.txt",
     "heartbeat.txt",
+    "last_message.md",
+    "last_message.preview.md",
     "prompt.md",
     "runner.sh",
     "started_at.txt",
@@ -96,6 +101,7 @@ CLARIFICATION_MODES = ("auto", "off")
 INTEGRATION_READY_STATES = {"applied", "applied-subset", "no-changes"}
 INTEGRATION_ALERT_STATES = {"conflict", "scope-violation", "apply-failed", "commit-failed"}
 INTEGRATION_BLOCKING_STATES = {"pending", *INTEGRATION_ALERT_STATES}
+AUTO_FIX_PLANNER_REASONS = {"failed-runs", "validation-failed", "waiting-for-sentinel", "integration-conflict"}
 
 
 def utc_now() -> str:
@@ -1107,6 +1113,7 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("output_warnings", [])
         run.setdefault("last_message_truncated", False)
         run.setdefault("last_message_original_bytes", None)
+        run.setdefault("compacted_last_message_preview", None)
         run.setdefault("max_run_seconds", None)
         run.setdefault("timed_out_at", None)
         run.setdefault("timeout_reason", None)
@@ -1279,6 +1286,16 @@ def max_release_window_seconds() -> int:
         return max(1, int(raw))
     except ValueError:
         return DEFAULT_RELEASE_WINDOW_SECONDS
+
+
+def max_plan_runs_per_wave() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_MAX_PLAN_RUNS_PER_WAVE"))
+    if raw is None:
+        return max(DEFAULT_MAX_PLAN_RUNS_PER_WAVE, max_parallel_sessions())
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return max(DEFAULT_MAX_PLAN_RUNS_PER_WAVE, max_parallel_sessions())
 
 
 def max_last_message_bytes() -> int:
@@ -1525,8 +1542,8 @@ def default_project_brief(project_name: str) -> dict[str, Any]:
         "validation_commands": [],
         "completion_sentinel": None,
         "max_work_seconds": None,
-        "max_planner_rounds": 3,
-        "max_auto_fix_rounds": 2,
+        "max_planner_rounds": DEFAULT_PROJECT_MAX_PLANNER_ROUNDS,
+        "max_auto_fix_rounds": DEFAULT_PROJECT_MAX_AUTO_FIX_ROUNDS,
         "planner_provider": None,
         "planner_provider_bin": None,
         "child_provider": None,
@@ -1580,13 +1597,13 @@ def load_project_brief(project_dir: Path, project_name: str | None = None) -> di
     try:
         max_rounds = int(max_rounds_raw)
     except (TypeError, ValueError):
-        max_rounds = 3
+        max_rounds = DEFAULT_PROJECT_MAX_PLANNER_ROUNDS
     brief["max_planner_rounds"] = max(1, max_rounds)
     max_auto_fix_rounds_raw = payload.get("max_auto_fix_rounds")
     try:
         max_auto_fix_rounds = int(max_auto_fix_rounds_raw)
     except (TypeError, ValueError):
-        max_auto_fix_rounds = 2
+        max_auto_fix_rounds = DEFAULT_PROJECT_MAX_AUTO_FIX_ROUNDS
     brief["max_auto_fix_rounds"] = max(0, max_auto_fix_rounds)
     brief["planner_provider"] = validate_provider_name(
         normalize_optional_text(payload.get("planner_provider")),
@@ -1767,6 +1784,7 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     lines.append(f"- Autonomy mode: `{autonomy_mode}`")
     lines.append(f"- Clarification mode: `{clarification_mode}`")
     lines.append(f"- Max parallel sessions: `{max_parallel_sessions()}`")
+    lines.append(f"- Max planned child runs per wave: `{max_plan_runs_per_wave()}`")
     lines.append(f"- Release throttle per cycle: `{max_releases_per_cycle()}`")
     lines.append(f"- Release throttle window: `{max_release_window_seconds()}` seconds")
     lines.append(f"- Max project work time: `{format_duration(max_work_seconds) if max_work_seconds is not None else '-'}`")
@@ -1882,6 +1900,7 @@ def project_state_policy_markdown(project_name: str, project_dir: Path, *, compa
             if compacted
             else "- Once a project settles cleanly, team-leader may compact transient dashboards, question scratchpads, per-run reports, and disposable child-run artifacts."
         ),
+        f"- Planner waves are capped at `{max_plan_runs_per_wave()}` child runs.",
         f"- Large child last messages are truncated to `{max_last_message_bytes()}` bytes with head/tail preservation.",
         f"- Launches are rate-limited to `{max_releases_per_cycle()}` new child sessions per `{max_release_window_seconds()}` seconds.",
         f"- Session-id log scans are capped at `{max_jsonl_scan_bytes()}` bytes per run refresh.",
@@ -1901,6 +1920,7 @@ def project_state_policy_cli(project_name: str, project_dir: Path) -> list[str]:
         "- same project name reuses this folder and tracked history",
         "- generated markdown files are persistent manager state",
         "- settled projects may be compacted automatically to reduce leftover files",
+        f"- planner waves are capped at {max_plan_runs_per_wave()} child runs",
         f"- last messages are capped at {max_last_message_bytes()} bytes with head/tail preservation",
         f"- launches are capped at {max_releases_per_cycle()} per {max_release_window_seconds()}s window",
         f"- session-id scans are capped at {max_jsonl_scan_bytes()} bytes",
@@ -2013,6 +2033,14 @@ def run_status_counts(runs: list[dict[str, Any]]) -> dict[str, int]:
 def run_sort_key(run: dict[str, Any]) -> tuple[str, str]:
     created_at = str(run.get("created_at") or run.get("launched_at") or "")
     return created_at, str(run.get("run_id") or "")
+
+
+def run_is_unsettled(run: dict[str, Any]) -> bool:
+    status = str(run.get("status") or "")
+    dispatch_state = str(run.get("dispatch_state") or "")
+    if status in {"running", "prepared", "blocked"}:
+        return True
+    return dispatch_state in {"ready", "blocked", "queued"}
 
 
 def markdown_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -2328,15 +2356,23 @@ def delete_git_branch_if_present(repo_root: Path, branch_name: str) -> None:
     git_run(["branch", "-D", branch_name], cwd=repo_root, check=False)
 
 
-def maybe_release_run_worktree(run: dict[str, Any]) -> None:
+def maybe_release_run_worktree(run: dict[str, Any], *, allow_terminal_cleanup: bool = False) -> None:
     if not run_requires_workspace_isolation(run):
         return
     if normalize_optional_text(run.get("workspace_released_at")):
         return
-    if str(run.get("status") or "") != "completed":
-        return
-    if normalize_optional_text(run.get("integration_state")) not in INTEGRATION_READY_STATES:
-        return
+    status = str(run.get("status") or "")
+    integration_state = normalize_optional_text(run.get("integration_state"))
+    if allow_terminal_cleanup:
+        if status not in AUTO_COMPACT_RUN_STATUSES:
+            return
+        if status == "completed" and integration_state not in INTEGRATION_READY_STATES:
+            return
+    else:
+        if status != "completed":
+            return
+        if integration_state not in INTEGRATION_READY_STATES:
+            return
     repo_root = project_git_root_for_run(run)
     worktree_path_raw = normalize_optional_text(run.get("worktree_path"))
     if not repo_root or not worktree_path_raw:
@@ -2712,7 +2748,7 @@ def auto_fix_round_count(runs: list[dict[str, Any]]) -> int:
         for run in runs
         if run_is_planner(run)
         and normalize_optional_text(run.get("planner_reason"))
-        in {"failed-runs", "validation-failed", "waiting-for-sentinel", "integration-conflict"}
+        in AUTO_FIX_PLANNER_REASONS
     )
 
 
@@ -2835,6 +2871,7 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             f"- If a run omits `provider`, the manager will use `{default_child_provider}` by default.",
             "- Set `provider_bin` only when the user explicitly asked for a non-default executable path.",
             "- Use as few child sessions as necessary.",
+            f"- Do not emit more than {max_plan_runs_per_wave()} child runs in one plan; if more work is needed, schedule only the next wave.",
             "- Split writers by disjoint file ownership whenever possible.",
             "- Prefer read-only research or review children if write boundaries are unclear.",
             "- Writers should own explicit disjoint paths whenever possible.",
@@ -2905,9 +2942,38 @@ def build_question_record(run: dict[str, Any], text: str) -> dict[str, str]:
     }
 
 
+def normalize_cached_question_records(run: dict[str, Any], cached: Any) -> list[dict[str, str]]:
+    if not isinstance(cached, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in cached:
+        if not isinstance(item, dict):
+            continue
+        text = normalize_optional_text(item.get("text"))
+        if not text:
+            continue
+        normalized.append(
+            {
+                "id": normalize_optional_text(item.get("id")) or question_id_for(run, text),
+                "run_id": normalize_optional_text(item.get("run_id")) or str(run["run_id"]),
+                "task_id": normalize_optional_text(item.get("task_id")) or str(run.get("task_id") or run["run_id"]),
+                "summary": normalize_optional_text(item.get("summary")) or str(run.get("summary") or "-"),
+                "text": text,
+            }
+        )
+    run["question_records"] = normalized
+    return normalized
+
+
 def question_records_for_run(run: dict[str, Any]) -> list[dict[str, str]]:
     path = Path(run["last_message_path"])
+    cached = run.get("question_records")
     if not path.exists():
+        normalized = normalize_cached_question_records(run, cached)
+        if normalized:
+            run["question_source_bytes"] = None
+            run["question_source_mtime_ns"] = None
+            return normalized
         run["question_records"] = []
         run["question_source_bytes"] = None
         run["question_source_mtime_ns"] = None
@@ -2915,30 +2981,12 @@ def question_records_for_run(run: dict[str, Any]) -> list[dict[str, str]]:
     stat = path.stat()
     size = stat.st_size
     mtime_ns = stat.st_mtime_ns
-    cached = run.get("question_records")
     if (
         isinstance(cached, list)
         and run.get("question_source_bytes") == size
         and run.get("question_source_mtime_ns") == mtime_ns
     ):
-        normalized: list[dict[str, str]] = []
-        for item in cached:
-            if not isinstance(item, dict):
-                continue
-            text = normalize_optional_text(item.get("text"))
-            if not text:
-                continue
-            normalized.append(
-                {
-                    "id": normalize_optional_text(item.get("id")) or question_id_for(run, text),
-                    "run_id": normalize_optional_text(item.get("run_id")) or str(run["run_id"]),
-                    "task_id": normalize_optional_text(item.get("task_id")) or str(run.get("task_id") or run["run_id"]),
-                    "summary": normalize_optional_text(item.get("summary")) or str(run.get("summary") or "-"),
-                    "text": text,
-                }
-            )
-        run["question_records"] = normalized
-        return normalized
+        return normalize_cached_question_records(run, cached)
     records = [build_question_record(run, question_text) for question_text in extract_questions(last_message_for_run(run))]
     run["question_records"] = records
     run["question_source_bytes"] = size
@@ -2982,6 +3030,9 @@ def last_message_display_for_run(run: dict[str, Any]) -> str | None:
     preview_path = last_message_preview_path_for_run(run)
     if preview_path.exists():
         return read_text_if_exists(preview_path)
+    cached = normalize_optional_text(run.get("compacted_last_message_preview"))
+    if cached:
+        return cached
     return last_message_for_run(run)
 
 
@@ -3722,7 +3773,11 @@ def render_project_overview(
             f"- Max parallel sessions: `{max_parallel_sessions()}`",
             f"- Release throttle per cycle: `{max_releases_per_cycle()}`",
             f"- Release throttle window: `{max_release_window_seconds()}` seconds",
-            f"- Max auto-fix rounds: `{max_auto_fix_rounds if max_auto_fix_rounds is not None else 2}`",
+            (
+                f"- Max auto-fix rounds: `{max_auto_fix_rounds}`"
+                if max_auto_fix_rounds is not None
+                else f"- Max auto-fix rounds: `{DEFAULT_PROJECT_MAX_AUTO_FIX_ROUNDS}`"
+            ),
             f"- Validation status: `{validation_status or 'not-run'}`",
             f"- Current stage: `{stage['current_stage']}`",
             f"- Stage reason: {stage['stage_reason']}",
@@ -4256,7 +4311,11 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"parallel_limit={max_parallel_sessions()}",
         f"release_throttle={max_releases_per_cycle()}",
         f"release_window_seconds={max_release_window_seconds()}",
-        f"max_auto_fix_rounds={brief.get('max_auto_fix_rounds') if brief else 2}",
+        (
+            f"max_auto_fix_rounds={brief.get('max_auto_fix_rounds')}"
+            if brief
+            else f"max_auto_fix_rounds={DEFAULT_PROJECT_MAX_AUTO_FIX_ROUNDS}"
+        ),
         f"validation_status={normalize_optional_text(validation.get('status')) if validation else 'not-run'}",
         f"current_stage={stage['current_stage']}",
         f"stage_reason={stage['stage_reason']}",
@@ -4713,6 +4772,10 @@ def compact_run_artifacts(
     if status not in allowed_statuses:
         return False, 0
     run_dir = Path(run["run_dir"])
+    cached_preview = preview_text(last_message_display_for_run(run), max_lines=8, max_chars=900)
+    run["compacted_last_message_preview"] = cached_preview
+    question_records_for_run(run)
+    maybe_release_run_worktree(run, allow_terminal_cleanup=True)
     removed_names: list[str] = []
     for name in RUN_COMPACT_FILE_NAMES:
         path = run_dir / name
@@ -4723,6 +4786,13 @@ def compact_run_artifacts(
     if guard_dir.exists():
         delete_tree_if_exists(guard_dir)
         removed_names.append("child-bin/")
+    if run_dir.exists() and not any(run_dir.iterdir()):
+        try:
+            run_dir.rmdir()
+        except OSError:
+            pass
+        else:
+            removed_names.append("run_dir/")
     was_compacted = bool(normalize_optional_text(run.get("compacted_at")))
     if removed_names or not was_compacted:
         run["compacted_at"] = utc_now()
@@ -4744,13 +4814,6 @@ def project_cleanup_state(
     answers = load_answers(project_dir)
     open_questions = unanswered_questions(question_records, answers)
     integration_issues = integration_alerts(runs)
-    validation = load_project_validation(project_dir)
-    validation_status = normalize_optional_text(validation.get("status")) if validation else None
-    blocked_terminal_statuses = {"cancelled", "dry-run"} | MANUAL_COMPACT_EXTRA_STATUSES
-    non_completed_terminal_runs = [
-        run for run in runs
-        if str(run.get("status") or "") in blocked_terminal_statuses
-    ]
     reason: str | None = None
     if project_has_unsettled_runs(runs):
         reason = "project still has active, queued, or blocked runs"
@@ -4758,10 +4821,6 @@ def project_cleanup_state(
         reason = "project still has integration issues"
     elif open_questions:
         reason = "project still has unanswered human questions"
-    elif (validation_status in {"failed", "timeout"}) and not include_failed:
-        reason = f"validation is still `{validation_status}`"
-    elif non_completed_terminal_runs and not include_failed:
-        reason = "project still has cancelled, dry-run, failed, or exited runs"
     return {
         "eligible": reason is None,
         "reason": reason,
@@ -5151,10 +5210,27 @@ def apply_planner_run(root: Path, index: dict[str, Any], run: dict[str, Any]) ->
         return []
     planned_ids: list[str] = []
     existing_task_ids = {normalize_optional_text(item.get("task_id")) for item in index["runs"]}
-    normalized_runs: list[dict[str, Any]] = []
+    normalized_runs = [dict(item) for item in plan["runs"]]
+    plan_limit = max_plan_runs_per_wave()
+    if len(normalized_runs) > plan_limit:
+        run["plan_applied_at"] = None
+        run["plan_apply_error"] = (
+            f"launch plan lists {len(normalized_runs)} child runs; the per-wave limit is {plan_limit}"
+        )
+        run["planned_run_ids"] = []
+        save_project_launch_plan(
+            project_dir,
+            {
+                "source_run_id": run["run_id"],
+                "plan_summary": plan["plan_summary"],
+                "runs": normalized_runs,
+                "applied_at": None,
+                "updated_at": utc_now(),
+            },
+        )
+        return []
     try:
-        for item in plan["runs"]:
-            normalized_runs.append(dict(item))
+        for item in normalized_runs:
             task_id = normalize_optional_text(item.get("task_id"))
             if task_id and task_id in existing_task_ids:
                 continue
@@ -5213,39 +5289,50 @@ def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], r
     conflicts = detect_conflict_risks(runs)
     if conflicts:
         return False, "resolve-conflicts"
-    if any(str(run.get("status") or "") == "running" for run in runs):
-        return False, "active-runs"
-    if any(str(run.get("dispatch_state") or "") == "blocked" for run in runs):
-        return False, "blocked-runs"
     latest_planner = latest_project_planner_run(runs)
     if latest_planner and str(latest_planner.get("status") or "") in {"running", "prepared", "blocked"}:
         return False, "planner-already-running"
-    max_rounds = int(brief.get("max_planner_rounds") or 3)
+    if project_has_unsettled_nonplanner_runs(runs):
+        return False, "worker-runs-pending"
+    if latest_planner and normalize_optional_text(latest_planner.get("plan_apply_error")):
+        if not answers_updated_after(project_dir, normalize_optional_text(latest_planner.get("finished_at"))):
+            return False, "planner-apply-error"
+    max_rounds = int(brief.get("max_planner_rounds") or DEFAULT_PROJECT_MAX_PLANNER_ROUNDS)
     if planner_round_count(runs) >= max_rounds:
         return False, "max-rounds-reached"
-    max_auto_fix_rounds = max(0, int(brief.get("max_auto_fix_rounds") or 0))
+    max_auto_fix_rounds = max(
+        0,
+        int(brief.get("max_auto_fix_rounds") or DEFAULT_PROJECT_MAX_AUTO_FIX_ROUNDS),
+    )
     validation = maybe_refresh_project_validation(project_dir, brief, runs) if runs else load_project_validation(project_dir)
     if project_is_machine_complete(brief, validation) is True:
         return False, "complete"
-    if auto_fix_round_count(runs) >= max_auto_fix_rounds and max_auto_fix_rounds >= 0:
-        if validation and validation.get("status") in {"failed", "waiting-for-sentinel"}:
-            return False, "max-auto-fix-rounds-reached"
     if latest_planner and latest_planner.get("plan_applied_at") and not normalize_str_list(latest_planner.get("planned_run_ids"), "planned_run_ids"):
         if not answers_updated_after(project_dir, normalize_optional_text(latest_planner.get("finished_at"))):
             if not validation or validation.get("status") not in {"failed", "waiting-for-sentinel"}:
                 return False, "planner-produced-no-work"
     if not runs:
         return True, "first-plan"
-    if any(str(run.get("status") or "") == "failed" for run in runs):
-        return True, "failed-runs"
-    if any(
+    failed_runs_present = any(str(run.get("status") or "") == "failed" for run in runs)
+    integration_recovery_needed = any(
         normalize_optional_text(run.get("integration_state"))
         in {"conflict", "scope-violation", "apply-failed", "commit-failed"}
         for run in runs
-    ):
+    )
+    validation_recovery_reason = (
+        str(validation.get("status"))
+        if validation and validation.get("status") in {"failed", "waiting-for-sentinel"}
+        else None
+    )
+    if auto_fix_round_count(runs) >= max_auto_fix_rounds:
+        if failed_runs_present or integration_recovery_needed or validation_recovery_reason:
+            return False, "max-auto-fix-rounds-reached"
+    if failed_runs_present:
+        return True, "failed-runs"
+    if integration_recovery_needed:
         return True, "integration-conflict"
-    if validation and validation.get("status") in {"failed", "waiting-for-sentinel"}:
-        return True, str(validation.get("status"))
+    if validation_recovery_reason:
+        return True, validation_recovery_reason
     if latest_planner is None:
         return True, "missing-planner"
     return False, "manual-review"
@@ -5993,17 +6080,12 @@ def watch_view_key(view: str) -> str:
     return re.sub(r"(?m)^(watcher=[^\n]+?) heartbeat=[^\n]+$", r"\1", view)
 
 
+def project_has_unsettled_nonplanner_runs(runs: list[dict[str, Any]]) -> bool:
+    return any(not run_is_planner(run) and run_is_unsettled(run) for run in runs)
+
+
 def project_has_unsettled_runs(runs: list[dict[str, Any]]) -> bool:
-    for run in runs:
-        status = str(run.get("status") or "")
-        dispatch_state = str(run.get("dispatch_state") or "")
-        if status == "running":
-            return True
-        if status in {"prepared"}:
-            return True
-        if dispatch_state in {"ready", "blocked", "queued"}:
-            return True
-    return False
+    return any(run_is_unsettled(run) for run in runs)
 
 
 def project_has_state_files(root: Path, project_name: str) -> bool:

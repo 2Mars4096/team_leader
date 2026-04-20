@@ -1,6 +1,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import sys
 import unittest
@@ -395,6 +396,246 @@ class TeamLeaderAdapterTests(unittest.TestCase):
             )
         self.assertFalse(mismatch["success"])
         self.assertFalse(mismatch["matched_expected_text"])
+
+    def test_should_not_spawn_planner_while_worker_runs_are_still_pending(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            brief = {
+                "goal": "ship it",
+                "max_planner_rounds": 10,
+                "max_auto_fix_rounds": 2,
+            }
+            runs = [
+                {
+                    "run_id": "planner-1",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "manager-plan-1",
+                    "role": "manager",
+                    "planner_source": "team-leader-planner",
+                    "plan_applied_at": "2026-01-01T00:00:00Z",
+                    "planned_run_ids": ["worker-1"],
+                    "last_message_path": str(project_dir / "planner.md"),
+                    "summary": "planner",
+                },
+                {
+                    "run_id": "worker-1",
+                    "status": "failed",
+                    "dispatch_state": "failed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "worker-1",
+                    "role": "implementation",
+                    "last_message_path": str(project_dir / "worker-1.md"),
+                    "summary": "failed worker",
+                },
+                {
+                    "run_id": "worker-2",
+                    "status": "blocked",
+                    "dispatch_state": "queued",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "worker-2",
+                    "role": "implementation",
+                    "last_message_path": str(project_dir / "worker-2.md"),
+                    "summary": "queued worker",
+                },
+            ]
+            self.assertEqual(
+                team_leader.should_spawn_planner_for_project(project_dir, brief, runs),
+                (False, "worker-runs-pending"),
+            )
+
+    def test_auto_fix_round_cap_blocks_failed_run_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            brief = {
+                "goal": "ship it",
+                "max_planner_rounds": 10,
+                "max_auto_fix_rounds": 2,
+            }
+            runs = [
+                {
+                    "run_id": "planner-1",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "manager-plan-1",
+                    "role": "manager",
+                    "planner_source": "team-leader-planner",
+                    "planner_reason": "failed-runs",
+                    "plan_applied_at": "2026-01-01T00:00:00Z",
+                    "planned_run_ids": ["worker-1"],
+                    "last_message_path": str(project_dir / "planner-1.md"),
+                    "summary": "planner 1",
+                },
+                {
+                    "run_id": "planner-2",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "manager-plan-2",
+                    "role": "manager",
+                    "planner_source": "team-leader-planner",
+                    "planner_reason": "failed-runs",
+                    "plan_applied_at": "2026-01-01T00:01:00Z",
+                    "planned_run_ids": ["worker-2"],
+                    "last_message_path": str(project_dir / "planner-2.md"),
+                    "summary": "planner 2",
+                },
+                {
+                    "run_id": "worker-1",
+                    "status": "failed",
+                    "dispatch_state": "failed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "worker-1",
+                    "role": "implementation",
+                    "last_message_path": str(project_dir / "worker-1.md"),
+                    "summary": "failed worker",
+                },
+            ]
+            self.assertEqual(
+                team_leader.should_spawn_planner_for_project(project_dir, brief, runs),
+                (False, "max-auto-fix-rounds-reached"),
+            )
+
+    def test_planner_apply_error_pauses_continuous_retries(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            brief = {
+                "goal": "ship it",
+                "max_planner_rounds": 10,
+                "max_auto_fix_rounds": 2,
+            }
+            runs = [
+                {
+                    "run_id": "planner-1",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "manager-plan-1",
+                    "role": "manager",
+                    "planner_source": "team-leader-planner",
+                    "planner_reason": "failed-runs",
+                    "plan_apply_error": "launch plan lists 99 child runs",
+                    "finished_at": "2026-01-01T00:00:00Z",
+                    "last_message_path": str(project_dir / "planner-1.md"),
+                    "summary": "planner 1",
+                },
+                {
+                    "run_id": "worker-1",
+                    "status": "failed",
+                    "dispatch_state": "failed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "worker-1",
+                    "role": "implementation",
+                    "last_message_path": str(project_dir / "worker-1.md"),
+                    "summary": "failed worker",
+                },
+            ]
+            self.assertEqual(
+                team_leader.should_spawn_planner_for_project(project_dir, brief, runs),
+                (False, "planner-apply-error"),
+            )
+
+    def test_apply_planner_run_rejects_oversized_plans(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".team-leader"
+            team_leader.ensure_root(root)
+            project_dir = team_leader.ensure_project_workspace(root, "demo", "demo")
+            brief = team_leader.default_project_brief("demo")
+            brief["goal"] = "ship it"
+            team_leader.save_project_brief(project_dir, brief)
+            planner_output = project_dir / "planner-output.md"
+            planner_output.write_text("plan\n", encoding="utf-8")
+            run = {
+                "run_id": "planner-1",
+                "project": "demo",
+                "project_slug": "demo",
+                "last_message_path": str(planner_output),
+                "plan_applied_at": None,
+                "plan_apply_error": None,
+                "planned_run_ids": [],
+                "provider": "codex",
+                "provider_bin": None,
+                "add_dirs": [],
+                "configs": [],
+                "enables": [],
+                "disables": [],
+                "images": [],
+                "search": False,
+                "skip_git_repo_check": False,
+                "ephemeral": False,
+                "full_auto": True,
+                "dangerous": False,
+                "planner_default_child_provider": "codex",
+                "planner_default_child_provider_bin": None,
+                "planner_allowed_providers": ["codex"],
+            }
+            index = {"version": 1, "runs": [run]}
+            oversized_plan = {
+                "plan_summary": "too many runs",
+                "runs": [
+                    {
+                        "task_id": f"task-{idx}",
+                        "name": f"task-{idx}",
+                        "role": "reviewer",
+                        "summary": f"Task {idx}",
+                        "cwd": ".",
+                        "sandbox": "read-only",
+                        "owned_paths": [],
+                        "depends_on": [],
+                        "prompt": "Review only.",
+                    }
+                    for idx in range(3)
+                ],
+            }
+            with mock.patch.object(team_leader, "extract_launch_plan", return_value=oversized_plan), mock.patch.object(
+                team_leader, "max_plan_runs_per_wave", return_value=2
+            ):
+                planned_ids = team_leader.apply_planner_run(root, index, run)
+            self.assertEqual(planned_ids, [])
+            self.assertIn("per-wave limit is 2", run["plan_apply_error"])
+            self.assertEqual(run["planned_run_ids"], [])
+
+    def test_compaction_caches_preview_and_question_records(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run-1"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            last_message_path = run_dir / "last_message.md"
+            last_message_path.write_text(
+                "Done.\n\nQuestions For Humans\n- Should we keep the fallback path?\n",
+                encoding="utf-8",
+            )
+            run = {
+                "run_id": "run-1",
+                "status": "failed",
+                "run_dir": str(run_dir),
+                "stdout_path": str(run_dir / "stdout.jsonl"),
+                "stderr_log": str(run_dir / "stderr.log"),
+                "last_message_path": str(last_message_path),
+                "workspace_mode": "direct",
+                "compacted_at": None,
+                "compaction_removed": [],
+                "summary": "failed worker",
+                "task_id": "worker-1",
+            }
+            changed, removed = team_leader.compact_run_artifacts(run, reason="settled-project")
+            self.assertTrue(changed)
+            self.assertGreaterEqual(removed, 1)
+            self.assertFalse(last_message_path.exists())
+            self.assertFalse(run_dir.exists())
+            self.assertIn("Done.", team_leader.last_message_display_for_run(run))
+            records = team_leader.question_records_for_run(run)
+            self.assertEqual(len(records), 1)
+            self.assertIn("fallback path", records[0]["text"])
 
 
 if __name__ == "__main__":
