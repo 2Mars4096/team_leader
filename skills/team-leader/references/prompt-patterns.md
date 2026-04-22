@@ -1,6 +1,6 @@
 # Prompt Patterns
 
-Use these as starting points when dispatching Codex subsessions.
+Use these as starting points when dispatching child sessions. Older references to "Codex subsessions" mean the same thing when the selected provider is `codex`.
 
 ## Research Child
 

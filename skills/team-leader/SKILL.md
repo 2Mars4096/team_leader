@@ -9,7 +9,7 @@ description: Use when a user wants a team-leader style Codex manager that launch
 
 This skill manages real child sessions through a provider adapter layer. The controller now ships verified adapters for `codex`, `claude`, `cursor`, and `kiro`.
 
-Treat a subsession as a full child CLI worker with its own session, context window, tool use, and follow-up lifecycle. This is more flexible than a lightweight in-process subagent because a child session can keep working independently, be resumed later, and itself act as a manager when useful.
+Treat a child session as a full child CLI worker with its own session, context window, tool use, and follow-up lifecycle. Older docs may still call this a "subsession", especially for Codex-backed runs, but the broader term in this skill is "child session". This is more flexible than a lightweight in-process subagent because a child session can keep working independently, be resumed later, and itself act as a manager when useful.
 
 Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragments. This path is relative to the skill itself, not the project root. In this repo that file is at `skills/team-leader/scripts/team_leader.py`, and when installed it lives under the Codex skills directory at `.../skills/team-leader/scripts/team_leader.py`. Keep your working directory at the target project unless you pass `--root` and `--cd` explicitly; do not `cd` into the skill directory just to run the controller, because the default `.team-leader/` root is derived from the current working directory. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
@@ -56,7 +56,7 @@ Keep provider-specific logic inside the adapter layer: option validation, launch
 
 Built-in subagents are lightweight delegated helpers inside the current orchestration model.
 
-Subsessions in this skill are separate provider sessions:
+Child sessions in this skill are separate provider sessions:
 
 - They run through the normal headless/resume surface for the selected provider
 - They can use the same tools and workflows that provider would normally expose

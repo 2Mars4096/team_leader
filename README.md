@@ -1,6 +1,6 @@
 # Team Leader
 
-A Codex skill and standalone controller that manages real child CLI sessions as a team-leader style orchestrator. It launches, tracks, reviews, and aggregates parallel workers through project dashboards, dependency-aware dispatch, and automatic markdown workspaces.
+A Codex skill and standalone controller that manages real child CLI sessions as a team-leader style orchestrator. It launches, tracks, reviews, and aggregates parallel workers through project dashboards, dependency-aware dispatch, and automatic markdown workspaces. Codex-backed runs are still supported, but the controller now treats them as one provider option within a broader child-session model.
 
 Unlike lightweight built-in subagents, each child session is a full external CLI session with its own context, tool access, and resume lifecycle.
 
