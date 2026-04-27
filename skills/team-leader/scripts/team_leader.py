@@ -56,6 +56,7 @@ DEFAULT_LAST_MESSAGE_BYTES = 128 * 1024
 DEFAULT_JSONL_SCAN_BYTES = 8 * 1024 * 1024
 DEFAULT_RUN_HEARTBEAT_INTERVAL_SECONDS = 10
 DEFAULT_RUN_HEARTBEAT_STALE_SECONDS = 45
+DEFAULT_RUN_TIMEOUT_GRACE_SECONDS = 5
 STDOUT_WARNING_BYTES = 8 * 1024 * 1024
 STDERR_WARNING_BYTES = 4 * 1024 * 1024
 CODEX_BACKEND_HOST = "chatgpt.com"
@@ -83,6 +84,8 @@ RUN_COMPACT_FILE_NAMES = (
     "started_at.txt",
     "state.txt",
     "stderr.log",
+    "timed_out_at.txt",
+    "timeout_reason.txt",
     "stdout.jsonl",
 )
 PROJECT_COMPACT_DELETE_FILES = (
@@ -1351,6 +1354,16 @@ def run_heartbeat_stale_seconds() -> int:
         return max(run_heartbeat_interval_seconds() + 2, int(raw))
     except ValueError:
         return fallback
+
+
+def run_timeout_grace_seconds() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_RUN_TIMEOUT_GRACE_SECONDS"))
+    if raw is None:
+        return DEFAULT_RUN_TIMEOUT_GRACE_SECONDS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_RUN_TIMEOUT_GRACE_SECONDS
 
 
 def project_metrics_granularity_seconds() -> int:
@@ -5482,6 +5495,8 @@ def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], r
         return True, validation_recovery_reason
     if latest_planner is None:
         return True, "missing-planner"
+    if project_work_budget_seconds(brief) is not None:
+        return True, "time-budget-continuation"
     return False, "manual-review"
 
 
@@ -5779,6 +5794,14 @@ def run_heartbeat_path(run: dict[str, Any]) -> Path:
     return Path(run["run_dir"]) / "heartbeat.txt"
 
 
+def run_timed_out_path(run: dict[str, Any]) -> Path:
+    return Path(run["run_dir"]) / "timed_out_at.txt"
+
+
+def run_timeout_reason_path(run: dict[str, Any]) -> Path:
+    return Path(run["run_dir"]) / "timeout_reason.txt"
+
+
 def run_elapsed_seconds(run: dict[str, Any], *, now_epoch: int | None = None) -> int | None:
     launched_epoch = parse_timestamp_epoch(normalize_optional_text(run.get("launched_at")))
     if launched_epoch is None:
@@ -5971,16 +5994,34 @@ def convert_running_launch_failure(run: dict[str, Any], note: str) -> None:
     write_text(Path(run["run_dir"]) / "state.txt", "blocked\n")
 
 
-def convert_running_timeout(run: dict[str, Any], note: str) -> None:
-    pid = run.get("pid")
-    if pid and pid_alive(pid):
+def terminate_run_process(pid: int | None, *, grace_seconds: int | None = None) -> None:
+    if not pid or not pid_alive(pid):
+        return
+    sent_group_signal = False
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        sent_group_signal = True
+    except OSError:
         try:
-            os.killpg(pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGTERM)
         except OSError:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
+            return
+    deadline = time.time() + max(0, grace_seconds if grace_seconds is not None else run_timeout_grace_seconds())
+    while pid_alive(pid) and time.time() < deadline:
+        time.sleep(0.1)
+    if not pid_alive(pid):
+        return
+    try:
+        if sent_group_signal:
+            os.killpg(pid, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def convert_running_timeout(run: dict[str, Any], note: str) -> None:
+    terminate_run_process(run.get("pid"))
     timestamp = utc_now()
     run["pid"] = None
     run["status"] = "failed"
@@ -5996,6 +6037,8 @@ def convert_running_timeout(run: dict[str, Any], note: str) -> None:
     write_text(run_dir / "state.txt", "failed\n")
     write_text(run_dir / "exit_code.txt", "124\n")
     write_text(run_dir / "finished_at.txt", timestamp + "\n")
+    write_text(run_timed_out_path(run), timestamp + "\n")
+    write_text(run_timeout_reason_path(run), note + "\n")
 
 
 def refresh_run(run: dict[str, Any]) -> None:
@@ -6004,6 +6047,8 @@ def refresh_run(run: dict[str, Any]) -> None:
     exit_code = read_text_if_exists(run_dir / "exit_code.txt")
     finished_at = read_text_if_exists(run_dir / "finished_at.txt")
     heartbeat_at = read_text_if_exists(run_heartbeat_path(run))
+    timed_out_at = read_text_if_exists(run_timed_out_path(run))
+    timeout_reason = read_text_if_exists(run_timeout_reason_path(run))
     if state:
         run["status"] = state.strip()
         if str(run.get("status") or "") in TERMINAL_STATUSES:
@@ -6017,6 +6062,10 @@ def refresh_run(run: dict[str, Any]) -> None:
         run["exit_code"] = int(exit_code.strip())
     if finished_at:
         run["finished_at"] = finished_at.strip()
+    if timed_out_at:
+        run["timed_out_at"] = timed_out_at.strip()
+    if timeout_reason:
+        run["timeout_reason"] = timeout_reason.strip()
     run["heartbeat_at"] = heartbeat_at.strip() if heartbeat_at else None
     if str(run.get("status") or "") in TERMINAL_STATUSES:
         run["pid"] = None
@@ -6062,11 +6111,25 @@ def build_runner_script(
     finished_path: Path,
     heartbeat_path: Path,
     heartbeat_interval_seconds: int,
+    timed_out_path: Path,
+    timeout_reason_path: Path,
+    max_run_seconds: int | None = None,
+    timeout_grace_seconds: int | None = None,
+    manager_tick_command: list[str] | None = None,
     env_exports: dict[str, str] | None = None,
     path_prefix: Path | None = None,
 ) -> str:
     cmd = quote_command(command)
+    state_q = shlex.quote(str(state_path))
+    exit_code_q = shlex.quote(str(exit_code_path))
+    started_q = shlex.quote(str(started_path))
+    finished_q = shlex.quote(str(finished_path))
     heartbeat_q = shlex.quote(str(heartbeat_path))
+    timed_out_q = shlex.quote(str(timed_out_path))
+    timeout_reason_q = shlex.quote(str(timeout_reason_path))
+    prompt_q = shlex.quote(str(prompt_path))
+    tick_cmd = quote_command(manager_tick_command) if manager_tick_command else None
+    timeout_grace = max(1, timeout_grace_seconds or run_timeout_grace_seconds())
     lines = [
         "#!/usr/bin/env bash",
         "set -uo pipefail",
@@ -6078,11 +6141,40 @@ def build_runner_script(
         lines.append(f"export {key}={shlex.quote(value)}")
     lines.extend(
         [
-            f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {shlex.quote(str(started_path))}",
-            f"printf '%s\\n' running > {shlex.quote(str(state_path))}",
+            f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {started_q}",
+            f"printf '%s\\n' running > {state_q}",
             f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {heartbeat_q}",
-            f"({cmd} < {shlex.quote(str(prompt_path))}) &",
+            f"({cmd} < {prompt_q}) &",
             "child_pid=$!",
+        ]
+    )
+    if max_run_seconds is not None:
+        timeout_seconds = max(1, int(max_run_seconds))
+        timeout_note = f"run exceeded max_run_seconds ({timeout_seconds}s)"
+        lines.extend(
+            [
+                "(",
+                "  trap '' TERM",
+                f"  sleep {timeout_seconds}",
+                "  if kill -0 \"$child_pid\" 2>/dev/null; then",
+                "    timed_out_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+                f"    printf '%s\\n' \"$timed_out_at\" > {timed_out_q}",
+                f"    printf '%s\\n' {shlex.quote(timeout_note)} > {timeout_reason_q}",
+                f"    printf '%s\\n' 124 > {exit_code_q}",
+                f"    printf '%s\\n' failed > {state_q}",
+                f"    printf '%s\\n' \"$timed_out_at\" > {finished_q}",
+                "    kill -TERM -- -$$ 2>/dev/null || kill -TERM \"$child_pid\" 2>/dev/null || true",
+                f"    sleep {timeout_grace}",
+                "    kill -KILL -- -$$ 2>/dev/null || kill -KILL \"$child_pid\" 2>/dev/null || true",
+                "  fi",
+                ") &",
+                "timeout_pid=$!",
+            ]
+        )
+    else:
+        lines.append("timeout_pid=")
+    lines.extend(
+        [
             "(",
             "  while kill -0 \"$child_pid\" 2>/dev/null; do",
             f"    printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {heartbeat_q}",
@@ -6092,16 +6184,26 @@ def build_runner_script(
             "heartbeat_pid=$!",
             "wait \"$child_pid\"",
             "status=$?",
+            "if [ -n \"${timeout_pid:-}\" ]; then",
+            "  kill \"$timeout_pid\" 2>/dev/null || true",
+            "  wait \"$timeout_pid\" 2>/dev/null || true",
+            "fi",
             "kill \"$heartbeat_pid\" 2>/dev/null || true",
             "wait \"$heartbeat_pid\" 2>/dev/null || true",
             f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {heartbeat_q}",
-            f"printf '%s\\n' \"$status\" > {shlex.quote(str(exit_code_path))}",
+            f"printf '%s\\n' \"$status\" > {exit_code_q}",
             "if [ \"$status\" -eq 0 ]; then",
-            f"  printf '%s\\n' completed > {shlex.quote(str(state_path))}",
+            f"  printf '%s\\n' completed > {state_q}",
             "else",
-            f"  printf '%s\\n' failed > {shlex.quote(str(state_path))}",
+            f"  printf '%s\\n' failed > {state_q}",
             "fi",
-            f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {shlex.quote(str(finished_path))}",
+            f"printf '%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {finished_q}",
+        ]
+    )
+    if tick_cmd:
+        lines.append(f"{tick_cmd} >/dev/null 2>&1 || true")
+    lines.extend(
+        [
             "exit \"$status\"",
             "",
         ]
@@ -6141,6 +6243,10 @@ def dispatch_options_for_run(run: dict[str, Any]) -> DispatchOptions:
     )
 
 
+def manager_tick_command(root: Path) -> list[str]:
+    return [sys.executable, str(Path(__file__).resolve()), "tick", "--root", str(root), "--quiet"]
+
+
 def refresh_runner_for_run(run: dict[str, Any]) -> None:
     adapter = get_provider(str(run.get("provider") or DEFAULT_PROVIDER))
     options = dispatch_options_for_run(run)
@@ -6167,6 +6273,11 @@ def refresh_runner_for_run(run: dict[str, Any]) -> None:
             finished_path=run_dir / "finished_at.txt",
             heartbeat_path=run_heartbeat_path(run),
             heartbeat_interval_seconds=run_heartbeat_interval_seconds(),
+            timed_out_path=run_timed_out_path(run),
+            timeout_reason_path=run_timeout_reason_path(run),
+            max_run_seconds=options.max_run_seconds,
+            timeout_grace_seconds=run_timeout_grace_seconds(),
+            manager_tick_command=manager_tick_command(Path(run["run_dir"]).parent.parent),
             env_exports={
                 adapter.bin_env_var: guard_target,
             },
@@ -6762,6 +6873,11 @@ def materialize_run(
             finished_path=finished_path,
             heartbeat_path=heartbeat_path,
             heartbeat_interval_seconds=run_heartbeat_interval_seconds(),
+            timed_out_path=run_dir / "timed_out_at.txt",
+            timeout_reason_path=run_dir / "timeout_reason.txt",
+            max_run_seconds=effective_max_run_seconds,
+            timeout_grace_seconds=run_timeout_grace_seconds(),
+            manager_tick_command=manager_tick_command(root),
             env_exports={
                 adapter.bin_env_var: guard_target,
             },
@@ -6973,6 +7089,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
             temp_args.ephemeral = spec.get("ephemeral", args.ephemeral)
             temp_args.full_auto = spec.get("full_auto", args.full_auto)
             temp_args.dangerous = spec.get("dangerous", args.dangerous)
+            temp_args.max_run_seconds = spec.get("max_run_seconds", args.max_run_seconds)
             temp_args.add_dir = spec.get("add_dirs", args.add_dir)
             temp_args.config = spec.get("configs", args.config)
             temp_args.enable = spec.get("enables", args.enable)
@@ -7022,6 +7139,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("runs:")
     for run in runs:
         print_run_summary(run)
+    return 0
+
+
+def cmd_tick(args: argparse.Namespace) -> int:
+    root = resolve_path(args.root) if args.root else default_root()
+    with root_lock(root):
+        index = load_index(root)
+        refresh_index_state(root, index)
+    if not args.quiet:
+        print("tick=ok")
     return 0
 
 
@@ -7474,6 +7601,11 @@ def build_parser() -> argparse.ArgumentParser:
     status_p.add_argument("--project", help="Filter to one project name or project slug")
     status_p.add_argument("--json", action="store_true", help="Print JSON instead of a table")
     status_p.set_defaults(func=cmd_status)
+
+    tick_p = sub.add_parser("tick", help="Refresh controller state once and dispatch any ready follow-up work")
+    tick_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")
+    tick_p.add_argument("--quiet", action="store_true", help="Suppress the tick=ok confirmation")
+    tick_p.set_defaults(func=cmd_tick)
 
     team_status_p = sub.add_parser("team-status", help="Show compact project progress updates and child activity")
     team_status_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME})")

@@ -13,7 +13,7 @@ Treat a child session as a full child CLI worker with its own session, context w
 
 Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragments. This path is relative to the skill itself, not the project root. In this repo that file is at `skills/team-leader/scripts/team_leader.py`, and when installed it lives under the Codex skills directory at `.../skills/team-leader/scripts/team_leader.py`. Keep your working directory at the target project unless you pass `--root` and `--cd` explicitly; do not `cd` into the skill directory just to run the controller, because the default `.team-leader/` root is derived from the current working directory. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
-Goal-oriented orchestration can now be bounded by time. Set `--max-work-seconds` on the project brief when the user wants the manager to pursue a goal autonomously but stop after a fixed safety budget, and use `--max-run-seconds` when one direct child should have a tighter wall-clock limit.
+Goal-oriented orchestration can be bounded by time. Set `--max-work-seconds` on the project brief when the user wants the manager to pursue a goal autonomously but stop after a fixed safety budget, and use `--max-run-seconds` when one direct child should have a tighter wall-clock limit. Child exit triggers a one-shot manager refresh, while the background monitor remains a fallback; automatic time-budget continuation requires `autonomy_mode=continuous` and an explicit `max_work_seconds` budget.
 
 When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. While any child is active, the manager refreshes those markdown files automatically in the background. Once a project settles cleanly, the manager compacts transient dashboards, question scratchpads, per-run reports, and disposable child-run artifacts into a smaller steady-state workspace.
 
@@ -22,6 +22,7 @@ The controller now includes conservative safety defaults aimed at avoiding runaw
 - at most `8` child sessions running in parallel by default
 - at most `2` new child launches per `15` seconds by default
 - per-run child heartbeats with stale-run detection for long-running sessions
+- runner-enforced child timeouts with a SIGTERM grace period before SIGKILL
 - child `last_message.md` files truncated to a bounded size with head/tail preservation
 - bounded session-id scans and bounded log tail reads
 - `team-status --project` gives a compact progressive update stream that is safer in captured Codex output than a full-screen watch
@@ -40,7 +41,7 @@ Common aliases are accepted anywhere the controller asks for a provider name, in
 
 `windsurf` and `antigravity` are not shipped adapters yet. This controller only first-classes CLIs with a documented standalone headless launch surface and an automatable resume workflow.
 
-Heartbeat tuning is available through `TEAM_LEADER_RUN_HEARTBEAT_INTERVAL_SECONDS` and `TEAM_LEADER_RUN_HEARTBEAT_STALE_SECONDS` when a provider needs a slower cadence or a looser stale threshold.
+Heartbeat tuning is available through `TEAM_LEADER_RUN_HEARTBEAT_INTERVAL_SECONDS` and `TEAM_LEADER_RUN_HEARTBEAT_STALE_SECONDS` when a provider needs a slower cadence or a looser stale threshold. Timeout termination grace is available through `TEAM_LEADER_RUN_TIMEOUT_GRACE_SECONDS`.
 
 Keep provider-specific logic inside the adapter layer: option validation, launch command construction, session detection, and resume command generation. All shipped providers now use the same adapter contract, while Codex keeps provider-specific hooks for backend reachability and thread detection so `codex -> codex` stays behaviorally aligned with the prior flow. Read `references/provider-adapters.md` when you need to extend the script beyond Codex.
 

@@ -220,6 +220,20 @@ class TeamLeaderAdapterTests(unittest.TestCase):
         self.assertEqual(payload["options"].provider, "claude")
         self.assertEqual(payload["options"].max_run_seconds, 90)
 
+    def test_batch_manifest_wires_per_run_max_run_seconds(self):
+        parser = team_leader.build_parser()
+        with tempfile.TemporaryDirectory() as td:
+            manifest = Path(td) / "manifest.json"
+            manifest.write_text(
+                '{"runs":[{"name":"worker","prompt":"Do it.","max_run_seconds":45}]}',
+                encoding="utf-8",
+            )
+            args = parser.parse_args(["batch", "--root", str(Path(td) / ".team-leader"), "--file", str(manifest)])
+            with mock.patch.object(team_leader, "materialize_run") as materialize:
+                self.assertEqual(team_leader.cmd_batch(args), 0)
+        options = materialize.call_args.kwargs["options"]
+        self.assertEqual(options.max_run_seconds, 45)
+
     def test_project_remaining_work_seconds_uses_project_start(self):
         brief = {
             "created_at": "2026-01-01T00:00:00Z",
@@ -279,11 +293,37 @@ class TeamLeaderAdapterTests(unittest.TestCase):
             finished_path=Path("/tmp/finished_at.txt"),
             heartbeat_path=Path("/tmp/heartbeat.txt"),
             heartbeat_interval_seconds=7,
+            timed_out_path=Path("/tmp/timed_out_at.txt"),
+            timeout_reason_path=Path("/tmp/timeout_reason.txt"),
         )
         self.assertIn("child_pid=$!", script)
         self.assertIn("heartbeat_pid=$!", script)
         self.assertIn("/tmp/heartbeat.txt", script)
         self.assertIn("sleep 7", script)
+
+    def test_build_runner_script_enforces_timeout_and_ticks_manager(self):
+        script = team_leader.build_runner_script(
+            command=["demo-cli", "exec", "-"],
+            prompt_path=Path("/tmp/prompt.md"),
+            state_path=Path("/tmp/state.txt"),
+            exit_code_path=Path("/tmp/exit_code.txt"),
+            started_path=Path("/tmp/started_at.txt"),
+            finished_path=Path("/tmp/finished_at.txt"),
+            heartbeat_path=Path("/tmp/heartbeat.txt"),
+            heartbeat_interval_seconds=7,
+            timed_out_path=Path("/tmp/timed_out_at.txt"),
+            timeout_reason_path=Path("/tmp/timeout_reason.txt"),
+            max_run_seconds=30,
+            timeout_grace_seconds=2,
+            manager_tick_command=["python3", "team_leader.py", "tick", "--root", "/tmp/root"],
+        )
+        self.assertIn("sleep 30", script)
+        self.assertIn("/tmp/timed_out_at.txt", script)
+        self.assertIn("/tmp/timeout_reason.txt", script)
+        self.assertIn("printf '%s\\n' 124", script)
+        self.assertIn("kill -TERM -- -$$", script)
+        self.assertIn("sleep 2", script)
+        self.assertIn("team_leader.py tick --root /tmp/root", script)
 
     def test_run_runtime_health_detects_healthy_and_stale_states(self):
         healthy_now = team_leader.parse_timestamp_epoch("2026-01-01T00:00:35Z")
@@ -502,6 +542,89 @@ class TeamLeaderAdapterTests(unittest.TestCase):
             self.assertEqual(
                 team_leader.should_spawn_planner_for_project(project_dir, brief, runs),
                 (False, "max-auto-fix-rounds-reached"),
+            )
+
+    def test_continuous_budget_allows_bounded_followup_after_successful_wave(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            brief = {
+                "goal": "ship it",
+                "max_work_seconds": 600,
+                "max_planner_rounds": 10,
+                "max_auto_fix_rounds": 2,
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+            runs = [
+                {
+                    "run_id": "planner-1",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "manager-plan-1",
+                    "role": "manager",
+                    "planner_source": "team-leader-planner",
+                    "plan_applied_at": "2026-01-01T00:00:00Z",
+                    "planned_run_ids": ["worker-1"],
+                    "last_message_path": str(project_dir / "planner-1.md"),
+                    "summary": "planner 1",
+                },
+                {
+                    "run_id": "worker-1",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "worker-1",
+                    "role": "implementation",
+                    "last_message_path": str(project_dir / "worker-1.md"),
+                    "summary": "successful worker",
+                },
+            ]
+            with mock.patch.object(team_leader, "project_time_budget_reached", return_value=False):
+                self.assertEqual(
+                    team_leader.should_spawn_planner_for_project(project_dir, brief, runs),
+                    (True, "time-budget-continuation"),
+                )
+
+    def test_continuous_followup_requires_project_time_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            brief = {
+                "goal": "ship it",
+                "max_planner_rounds": 10,
+                "max_auto_fix_rounds": 2,
+            }
+            runs = [
+                {
+                    "run_id": "planner-1",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "manager-plan-1",
+                    "role": "manager",
+                    "planner_source": "team-leader-planner",
+                    "plan_applied_at": "2026-01-01T00:00:00Z",
+                    "planned_run_ids": ["worker-1"],
+                    "last_message_path": str(project_dir / "planner-1.md"),
+                    "summary": "planner 1",
+                },
+                {
+                    "run_id": "worker-1",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "worker-1",
+                    "role": "implementation",
+                    "last_message_path": str(project_dir / "worker-1.md"),
+                    "summary": "successful worker",
+                },
+            ]
+            self.assertEqual(
+                team_leader.should_spawn_planner_for_project(project_dir, brief, runs),
+                (False, "manual-review"),
             )
 
     def test_planner_apply_error_pauses_continuous_retries(self):

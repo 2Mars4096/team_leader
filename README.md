@@ -4,9 +4,9 @@ A Codex skill and standalone controller that manages real child CLI sessions as 
 
 Unlike lightweight built-in subagents, each child session is a full external CLI session with its own context, tool access, and resume lifecycle.
 
-Long-running child runs now emit a per-run heartbeat file. The manager records heartbeat metadata, surfaces heartbeat state in `status` and `watch`, and flags stale or missing heartbeats through the existing warning paths instead of leaving a hung run indistinguishable from a healthy long-running run.
+Long-running child runs emit a per-run heartbeat file. The manager records heartbeat metadata, surfaces heartbeat state in `status` and `watch`, and flags stale or missing heartbeats through the existing warning paths instead of leaving a hung run indistinguishable from a healthy long-running run.
 
-Goal-oriented orchestration can now be bounded by time. Set `--max-work-seconds` on a project brief to cap how long the manager may keep launching work toward that goal, and use `--max-run-seconds` when one child needs a stricter wall-clock limit than the overall project budget.
+Goal-oriented orchestration can be bounded by time. Set `--max-work-seconds` on a project brief to cap how long the manager may keep launching work toward that goal, and use `--max-run-seconds` when one child needs a stricter wall-clock limit than the overall project budget. Child exit now triggers a one-shot manager refresh, while the background monitor remains a fallback; continuous follow-up waves require an explicit project time budget and still obey the planner-round caps.
 
 ## Skills Included
 
@@ -32,7 +32,7 @@ Common aliases are accepted anywhere a provider name is expected: `cc` or `claud
 
 `windsurf` and `antigravity` are not shipped as provider adapters yet. This controller only first-classes CLIs with a documented standalone headless launch surface and a resume story the manager can automate safely.
 
-Heartbeat tuning is available through `TEAM_LEADER_RUN_HEARTBEAT_INTERVAL_SECONDS` and `TEAM_LEADER_RUN_HEARTBEAT_STALE_SECONDS` when a provider needs a slower cadence or a looser stale threshold.
+Heartbeat tuning is available through `TEAM_LEADER_RUN_HEARTBEAT_INTERVAL_SECONDS` and `TEAM_LEADER_RUN_HEARTBEAT_STALE_SECONDS` when a provider needs a slower cadence or a looser stale threshold. Timeout termination grace is available through `TEAM_LEADER_RUN_TIMEOUT_GRACE_SECONDS`.
 
 ## Installation
 
@@ -179,6 +179,7 @@ All commands use `python3 <path-to>/team_leader.py <command> [options]`.
 | `dispatch` | Launch a single child session |
 | `batch` | Launch multiple children from a JSON manifest |
 | `status` | Show tracked runs and project summary |
+| `tick` | Refresh state once and dispatch any ready follow-up work |
 | `team-status` | Compact milestone-style progress updates |
 | `team-metrics` | Efficiency scorecard (age, speed, human-touch, overlap) |
 | `watch` | Live terminal view with auto-refresh |
