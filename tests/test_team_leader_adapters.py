@@ -144,6 +144,27 @@ class TeamLeaderAdapterTests(unittest.TestCase):
         self.assertEqual(team_leader.validate_provider_name("kiro-cli"), "kiro")
         self.assertEqual(team_leader.validate_provider_name("codex-cli"), "codex")
 
+    def test_launcher_provider_env_sets_new_run_default_provider(self):
+        with mock.patch.dict(os.environ, {"TEAM_LEADER_LAUNCHER_PROVIDER": "cc"}, clear=True):
+            parser = team_leader.build_parser()
+            args = parser.parse_args(["dispatch", "--prompt", "Review only."])
+            payload = team_leader.common_dispatch_kwargs(args)
+        self.assertEqual(args.provider, "claude")
+        self.assertEqual(payload["options"].provider, "claude")
+
+    def test_default_child_provider_follows_brief_planner_provider(self):
+        brief = {
+            "planner_provider": "claude",
+            "planner_provider_bin": "/opt/bin/claude",
+            "child_provider": None,
+            "child_provider_bin": None,
+        }
+        self.assertEqual(team_leader.default_child_provider_for_context(brief), "claude")
+        self.assertEqual(
+            team_leader.default_child_provider_bin_for_context(brief),
+            "/opt/bin/claude",
+        )
+
     def test_plan_item_can_switch_child_provider(self):
         brief = {
             "repo_paths": ["/repo"],

@@ -30,6 +30,30 @@ UUID_RE = re.compile(
 )
 INDEX_VERSION = 3
 DEFAULT_PROVIDER = "codex"
+LAUNCHER_PROVIDER_ENV = "TEAM_LEADER_LAUNCHER_PROVIDER"
+LAUNCHER_PROVIDER_ENV_HINTS: dict[str, tuple[str, ...]] = {
+    "codex": (
+        "CODEX_THREAD_ID",
+        "CODEX_SANDBOX",
+        "CODEX_CI",
+        "CODEX_MANAGED_BY_NPM",
+    ),
+    "claude": (
+        "CLAUDECODE",
+        "CLAUDE_CODE",
+        "CLAUDE_PROJECT_DIR",
+        "CLAUDE_SESSION_ID",
+    ),
+    "cursor": (
+        "CURSOR_AGENT",
+        "CURSOR_TRACE_ID",
+        "CURSOR_WORKSPACE_ID",
+    ),
+    "kiro": (
+        "KIRO_SESSION_ID",
+        "KIRO_PROJECT_DIR",
+    ),
+}
 PROVIDER_ALIASES: dict[str, str] = {
     "openai-codex": "codex",
     "codex-cli": "codex",
@@ -977,6 +1001,18 @@ def normalize_provider_list(value: Any, field_name: str) -> list[str]:
     return unique_preserve_order(names)
 
 
+def launcher_default_provider() -> str:
+    configured = normalize_provider_alias(os.environ.get(LAUNCHER_PROVIDER_ENV))
+    if configured in PROVIDERS:
+        return configured
+    for provider_name, env_names in LAUNCHER_PROVIDER_ENV_HINTS.items():
+        if provider_name not in PROVIDERS:
+            continue
+        if any(normalize_optional_text(os.environ.get(env_name)) for env_name in env_names):
+            return provider_name
+    return DEFAULT_PROVIDER
+
+
 def provider_for_run(run: dict[str, Any]) -> ProviderAdapter:
     return get_provider(str(run.get("provider") or DEFAULT_PROVIDER))
 
@@ -1819,13 +1855,8 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     planner_provider = validate_provider_name(
         normalize_optional_text(brief.get("planner_provider")),
         field_name="planner_provider",
-    )
+    ) or launcher_default_provider()
     planner_provider_bin = normalize_optional_text(brief.get("planner_provider_bin"))
-    child_provider = validate_provider_name(
-        normalize_optional_text(brief.get("child_provider")),
-        field_name="child_provider",
-    )
-    child_provider_bin = normalize_optional_text(brief.get("child_provider_bin"))
     allowed_providers = normalize_provider_list(brief.get("allowed_providers"), "allowed_providers")
     lines = [
         f"# {brief.get('project') or 'Project'} Brief",
@@ -1868,10 +1899,10 @@ def render_project_brief(brief: dict[str, Any]) -> str:
     lines.append(f"- Max planner rounds: `{max_planner_rounds}`")
     lines.append(f"- Max auto-fix rounds: `{max_auto_fix_rounds}`")
     lines.append(f"- Completion sentinel: `{completion_sentinel or '-'}`")
-    lines.append(f"- Planner provider: `{planner_provider or DEFAULT_PROVIDER}`")
+    lines.append(f"- Planner provider: `{planner_provider}`")
     lines.append(f"- Planner provider bin: `{planner_provider_bin or '-'}`")
-    lines.append(f"- Default child provider: `{child_provider or planner_provider or DEFAULT_PROVIDER}`")
-    lines.append(f"- Default child provider bin: `{child_provider_bin or '-'}`")
+    lines.append(f"- Default child provider: `{default_child_provider_for_context(brief)}`")
+    lines.append(f"- Default child provider bin: `{default_child_provider_bin_for_context(brief) or '-'}`")
     lines.append(
         f"- Allowed child providers: {format_inline_list(allowed_providers or sorted(PROVIDERS))}"
     )
@@ -2858,7 +2889,7 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
     planner_provider = validate_provider_name(
         normalize_optional_text(brief.get("planner_provider")),
         field_name="planner_provider",
-    ) or DEFAULT_PROVIDER
+    ) or launcher_default_provider()
     default_child_provider = default_child_provider_for_context(brief)
     default_child_provider_bin = default_child_provider_bin_for_context(brief)
     allowed_child_providers = allowed_child_providers_for_context(brief)
@@ -5241,13 +5272,19 @@ def default_child_provider_for_context(
             normalize_optional_text(planner_run.get("provider")),
             field_name="provider",
         )
-    return provider_name or DEFAULT_PROVIDER
+    if provider_name is None and brief:
+        provider_name = validate_provider_name(
+            normalize_optional_text(brief.get("planner_provider")),
+            field_name="planner_provider",
+        )
+    return provider_name or launcher_default_provider()
 
 
 def default_child_provider_bin_for_context(
     brief: dict[str, Any] | None,
     planner_run: dict[str, Any] | None = None,
 ) -> str | None:
+    default_provider = default_child_provider_for_context(brief, planner_run)
     if planner_run is not None:
         value = normalize_optional_text(planner_run.get("planner_default_child_provider_bin"))
         if value:
@@ -5256,6 +5293,24 @@ def default_child_provider_bin_for_context(
         value = normalize_optional_text(brief.get("child_provider_bin"))
         if value:
             return value
+    if planner_run is not None:
+        planner_provider = validate_provider_name(
+            normalize_optional_text(planner_run.get("provider")),
+            field_name="provider",
+        )
+        if planner_provider == default_provider:
+            value = normalize_optional_text(planner_run.get("provider_bin"))
+            if value:
+                return value
+    if brief:
+        planner_provider = validate_provider_name(
+            normalize_optional_text(brief.get("planner_provider")),
+            field_name="planner_provider",
+        )
+        if planner_provider == default_provider:
+            value = normalize_optional_text(brief.get("planner_provider_bin"))
+            if value:
+                return value
     return None
 
 
@@ -5514,7 +5569,7 @@ def spawn_planner_run(
     planner_provider = validate_provider_name(
         normalize_optional_text(brief.get("planner_provider")),
         field_name="planner_provider",
-    ) or DEFAULT_PROVIDER
+    ) or launcher_default_provider()
     planner_options = DispatchOptions(
         provider=planner_provider,
         provider_bin=normalize_optional_text(brief.get("planner_provider_bin")),
@@ -6419,10 +6474,11 @@ def provider_check_record(
 
 def cmd_providers(args: argparse.Namespace) -> int:
     payload = []
+    default_provider = launcher_default_provider()
     for name in sorted(PROVIDERS):
         adapter = PROVIDERS[name]
         record = adapter.describe()
-        record["default"] = name == DEFAULT_PROVIDER
+        record["default"] = name == default_provider
         payload.append(record)
     if args.json:
         print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
@@ -6741,7 +6797,7 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
         planner_provider = (
             validate_provider_name(normalize_optional_text(args.provider), field_name="provider")
             or validate_provider_name(normalize_optional_text(brief.get("planner_provider")), field_name="planner_provider")
-            or DEFAULT_PROVIDER
+            or launcher_default_provider()
         )
         planner_provider_bin = normalize_optional_text(args.provider_bin) or normalize_optional_text(brief.get("planner_provider_bin"))
         default_child_provider = (
@@ -6749,6 +6805,8 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
             or planner_provider
         )
         default_child_provider_bin = normalize_optional_text(brief.get("child_provider_bin"))
+        if default_child_provider_bin is None and default_child_provider == planner_provider:
+            default_child_provider_bin = planner_provider_bin
         allowed_child_providers = normalize_provider_list(brief.get("allowed_providers"), "allowed_providers")
         planner_options = DispatchOptions(
             provider=planner_provider,
@@ -6993,7 +7051,7 @@ def parse_prompt(args: argparse.Namespace) -> str:
 def common_dispatch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "options": DispatchOptions(
-            provider=validate_provider_name(args.provider, field_name="provider") or DEFAULT_PROVIDER,
+            provider=validate_provider_name(args.provider, field_name="provider") or launcher_default_provider(),
             provider_bin=normalize_optional_text(getattr(args, "provider_bin", None)),
             name=args.name,
             project=normalize_optional_text(args.project),
@@ -7427,12 +7485,13 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 
 
 def add_common_run_options(parser: argparse.ArgumentParser) -> None:
+    default_provider = launcher_default_provider()
     parser.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
     parser.add_argument(
         "--provider",
-        default=DEFAULT_PROVIDER,
+        default=default_provider,
         metavar="PROVIDER",
-        help=f"CLI provider adapter for this run. Supported names: {provider_names_for_help()}",
+        help=f"CLI provider adapter for this run (default: {default_provider}). Supported names: {provider_names_for_help()}",
     )
     parser.add_argument("--provider-bin", help="Executable override for the selected provider")
     parser.add_argument("--name", help="Human-friendly run label")
@@ -7497,7 +7556,7 @@ def add_project_capture_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--child-provider",
         metavar="PROVIDER",
-        help=f"Default provider for child runs launched from planner output. Supported names: {provider_names_for_help()}",
+        help=f"Default provider for child runs launched from planner output. Defaults to the planner or launcher provider. Supported names: {provider_names_for_help()}",
     )
     parser.add_argument("--child-provider-bin", help="Executable override for the default child provider")
     parser.add_argument(
@@ -7511,11 +7570,12 @@ def add_project_capture_options(parser: argparse.ArgumentParser) -> None:
 
 def add_orchestrate_options(parser: argparse.ArgumentParser) -> None:
     add_project_capture_options(parser)
+    default_provider = launcher_default_provider()
     parser.add_argument(
         "--provider",
         default=None,
         metavar="PROVIDER",
-        help=f"CLI provider adapter to use for the manager planner child. Supported names: {provider_names_for_help()}",
+        help=f"CLI provider adapter to use for the manager planner child (default: {default_provider}). Supported names: {provider_names_for_help()}",
     )
     parser.add_argument("--provider-bin", help="Executable override for the planner child provider")
     parser.add_argument("--cd", help="Working directory for the planner child")

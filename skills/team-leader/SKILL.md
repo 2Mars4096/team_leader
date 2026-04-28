@@ -119,7 +119,7 @@ python3 scripts/team_leader.py orchestrate \
   --project checkout-refactor
 ```
 
-`orchestrate` launches a manager-planner child when needed. That planner inspects `brief.md`, the repo paths, and any spec paths, then either asks a concise clarification round or emits a machine-readable launch plan. The manager parses that plan and auto-dispatches child sessions from it. Planner output can now choose `provider` and `provider_bin` per child run, subject to the project allowlist and default child provider stored in the brief. If the planner raises human questions, they land in `questions.md` and `answers-template.md`.
+`orchestrate` launches a manager-planner child when needed. That planner inspects `brief.md`, the repo paths, and any spec paths, then either asks a concise clarification round or emits a machine-readable launch plan. The manager parses that plan and auto-dispatches child sessions from it. Planner output can now choose `provider` and `provider_bin` per child run, subject to the project allowlist and default child provider. When no child provider is set explicitly, that default follows the planner or launcher provider. If the planner raises human questions, they land in `questions.md` and `answers-template.md`.
 
 ### 4. Dispatch a child run directly when needed
 

@@ -201,7 +201,7 @@ All commands use `python3 <path-to>/team_leader.py <command> [options]`.
 - `--provider <name>` -- provider for one direct run or for the planner child
 - `--provider-bin <path>` -- executable override for that provider
 - `--planner-provider <name>` -- persist the planner provider in `brief.md`
-- `--child-provider <name>` -- default provider for planner-produced child runs
+- `--child-provider <name>` -- default provider for planner-produced child runs; when omitted it follows the planner or launcher provider
 - `--child-provider-bin <path>` -- executable override for the default child provider
 - `--allow-provider <name>` -- constrain planner output to a provider allowlist
 - `--max-work-seconds <n>` -- cap total project work time for goal-oriented orchestration
