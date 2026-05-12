@@ -214,6 +214,175 @@ class TeamLeaderAdapterTests(unittest.TestCase):
         self.assertEqual(options.provider, "claude")
         self.assertEqual(options.cd, Path("/repo"))
 
+    def test_plan_item_carries_path_metadata(self):
+        brief = {"repo_paths": ["/repo"], "allowed_providers": ["codex"]}
+        planner_run = {
+            "provider": "codex",
+            "provider_bin": None,
+            "add_dirs": [],
+            "configs": [],
+            "enables": [],
+            "disables": [],
+            "images": [],
+            "search": False,
+            "skip_git_repo_check": False,
+            "ephemeral": False,
+            "full_auto": True,
+            "dangerous": False,
+        }
+        item = {
+            "task_id": "checkout-refactor-a",
+            "role": "implementation",
+            "summary": "Try the adapter-boundary refactor",
+            "prompt": "Refactor the checkout adapter boundary.",
+            "path_id": "A",
+            "parent_path_id": "root",
+            "path_mode": "exploit",
+            "task_type": "refactor",
+            "hypothesis": "Adapter boundary reduces checkout coupling.",
+            "kill_criteria": "Public checkout API changes.",
+            "max_run_seconds": 120,
+        }
+
+        options = team_leader.dispatch_options_from_plan_item(
+            team_leader.normalize_plan_item(item),
+            project_name="demo",
+            brief=brief,
+            planner_run=planner_run,
+        )
+
+        self.assertEqual(options.path_id, "A")
+        self.assertEqual(options.parent_path_id, "root")
+        self.assertEqual(options.path_mode, "exploit")
+        self.assertEqual(options.task_type, "refactor")
+        self.assertEqual(options.hypothesis, "Adapter boundary reduces checkout coupling.")
+        self.assertEqual(options.max_run_seconds, 120)
+
+    def test_extract_path_checkpoint_from_child_output(self):
+        text = """
+Done.
+
+## Path Checkpoint
+- Path ID: A1
+- Parent: A
+- Mode: retry
+- Task Type: bugfix
+- Hypothesis: The checkout failure is caused by stale adapter state.
+- Action: Reproduced the failure and changed cache invalidation.
+- Artifact: Patch in services/checkout.
+- Evidence: Focused checkout test now passes.
+- Worked: Cache invalidation fixed the original assertion.
+- Failed: Full test suite still has one unrelated failure.
+- Decision: continue
+- Next: Run full validation after integration.
+- Kill Criteria: Same stale-state assertion returns.
+"""
+        run = {
+            "run_id": "run-1",
+            "project": "demo",
+            "task_id": "fix-cache",
+            "role": "implementation",
+            "summary": "Fix cache",
+            "finished_at": "2026-01-01T00:00:00Z",
+        }
+
+        checkpoint = team_leader.extract_path_checkpoint(text, run)
+
+        self.assertIsNotNone(checkpoint)
+        assert checkpoint is not None
+        self.assertEqual(checkpoint["path_id"], "A1")
+        self.assertEqual(checkpoint["parent_path_id"], "A")
+        self.assertEqual(checkpoint["mode"], "retry")
+        self.assertEqual(checkpoint["task_type"], "bugfix")
+        self.assertEqual(checkpoint["source_run_id"], "run-1")
+
+    def test_merge_path_checkpoints_writes_markdown_and_html(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            run_dir = project_dir / "runs" / "run-1"
+            run_dir.mkdir(parents=True)
+            last_message = run_dir / "last_message.md"
+            last_message.write_text(
+                "\n".join(
+                    [
+                        "Done.",
+                        "",
+                        "## Path Checkpoint",
+                        "- Path ID: A",
+                        "- Mode: explore",
+                        "- Task Type: architecture",
+                        "- Hypothesis: A facade reduces coupling.",
+                        "- Action: Tested a thin facade spike.",
+                        "- Evidence: Two call sites became simpler.",
+                        "- Worked: The boundary is viable.",
+                        "- Failed: One API edge is still unclear.",
+                        "- Decision: promote",
+                        "- Next: Exploit A1 with an implementation slice.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            runs = [
+                {
+                    "run_id": "run-1",
+                    "project": "demo",
+                    "task_id": "arch-spike",
+                    "role": "research",
+                    "summary": "Architecture spike",
+                    "status": "completed",
+                    "finished_at": "2026-01-01T00:00:00Z",
+                    "run_dir": str(run_dir),
+                    "last_message_path": str(last_message),
+                }
+            ]
+
+            records = team_leader.merge_path_checkpoints(project_dir, runs)
+
+            self.assertEqual(len(records), 1)
+            self.assertTrue(team_leader.project_path_checkpoints_jsonl_path(project_dir).exists())
+            self.assertIn("A facade reduces coupling", team_leader.project_path_checkpoints_md_path(project_dir).read_text(encoding="utf-8"))
+            self.assertIn("Path Tree", team_leader.project_path_tree_html_path(project_dir).read_text(encoding="utf-8"))
+
+    def test_path_warnings_detect_stale_and_repeated_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            checkpoints = [
+                {
+                    "path_id": "A",
+                    "mode": "retry",
+                    "failed": "same assertion failed",
+                    "source_run_id": "run-old",
+                },
+                {
+                    "path_id": "A",
+                    "mode": "retry",
+                    "failed": "same assertion failed",
+                    "source_run_id": "run-new",
+                },
+            ]
+            runs = [
+                {
+                    "run_id": "run-live",
+                    "task_id": "live",
+                    "role": "implementation",
+                    "status": "running",
+                    "dispatch_state": "running",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "launched_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+            with mock.patch.object(team_leader, "path_checkpoint_stale_seconds", return_value=60):
+                warnings = team_leader.project_path_warnings(
+                    project_dir,
+                    runs,
+                    checkpoints,
+                    now_epoch=team_leader.parse_timestamp_epoch("2026-01-01T00:02:00Z"),
+                )
+
+            kinds = {warning["kind"] for warning in warnings}
+            self.assertIn("checkpoint-stale", kinds)
+            self.assertIn("repeated-failure", kinds)
+
     def test_provider_smoke_test_parser_wires_defaults(self):
         parser = team_leader.build_parser()
         args = parser.parse_args(["provider-smoke-test", "--provider", "cc"])
@@ -272,6 +441,24 @@ class TeamLeaderAdapterTests(unittest.TestCase):
             now_epoch=team_leader.parse_timestamp_epoch("2026-01-01T00:05:00Z"),
         )
         self.assertEqual(remaining, 300)
+
+    def test_max_work_seconds_implies_continuous_autonomy_when_not_explicit(self):
+        brief = team_leader.merge_project_brief(
+            None,
+            project_name="demo",
+            goal="keep working",
+            max_work_seconds=600,
+        )
+        self.assertEqual(brief["autonomy_mode"], "continuous")
+
+        explicit_manual = team_leader.merge_project_brief(
+            None,
+            project_name="demo",
+            goal="one wave only",
+            autonomy_mode="manual",
+            max_work_seconds=600,
+        )
+        self.assertEqual(explicit_manual["autonomy_mode"], "manual")
 
     def test_provider_check_returns_nonzero_when_any_provider_is_blocked(self):
         args = SimpleNamespace(provider=["cc", "codex-cli"], bin=[], cd=None, json=False)
@@ -418,6 +605,30 @@ class TeamLeaderAdapterTests(unittest.TestCase):
             }
         )
         self.assertIn("hb=timeout", text)
+
+    def test_run_summary_shows_heartbeat_health_markers(self):
+        base_run = {
+            "run_id": "run-1",
+            "status": "running",
+            "provider": "codex",
+            "pid": 123,
+            "exit_code": None,
+            "task_id": "worker",
+            "summary": "Long running worker",
+            "dispatch_state": "running",
+            "blocked_on": [],
+            "integration_state": None,
+            "session_id": None,
+            "thread_id": None,
+        }
+
+        healthy = team_leader.run_summary_text({**base_run, "runtime_health": "healthy"})
+        stale = team_leader.run_summary_text({**base_run, "runtime_health": "heartbeat-stale"})
+        missing = team_leader.run_summary_text({**base_run, "runtime_health": "heartbeat-missing"})
+
+        self.assertIn("hb=ok", healthy)
+        self.assertIn("hb=stale", stale)
+        self.assertIn("hb=missing", missing)
 
     def test_smoke_test_payload_requires_exact_last_message(self):
         with mock.patch.object(team_leader, "last_message_for_run", return_value="OK"):
@@ -606,6 +817,96 @@ class TeamLeaderAdapterTests(unittest.TestCase):
                 self.assertEqual(
                     team_leader.should_spawn_planner_for_project(project_dir, brief, runs),
                     (True, "time-budget-continuation"),
+                )
+
+    def test_continuous_budget_ignores_machine_complete_until_window_expires(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            brief = {
+                "goal": "ship it",
+                "max_work_seconds": 600,
+                "max_planner_rounds": 10,
+                "max_auto_fix_rounds": 2,
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+            runs = [
+                {
+                    "run_id": "planner-1",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "manager-plan-1",
+                    "role": "manager",
+                    "planner_source": "team-leader-planner",
+                    "plan_applied_at": "2026-01-01T00:00:00Z",
+                    "planned_run_ids": ["worker-1"],
+                    "last_message_path": str(project_dir / "planner-1.md"),
+                    "summary": "planner 1",
+                },
+                {
+                    "run_id": "worker-1",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "worker-1",
+                    "role": "implementation",
+                    "last_message_path": str(project_dir / "worker-1.md"),
+                    "summary": "successful worker",
+                },
+            ]
+            with mock.patch.object(team_leader, "project_time_budget_reached", return_value=False), mock.patch.object(
+                team_leader, "project_is_machine_complete", return_value=True
+            ):
+                self.assertEqual(
+                    team_leader.should_spawn_planner_for_project(project_dir, brief, runs),
+                    (True, "time-budget-continuation"),
+                )
+
+    def test_continuous_budget_tops_up_underfilled_worker_pool(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td)
+            brief = {
+                "goal": "ship it",
+                "max_work_seconds": 600,
+                "max_planner_rounds": 10,
+                "max_auto_fix_rounds": 2,
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+            runs = [
+                {
+                    "run_id": "planner-1",
+                    "status": "completed",
+                    "dispatch_state": "completed",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "manager-plan-1",
+                    "role": "manager",
+                    "planner_source": "team-leader-planner",
+                    "plan_applied_at": "2026-01-01T00:00:00Z",
+                    "planned_run_ids": ["worker-1"],
+                    "last_message_path": str(project_dir / "planner-1.md"),
+                    "summary": "planner 1",
+                },
+                {
+                    "run_id": "worker-1",
+                    "status": "running",
+                    "dispatch_state": "running",
+                    "project": "demo",
+                    "project_slug": "demo",
+                    "task_id": "worker-1",
+                    "role": "implementation",
+                    "last_message_path": str(project_dir / "worker-1.md"),
+                    "summary": "active worker",
+                },
+            ]
+            with mock.patch.object(team_leader, "project_time_budget_reached", return_value=False), mock.patch.object(
+                team_leader, "max_parallel_sessions", return_value=3
+            ):
+                self.assertEqual(
+                    team_leader.should_spawn_planner_for_project(project_dir, brief, runs),
+                    (True, "time-budget-pool-top-up"),
                 )
 
     def test_continuous_followup_requires_project_time_budget(self):

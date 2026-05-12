@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import hashlib
+import html
 import json
 import os
 import os.path
@@ -125,15 +126,21 @@ PROJECT_PLAN_MD = "launch-plan.md"
 PROJECT_VALIDATION_FILE = "validation.json"
 PROJECT_VALIDATION_MD = "validation.md"
 PROJECT_METRICS_MD = "metrics.md"
+PROJECT_PATH_CHECKPOINTS_JSONL = "path-checkpoints.jsonl"
+PROJECT_PATH_CHECKPOINTS_MD = "path-checkpoints.md"
+PROJECT_PATH_TREE_HTML = "path-tree.html"
 PLANNER_TASK_PREFIX = "manager-plan"
 PLANNER_ROLE = "manager"
 PLANNER_SOURCE = "team-leader-planner"
 AUTONOMY_MODES = ("manual", "guided", "continuous")
 CLARIFICATION_MODES = ("auto", "off")
+PATH_MODES = ("explore", "exploit", "retry", "promote", "park", "drop", "blocked", "review", "synthesize")
+TASK_TYPES = ("architecture", "bugfix", "docs", "implementation", "refactor", "research", "review", "validation")
 INTEGRATION_READY_STATES = {"applied", "applied-subset", "no-changes"}
 INTEGRATION_ALERT_STATES = {"conflict", "scope-violation", "apply-failed", "commit-failed"}
 INTEGRATION_BLOCKING_STATES = {"pending", *INTEGRATION_ALERT_STATES}
 AUTO_FIX_PLANNER_REASONS = {"failed-runs", "validation-failed", "waiting-for-sentinel", "integration-conflict"}
+DEFAULT_PATH_CHECKPOINT_STALE_SECONDS = 45 * 60
 
 
 def utc_now() -> str:
@@ -405,6 +412,12 @@ class DispatchOptions:
     dry_run: bool
     owned_paths: list[str]
     depends_on: list[str]
+    path_id: str | None = None
+    parent_path_id: str | None = None
+    path_mode: str | None = None
+    task_type: str | None = None
+    hypothesis: str | None = None
+    kill_criteria: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1132,6 +1145,12 @@ def load_index(root: Path) -> dict[str, Any]:
         run.setdefault("task_id", None)
         run.setdefault("role", None)
         run.setdefault("summary", None)
+        run.setdefault("path_id", None)
+        run.setdefault("parent_path_id", None)
+        run.setdefault("path_mode", None)
+        run.setdefault("task_type", None)
+        run.setdefault("hypothesis", None)
+        run.setdefault("kill_criteria", None)
         run.setdefault("created_at", run.get("launched_at"))
         run.setdefault("started_epoch", None)
         run.setdefault("owned_paths", [])
@@ -1402,6 +1421,16 @@ def run_timeout_grace_seconds() -> int:
         return DEFAULT_RUN_TIMEOUT_GRACE_SECONDS
 
 
+def path_checkpoint_stale_seconds() -> int:
+    raw = normalize_optional_text(os.environ.get("TEAM_LEADER_PATH_CHECKPOINT_STALE_SECONDS"))
+    if raw is None:
+        return DEFAULT_PATH_CHECKPOINT_STALE_SECONDS
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return DEFAULT_PATH_CHECKPOINT_STALE_SECONDS
+
+
 def project_metrics_granularity_seconds() -> int:
     raw = normalize_optional_text(os.environ.get("TEAM_LEADER_PROJECT_METRICS_GRANULARITY_SECONDS"))
     if raw is None:
@@ -1629,6 +1658,18 @@ def project_metrics_md_path(project_dir: Path) -> Path:
     return project_dir / PROJECT_METRICS_MD
 
 
+def project_path_checkpoints_jsonl_path(project_dir: Path) -> Path:
+    return project_dir / PROJECT_PATH_CHECKPOINTS_JSONL
+
+
+def project_path_checkpoints_md_path(project_dir: Path) -> Path:
+    return project_dir / PROJECT_PATH_CHECKPOINTS_MD
+
+
+def project_path_tree_html_path(project_dir: Path) -> Path:
+    return project_dir / PROJECT_PATH_TREE_HTML
+
+
 def project_history_path(project_dir: Path) -> Path:
     return project_dir / "history.md"
 
@@ -1812,6 +1853,8 @@ def merge_project_brief(
             max_work_seconds,
             "max_work_seconds",
         )
+        if autonomy_mode is None:
+            brief["autonomy_mode"] = "continuous"
     if max_planner_rounds is not None:
         brief["max_planner_rounds"] = max(1, int(max_planner_rounds))
     if max_auto_fix_rounds is not None:
@@ -1975,6 +2018,10 @@ def render_project_launch_plan(payload: dict[str, Any]) -> str:
             [
                 str(item.get("provider") or "-"),
                 str(item.get("task_id") or "-"),
+                str(item.get("path_id") or "-"),
+                str(item.get("path_mode") or "-"),
+                str(item.get("task_type") or "-"),
+                format_duration(item.get("max_run_seconds")) if item.get("max_run_seconds") is not None else "-",
                 short_summary(normalize_optional_text(item.get("summary")), max_chars=48),
                 str(item.get("role") or "-"),
                 str(item.get("sandbox") or "-"),
@@ -1985,8 +2032,8 @@ def render_project_launch_plan(payload: dict[str, Any]) -> str:
     lines.extend(
         [
             markdown_table(
-                ["provider", "task", "summary", "role", "sandbox", "depends_on", "owned_paths"],
-                rows or [["-", "-", "-", "-", "-", "-", "-"]],
+                ["provider", "task", "path", "mode", "type", "max_run", "summary", "role", "sandbox", "depends_on", "owned_paths"],
+                rows or [["-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]],
             ),
             "",
         ]
@@ -2125,6 +2172,717 @@ def render_project_validation(payload: dict[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+PATH_CHECKPOINT_KEY_ALIASES = {
+    "path": "path_id",
+    "path_id": "path_id",
+    "node": "path_id",
+    "node_id": "path_id",
+    "parent": "parent_path_id",
+    "parent_path": "parent_path_id",
+    "parent_path_id": "parent_path_id",
+    "mode": "mode",
+    "path_mode": "mode",
+    "type": "task_type",
+    "task_type": "task_type",
+    "hypothesis": "hypothesis",
+    "action": "action",
+    "actions": "action",
+    "actions_taken": "action",
+    "artifact": "artifact",
+    "artifact_produced": "artifact",
+    "evidence": "evidence",
+    "worked": "worked",
+    "what_worked": "worked",
+    "failed": "failed",
+    "what_failed": "failed",
+    "decision": "decision",
+    "next": "next",
+    "next_branch": "next",
+    "next_step": "next",
+    "kill": "kill_criteria",
+    "kill_criteria": "kill_criteria",
+    "confidence": "confidence",
+}
+
+
+def normalize_path_mode(value: Any, *, fallback: str | None = None) -> str | None:
+    text = normalize_optional_text(value)
+    if not text:
+        return fallback
+    normalized = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    aliases = {
+        "implementation": "exploit",
+        "implement": "exploit",
+        "fix": "retry",
+        "fixer": "retry",
+        "recover": "retry",
+        "recovery": "retry",
+        "prune": "synthesize",
+        "summary": "synthesize",
+        "synthesis": "synthesize",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized in PATH_MODES:
+        return normalized
+    return fallback
+
+
+def normalize_task_type(value: Any, *, fallback: str | None = None) -> str | None:
+    text = normalize_optional_text(value)
+    if not text:
+        return fallback
+    normalized = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    aliases = {
+        "bug": "bugfix",
+        "fix": "bugfix",
+        "implementation": "implementation",
+        "implement": "implementation",
+        "impl": "implementation",
+        "test": "validation",
+        "testing": "validation",
+        "validate": "validation",
+        "architecture": "architecture",
+        "arch": "architecture",
+        "documentation": "docs",
+        "doc": "docs",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized in TASK_TYPES:
+        return normalized
+    return fallback
+
+
+def infer_path_mode(role: str | None, summary: str | None, prompt_text: str | None) -> str:
+    role_text = (role or "").lower()
+    joined = f"{summary or ''}\n{prompt_text or ''}".lower()
+    if role_text in {"review", "reviewer", "audit", "auditor"}:
+        return "review"
+    if any(word in joined for word in ("failed", "failing", "validation", "recover", "regression")):
+        return "retry"
+    if role_text in {"implementation", "implementer", "writer", "owner"}:
+        return "exploit"
+    if role_text == PLANNER_ROLE:
+        return "synthesize"
+    return "explore"
+
+
+def infer_task_type(role: str | None, summary: str | None, prompt_text: str | None) -> str:
+    role_text = (role or "").lower()
+    joined = f"{summary or ''}\n{prompt_text or ''}".lower()
+    if any(word in joined for word in ("refactor", "rewrite", "cleanup", "simplify")):
+        return "refactor"
+    if any(word in joined for word in ("bug", "fix", "failure", "failing", "regression")):
+        return "bugfix"
+    if any(word in joined for word in ("test", "validate", "validation", "typecheck", "lint")):
+        return "validation"
+    if any(word in joined for word in ("architecture", "design", "boundary", "api", "contract")):
+        return "architecture"
+    if role_text in {"review", "reviewer", "audit", "auditor"}:
+        return "review"
+    if any(word in joined for word in ("doc", "readme", "guide")):
+        return "docs"
+    if role_text in {"implementation", "implementer", "writer", "owner"}:
+        return "implementation"
+    return "research"
+
+
+def path_checkpoint_key(raw_key: str) -> str | None:
+    key = re.sub(r"[^a-z0-9]+", "_", raw_key.strip().lower()).strip("_")
+    return PATH_CHECKPOINT_KEY_ALIASES.get(key)
+
+
+def normalize_checkpoint_record(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        "checkpoint_id": normalize_optional_text(record.get("checkpoint_id")),
+        "updated_at": normalize_optional_text(record.get("updated_at")),
+        "project": normalize_optional_text(record.get("project")),
+        "source_run_id": normalize_optional_text(record.get("source_run_id")),
+        "task_id": normalize_optional_text(record.get("task_id")),
+        "role": normalize_optional_text(record.get("role")),
+        "summary": normalize_optional_text(record.get("summary")),
+        "path_id": normalize_optional_text(record.get("path_id")),
+        "parent_path_id": normalize_optional_text(record.get("parent_path_id")),
+        "mode": normalize_path_mode(record.get("mode"), fallback=normalize_optional_text(record.get("mode"))),
+        "task_type": normalize_task_type(record.get("task_type"), fallback=normalize_optional_text(record.get("task_type"))),
+        "hypothesis": normalize_optional_text(record.get("hypothesis")),
+        "action": normalize_optional_text(record.get("action")),
+        "artifact": normalize_optional_text(record.get("artifact")),
+        "evidence": normalize_optional_text(record.get("evidence")),
+        "worked": normalize_optional_text(record.get("worked")),
+        "failed": normalize_optional_text(record.get("failed")),
+        "decision": normalize_optional_text(record.get("decision")),
+        "next": normalize_optional_text(record.get("next")),
+        "kill_criteria": normalize_optional_text(record.get("kill_criteria")),
+        "confidence": normalize_optional_text(record.get("confidence")),
+    }
+    source = normalized["source_run_id"] or "-"
+    path_id = normalized["path_id"] or source
+    normalized["path_id"] = path_id
+    normalized["checkpoint_id"] = normalized["checkpoint_id"] or source
+    return normalized
+
+
+def extract_path_checkpoint(text: str | None, run: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if not text:
+        return None
+    active = False
+    current_key: str | None = None
+    fields: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            if active:
+                current_key = None
+            continue
+        if stripped.startswith("#"):
+            heading = stripped.lstrip("#").strip().lower()
+            if "path checkpoint" in heading or "search checkpoint" in heading:
+                active = True
+                current_key = None
+                continue
+            if active:
+                break
+        if not active:
+            continue
+        cleaned = re.sub(r"^\s*[-*+]\s*", "", stripped)
+        match = re.match(r"`?([A-Za-z][A-Za-z0-9 _/-]{0,40})`?\s*:\s*(.*)$", cleaned)
+        if match:
+            key = path_checkpoint_key(match.group(1))
+            if key:
+                fields[key] = match.group(2).strip()
+                current_key = key
+            continue
+        if current_key:
+            fields[current_key] = f"{fields[current_key]} {cleaned}".strip()
+    meaningful_keys = {"hypothesis", "action", "evidence", "worked", "failed", "decision", "next"}
+    if not any(normalize_optional_text(fields.get(key)) for key in meaningful_keys):
+        return None
+    payload: dict[str, Any] = dict(fields)
+    if run:
+        payload.update(
+            {
+                "checkpoint_id": normalize_optional_text(run.get("run_id")),
+                "updated_at": normalize_optional_text(run.get("finished_at"))
+                or normalize_optional_text(run.get("launched_at"))
+                or normalize_optional_text(run.get("created_at")),
+                "project": normalize_optional_text(run.get("project")),
+                "source_run_id": normalize_optional_text(run.get("run_id")),
+                "task_id": normalize_optional_text(run.get("task_id")),
+                "role": normalize_optional_text(run.get("role")),
+                "summary": normalize_optional_text(run.get("summary")),
+                "path_id": normalize_optional_text(fields.get("path_id")) or normalize_optional_text(run.get("path_id")),
+                "parent_path_id": normalize_optional_text(fields.get("parent_path_id"))
+                or normalize_optional_text(run.get("parent_path_id")),
+                "mode": normalize_optional_text(fields.get("mode")) or normalize_optional_text(run.get("path_mode")),
+                "task_type": normalize_optional_text(fields.get("task_type")) or normalize_optional_text(run.get("task_type")),
+                "hypothesis": normalize_optional_text(fields.get("hypothesis"))
+                or normalize_optional_text(run.get("hypothesis")),
+                "kill_criteria": normalize_optional_text(fields.get("kill_criteria"))
+                or normalize_optional_text(run.get("kill_criteria")),
+            }
+        )
+    return normalize_checkpoint_record(payload)
+
+
+def load_path_checkpoints(project_dir: Path) -> list[dict[str, Any]]:
+    path = project_path_checkpoints_jsonl_path(project_dir)
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            records.append(normalize_checkpoint_record(payload))
+    return records
+
+
+def checkpoint_from_run(run: dict[str, Any]) -> dict[str, Any] | None:
+    if run_is_planner(run):
+        return None
+    text = last_message_display_for_run(run)
+    checkpoint = extract_path_checkpoint(text, run)
+    if not checkpoint:
+        return None
+    checkpoint["updated_at"] = (
+        checkpoint.get("updated_at")
+        or normalize_optional_text(run.get("finished_at"))
+        or normalize_optional_text(run.get("created_at"))
+    )
+    return normalize_checkpoint_record(checkpoint)
+
+
+def path_checkpoint_sort_key(record: dict[str, Any]) -> tuple[str, str]:
+    return (
+        normalize_optional_text(record.get("updated_at")) or "",
+        normalize_optional_text(record.get("checkpoint_id")) or "",
+    )
+
+
+def merge_path_checkpoints(project_dir: Path, runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records_by_source: dict[str, dict[str, Any]] = {}
+    loose_records: list[dict[str, Any]] = []
+    for record in load_path_checkpoints(project_dir):
+        source = normalize_optional_text(record.get("source_run_id"))
+        if source:
+            records_by_source[source] = record
+        else:
+            loose_records.append(record)
+    for run in runs:
+        checkpoint = checkpoint_from_run(run)
+        if not checkpoint:
+            continue
+        source = normalize_optional_text(checkpoint.get("source_run_id")) or normalize_optional_text(run.get("run_id"))
+        if source:
+            records_by_source[source] = checkpoint
+        else:
+            loose_records.append(checkpoint)
+    records = sorted([*loose_records, *records_by_source.values()], key=path_checkpoint_sort_key)
+    write_text(
+        project_path_checkpoints_jsonl_path(project_dir),
+        "".join(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n" for record in records),
+    )
+    write_text(project_path_checkpoints_md_path(project_dir), render_path_checkpoints_md(records))
+    write_text(project_path_tree_html_path(project_dir), render_path_tree_html(records))
+    return records
+
+
+def checkpoint_label(record: dict[str, Any]) -> str:
+    return normalize_optional_text(record.get("path_id")) or normalize_optional_text(record.get("task_id")) or "-"
+
+
+def render_path_checkpoints_md(records: list[dict[str, Any]]) -> str:
+    updated_at = normalize_optional_text(records[-1].get("updated_at")) if records else None
+    lines = [
+        "# Path Checkpoints",
+        "",
+        "This file records the explore/exploit search memory for long-running team-leader projects.",
+        "",
+        f"- Updated: `{updated_at or '-'}`",
+        f"- Records: `{len(records)}`",
+        f"- Tree view: `{PROJECT_PATH_TREE_HTML}`",
+        "",
+    ]
+    if not records:
+        lines.extend(["_No path checkpoints recorded yet._", ""])
+        return "\n".join(lines)
+    rows: list[list[str]] = []
+    for record in records[-20:]:
+        rows.append(
+            [
+                format_short_timestamp(normalize_optional_text(record.get("updated_at"))),
+                short_summary(normalize_optional_text(record.get("path_id")), max_chars=24),
+                short_summary(normalize_optional_text(record.get("mode")), max_chars=12),
+                short_summary(normalize_optional_text(record.get("task_type")), max_chars=14),
+                short_summary(normalize_optional_text(record.get("hypothesis")), max_chars=42),
+                short_summary(normalize_optional_text(record.get("decision")), max_chars=36),
+                short_summary(normalize_optional_text(record.get("next")), max_chars=36),
+            ]
+        )
+    lines.extend(
+        [
+            "## Recent Records",
+            "",
+            markdown_table(
+                ["updated", "path", "mode", "type", "hypothesis", "decision", "next"],
+                rows,
+            ),
+            "",
+            "## Details",
+            "",
+        ]
+    )
+    for record in records:
+        lines.extend(
+            [
+                f"### {checkpoint_label(record)}",
+                "",
+                f"- Updated: `{normalize_optional_text(record.get('updated_at')) or '-'}`",
+                f"- Parent: `{normalize_optional_text(record.get('parent_path_id')) or '-'}`",
+                f"- Mode: `{normalize_optional_text(record.get('mode')) or '-'}`",
+                f"- Task type: `{normalize_optional_text(record.get('task_type')) or '-'}`",
+                f"- Source run: `{normalize_optional_text(record.get('source_run_id')) or '-'}`",
+                f"- Hypothesis: {normalize_optional_text(record.get('hypothesis')) or '-'}",
+                f"- Action: {normalize_optional_text(record.get('action')) or '-'}",
+                f"- Artifact: {normalize_optional_text(record.get('artifact')) or '-'}",
+                f"- Evidence: {normalize_optional_text(record.get('evidence')) or '-'}",
+                f"- Worked: {normalize_optional_text(record.get('worked')) or '-'}",
+                f"- Failed: {normalize_optional_text(record.get('failed')) or '-'}",
+                f"- Decision: {normalize_optional_text(record.get('decision')) or '-'}",
+                f"- Next: {normalize_optional_text(record.get('next')) or '-'}",
+                f"- Kill criteria: {normalize_optional_text(record.get('kill_criteria')) or '-'}",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def html_escape(value: Any) -> str:
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def html_json_payload(value: Any) -> str:
+    return (
+        json.dumps(value, ensure_ascii=True)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+
+
+def render_path_tree_html(records: list[dict[str, Any]]) -> str:
+    latest_by_path: dict[str, dict[str, Any]] = {}
+    for record in records:
+        path_id = normalize_optional_text(record.get("path_id"))
+        if not path_id:
+            continue
+        latest_by_path[path_id] = record
+    children: dict[str, list[dict[str, Any]]] = {}
+    for record in latest_by_path.values():
+        parent = normalize_optional_text(record.get("parent_path_id")) or "__root__"
+        if parent == normalize_optional_text(record.get("path_id")):
+            parent = "__root__"
+        children.setdefault(parent, []).append(record)
+    for items in children.values():
+        items.sort(key=path_checkpoint_sort_key)
+
+    def render_node(record: dict[str, Any], seen: set[str]) -> str:
+        path_id = normalize_optional_text(record.get("path_id")) or "-"
+        if path_id in seen:
+            return ""
+        seen = {*seen, path_id}
+        mode = normalize_path_mode(record.get("mode"), fallback="explore") or "explore"
+        label = html_escape(path_id)
+        summary = html_escape(short_summary(normalize_optional_text(record.get("hypothesis")), max_chars=64))
+        child_html = "".join(render_node(child, seen) for child in children.get(path_id, []))
+        nested = f"<ul>{child_html}</ul>" if child_html else ""
+        return (
+            f'<li><button class="node mode-{html_escape(mode)}" data-path="{html_escape(path_id)}">'
+            f"<span>{label}</span><small>{html_escape(mode)} - {summary}</small></button>{nested}</li>"
+        )
+
+    root_nodes = children.get("__root__", [])
+    orphan_nodes = [record for path, record in latest_by_path.items() if normalize_optional_text(record.get("parent_path_id")) and normalize_optional_text(record.get("parent_path_id")) not in latest_by_path]
+    root_html = "".join(render_node(record, set()) for record in [*root_nodes, *orphan_nodes])
+    if not root_html:
+        root_html = '<li><span class="empty">No path checkpoints recorded yet.</span></li>'
+    records_json = html_json_payload(records)
+    latest_json = html_json_payload(latest_by_path)
+    lead = next(
+        (
+            record
+            for record in reversed(records)
+            if normalize_path_mode(record.get("mode")) in {"promote", "exploit"}
+            or "promote" in (normalize_optional_text(record.get("decision")) or "").lower()
+        ),
+        records[-1] if records else None,
+    )
+    lead_label = normalize_optional_text(lead.get("path_id")) if lead else "-"
+    timeline_items = "\n".join(
+        (
+            f'<button class="timeline-item" data-path="{html_escape(normalize_optional_text(record.get("path_id")) or "")}">'
+            f'<span>{html_escape(format_short_timestamp(normalize_optional_text(record.get("updated_at"))))}</span>'
+            f'<strong>{html_escape(normalize_optional_text(record.get("path_id")) or "-")}</strong>'
+            f'<small>{html_escape(short_summary(normalize_optional_text(record.get("decision")), max_chars=70))}</small>'
+            "</button>"
+        )
+        for record in records
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>team-leader path tree</title>
+<style>
+:root {{ color-scheme: light; --bg:#f7f8fa; --panel:#ffffff; --ink:#1f2933; --muted:#637083; --line:#d9dee7; --blue:#2563eb; --green:#16803c; --amber:#b26a00; --red:#b42318; --gray:#667085; --purple:#7c3aed; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); }}
+header {{ display:flex; gap:20px; align-items:center; justify-content:space-between; padding:16px 20px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:2; }}
+header h1 {{ margin:0; font-size:18px; font-weight:650; }}
+header .meta {{ display:flex; gap:14px; flex-wrap:wrap; color:var(--muted); }}
+main {{ display:grid; grid-template-columns:minmax(280px, 36vw) 1fr; min-height:calc(100vh - 68px); }}
+.tree {{ border-right:1px solid var(--line); background:#fbfcfd; padding:16px; overflow:auto; }}
+.details {{ padding:18px 20px; overflow:auto; }}
+.tree ul {{ list-style:none; margin:0; padding-left:18px; border-left:1px solid var(--line); }}
+.tree > ul {{ padding-left:0; border-left:0; }}
+.tree li {{ margin:8px 0; }}
+.node, .timeline-item {{ width:100%; text-align:left; border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:10px 12px; cursor:pointer; color:var(--ink); }}
+.node span {{ display:block; font-weight:650; }}
+.node small, .timeline-item small {{ display:block; color:var(--muted); margin-top:2px; }}
+.node.active {{ outline:2px solid var(--blue); }}
+.mode-explore {{ border-left:5px solid var(--blue); }}
+.mode-exploit, .mode-promote {{ border-left:5px solid var(--green); }}
+.mode-retry {{ border-left:5px solid var(--amber); }}
+.mode-park {{ border-left:5px solid var(--gray); }}
+.mode-drop {{ border-left:5px solid var(--red); opacity:.78; }}
+.mode-blocked {{ border-left:5px solid var(--purple); }}
+.mode-review, .mode-synthesize {{ border-left:5px solid #0891b2; }}
+.card {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-bottom:14px; }}
+.card h2 {{ margin:0 0 10px; font-size:16px; }}
+.grid {{ display:grid; grid-template-columns:160px 1fr; gap:8px 12px; }}
+.grid dt {{ color:var(--muted); }}
+.grid dd {{ margin:0; white-space:pre-wrap; }}
+.timeline {{ display:grid; gap:8px; max-height:280px; overflow:auto; }}
+.timeline-item span {{ color:var(--muted); margin-right:8px; }}
+.timeline-item strong {{ margin-right:8px; }}
+.empty {{ color:var(--muted); }}
+@media (max-width: 820px) {{ main {{ grid-template-columns:1fr; }} .tree {{ border-right:0; border-bottom:1px solid var(--line); max-height:44vh; }} }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Path Tree</h1>
+  <div class="meta"><span>records: {len(records)}</span><span>paths: {len(latest_by_path)}</span><span>lead: {html_escape(lead_label or "-")}</span></div>
+</header>
+<main>
+  <aside class="tree"><ul>{root_html}</ul></aside>
+  <section class="details">
+    <div class="card"><h2 id="detail-title">Select a path</h2><dl class="grid" id="detail-grid"></dl></div>
+    <div class="card"><h2>Timeline</h2><div class="timeline">{timeline_items or '<span class="empty">No timeline yet.</span>'}</div></div>
+  </section>
+</main>
+<script id="records-json" type="application/json">{records_json}</script>
+<script id="latest-json" type="application/json">{latest_json}</script>
+<script>
+const records = JSON.parse(document.getElementById('records-json').textContent || '[]');
+const latest = JSON.parse(document.getElementById('latest-json').textContent || '{{}}');
+const fields = ['updated_at','parent_path_id','mode','task_type','hypothesis','action','artifact','evidence','worked','failed','decision','next','kill_criteria','confidence','source_run_id'];
+function esc(value) {{ return String(value || '-').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c])); }}
+function show(path) {{
+  const record = latest[path] || records.find(item => item.path_id === path);
+  if (!record) return;
+  document.querySelectorAll('.node').forEach(btn => btn.classList.toggle('active', btn.dataset.path === path));
+  document.getElementById('detail-title').textContent = record.path_id || path || 'Path';
+  document.getElementById('detail-grid').innerHTML = fields.map(key => `<dt>${{key.replaceAll('_',' ')}}</dt><dd>${{esc(record[key])}}</dd>`).join('');
+}}
+document.querySelectorAll('[data-path]').forEach(btn => btn.addEventListener('click', () => show(btn.dataset.path)));
+const first = document.querySelector('.node[data-path]');
+if (first) show(first.dataset.path);
+</script>
+</body>
+</html>
+"""
+
+
+def project_path_warnings(
+    project_dir: Path,
+    runs: list[dict[str, Any]],
+    checkpoints: list[dict[str, Any]] | None = None,
+    *,
+    now_epoch: int | None = None,
+) -> list[dict[str, str]]:
+    records = checkpoints if checkpoints is not None else load_path_checkpoints(project_dir)
+    by_run = {normalize_optional_text(record.get("source_run_id")) for record in records if normalize_optional_text(record.get("source_run_id"))}
+    warnings: list[dict[str, str]] = []
+    current_epoch = now_epoch or epoch_now()
+    stale_seconds = path_checkpoint_stale_seconds()
+    for run in runs:
+        if run_is_planner(run):
+            continue
+        run_id = normalize_optional_text(run.get("run_id"))
+        task_id = normalize_optional_text(run.get("task_id")) or run_id or "-"
+        if run_is_unsettled(run):
+            start_epoch = (
+                parse_timestamp_epoch(normalize_optional_text(run.get("launched_at")))
+                or parse_timestamp_epoch(normalize_optional_text(run.get("created_at")))
+            )
+            if start_epoch is not None and current_epoch - start_epoch >= stale_seconds and run_id not in by_run:
+                warnings.append(
+                    {
+                        "kind": "checkpoint-stale",
+                        "task_id": task_id,
+                        "path_id": normalize_optional_text(run.get("path_id")) or task_id,
+                        "message": f"no path checkpoint after {format_duration(stale_seconds)}",
+                    }
+                )
+        elif str(run.get("status") or "") in TERMINAL_STATUSES and run_id not in by_run:
+            warnings.append(
+                {
+                    "kind": "checkpoint-missing",
+                    "task_id": task_id,
+                    "path_id": normalize_optional_text(run.get("path_id")) or task_id,
+                    "message": "terminal run did not report a path checkpoint",
+                }
+            )
+    failed_counts: dict[str, int] = {}
+    for record in records:
+        failed = normalize_optional_text(record.get("failed"))
+        if not failed or failed == "-":
+            continue
+        key = re.sub(r"\s+", " ", failed.lower()).strip()
+        failed_counts[key] = failed_counts.get(key, 0) + 1
+    for failed, count in sorted(failed_counts.items(), key=lambda item: (-item[1], item[0]))[:3]:
+        if count >= 2:
+            warnings.append(
+                {
+                    "kind": "repeated-failure",
+                    "task_id": "-",
+                    "path_id": "-",
+                    "message": f"same failure recorded {count} times: {short_summary(failed, max_chars=90)}",
+                }
+            )
+    retry_counts: dict[str, int] = {}
+    for record in records:
+        if normalize_path_mode(record.get("mode")) != "retry":
+            continue
+        path_id = normalize_optional_text(record.get("path_id")) or "-"
+        retry_counts[path_id] = retry_counts.get(path_id, 0) + 1
+    for path_id, count in sorted(retry_counts.items(), key=lambda item: (-item[1], item[0]))[:3]:
+        if count >= 3:
+            warnings.append(
+                {
+                    "kind": "retry-loop",
+                    "task_id": "-",
+                    "path_id": path_id,
+                    "message": f"path retried {count} times without a promote/park/drop decision",
+                }
+            )
+    return warnings[:10]
+
+
+def task_specific_checkpoint_contract(task_type: str, mode: str) -> list[str]:
+    common = [
+        "End your final response with a `Path Checkpoint` section using these exact keys:",
+        "- Path ID:",
+        "- Parent:",
+        "- Mode:",
+        "- Task Type:",
+        "- Hypothesis:",
+        "- Action:",
+        "- Artifact:",
+        "- Evidence:",
+        "- Worked:",
+        "- Failed:",
+        "- Decision: promote / continue / park / drop / retry / blocked",
+        "- Next:",
+        "- Kill Criteria:",
+    ]
+    contracts: dict[str, list[str]] = {
+        "refactor": [
+            "Refactor-specific convergence:",
+            "- State the invariant or public behavior that must not change.",
+            "- Prefer the smallest reversible boundary change that produces evidence.",
+            "- Report blast radius and compatibility risk in the Evidence or Failed field.",
+            "- Promote only when the refactor reduced coupling or complexity without broad regressions.",
+        ],
+        "bugfix": [
+            "Bugfix-specific convergence:",
+            "- Name the reproduction or failing command before the fix.",
+            "- Change one plausible cause at a time where practical.",
+            "- If the same failure repeats, record what variable changed since the last attempt.",
+            "- Use retry for execution mistakes; use drop when the causal theory is contradicted.",
+        ],
+        "validation": [
+            "Validation-recovery convergence:",
+            "- Identify the first meaningful failing check, not every downstream symptom.",
+            "- Record the smallest recovery patch or the reason no patch was safe.",
+            "- If validation still fails, distinguish new failure from repeated failure.",
+            "- Escalate as blocked when human credentials, external services, or unclear policy are required.",
+        ],
+        "architecture": [
+            "Architecture-specific convergence:",
+            "- Test one boundary or contract hypothesis, not a full redesign.",
+            "- Name the decision that this exploration is meant to unlock.",
+            "- Prefer a thin spike or written rejection over broad implementation.",
+            "- Promote only if the path gives a lower-risk execution route.",
+        ],
+        "implementation": [
+            "Implementation-specific convergence:",
+            "- Push the current lead path forward; do not switch strategy unless a kill criterion is hit.",
+            "- Keep changes inside the owned scope and record any scope pressure.",
+            "- If blocked, checkpoint the blocker and recommend the next branch.",
+            "- End with continue, promote, blocked, retry, or park.",
+        ],
+        "review": [
+            "Review-specific convergence:",
+            "- Judge whether the current branch should continue, be parked, be dropped, or be retried.",
+            "- Focus on decision-changing defects, missing evidence, and scope conflicts.",
+            "- Do not produce a general review summary without a branch decision.",
+        ],
+        "docs": [
+            "Docs-specific convergence:",
+            "- Identify which user or maintainer decision the document should support.",
+            "- Record whether the docs clarified the path, exposed a gap, or should be parked.",
+        ],
+        "research": [
+            "Research-specific convergence:",
+            "- Answer the smallest question that changes the path decision.",
+            "- Prefer concrete evidence from the repo, tests, docs, or specs over broad speculation.",
+            "- End by promoting, parking, dropping, or retrying the path.",
+        ],
+    }
+    mode_lines: dict[str, list[str]] = {
+        "explore": [
+            "Mode behavior: explore.",
+            "- Your goal is to decide whether this path deserves more work, not to finish the whole project.",
+            "- Stop when you have enough evidence to promote, park, drop, or retry.",
+        ],
+        "exploit": [
+            "Mode behavior: exploit.",
+            "- Your goal is to advance the current best-supported path toward completion.",
+            "- Do not pivot unless a kill criterion is hit; checkpoint first if you must pivot.",
+        ],
+        "retry": [
+            "Mode behavior: retry.",
+            "- Your goal is to test whether the path failed because of execution, not because the idea is bad.",
+            "- Explicitly state what changed since the previous failure.",
+        ],
+        "review": [
+            "Mode behavior: review.",
+            "- Your goal is to produce a branch decision from evidence, not a neutral status report.",
+        ],
+        "synthesize": [
+            "Mode behavior: synthesize.",
+            "- Your goal is to prune the search tree and identify the next lead path.",
+        ],
+    }
+    return [*mode_lines.get(mode, mode_lines["explore"]), "", *contracts.get(task_type, contracts["research"]), "", *common]
+
+
+def build_child_convergence_prompt(
+    prompt_text: str,
+    *,
+    project_dir: Path,
+    path_id: str,
+    parent_path_id: str | None,
+    mode: str,
+    task_type: str,
+    hypothesis: str | None,
+    kill_criteria: str | None,
+) -> str:
+    lines = [
+        prompt_text.strip(),
+        "",
+        "## team-leader path convergence contract",
+        "",
+        f"- Project path checkpoint log: `{project_path_checkpoints_md_path(project_dir)}`",
+        f"- Project path tree view: `{project_path_tree_html_path(project_dir)}`",
+        f"- Path ID: `{path_id}`",
+        f"- Parent path ID: `{parent_path_id or '-'}`",
+        f"- Mode: `{mode}`",
+        f"- Task type: `{task_type}`",
+        f"- Hypothesis: {hypothesis or 'state the concrete hypothesis you tested'}",
+        f"- Kill criteria: {kill_criteria or 'state what evidence would make this path not worth pursuing'}",
+        "",
+        "Anti-loop rules:",
+        "- Do not retry the same failing command more than twice without changing a material variable.",
+        "- Do not switch strategy without recording why in the checkpoint.",
+        "- Do not open a new branch unless the current branch has evidence.",
+        "- If the kill criteria are hit or the path stops producing useful evidence, stop promptly after writing the checkpoint instead of consuming the full time budget.",
+        "- If you cannot make meaningful progress, checkpoint the blocker and recommend the next branch.",
+        "",
+        *task_specific_checkpoint_contract(task_type, mode),
+    ]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def run_status_counts(runs: list[dict[str, Any]]) -> dict[str, int]:
@@ -2665,6 +3423,13 @@ def normalize_plan_item(item: dict[str, Any]) -> dict[str, Any]:
         "skip_git_repo_check": bool(item.get("skip_git_repo_check")),
         "full_auto": bool(item.get("full_auto")),
         "dangerous": bool(item.get("dangerous")),
+        "max_run_seconds": normalize_optional_positive_int(item.get("max_run_seconds"), "max_run_seconds"),
+        "path_id": normalize_optional_text(item.get("path_id")),
+        "parent_path_id": normalize_optional_text(item.get("parent_path_id")),
+        "path_mode": normalize_path_mode(item.get("path_mode"), fallback=normalize_path_mode(item.get("mode"))),
+        "task_type": normalize_task_type(item.get("task_type")),
+        "hypothesis": normalize_optional_text(item.get("hypothesis")),
+        "kill_criteria": normalize_optional_text(item.get("kill_criteria")),
     }
     if not normalized["task_id"]:
         raise RuntimeError("launch plan item must include task_id")
@@ -2886,6 +3651,9 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
     completion_sentinel = normalize_optional_text(brief.get("completion_sentinel"))
     max_planner_rounds = brief.get("max_planner_rounds")
     max_auto_fix_rounds = brief.get("max_auto_fix_rounds")
+    max_work_seconds = project_work_budget_seconds(brief)
+    remaining_work_seconds = project_remaining_work_seconds(brief, existing_runs)
+    elapsed_work_seconds = project_elapsed_seconds(brief, existing_runs)
     planner_provider = validate_provider_name(
         normalize_optional_text(brief.get("planner_provider")),
         field_name="planner_provider",
@@ -2898,6 +3666,20 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
     validation_status = normalize_optional_text(validation.get("status")) or "not-run"
     answers = load_answers(project_dir)
     answered = answered_questions(collect_question_records(existing_runs), answers)
+    path_checkpoints = load_path_checkpoints(project_dir)
+    path_warnings = project_path_warnings(project_dir, existing_runs, path_checkpoints)
+    running_workers = [
+        run
+        for run in previous_workers
+        if str(run.get("status") or "") == "running"
+    ]
+    pending_workers = [
+        run
+        for run in previous_workers
+        if run_is_unsettled(run) and str(run.get("status") or "") != "running"
+    ]
+    pool_target = max_parallel_sessions()
+    available_worker_slots = max(0, pool_target - len(running_workers) - len(pending_workers))
     lines = [
         f"You are the manager-planner for the project `{project_name}`.",
         "",
@@ -2939,6 +3721,13 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
     lines.append(f"- clarification_mode={clarification_mode}")
     lines.append(f"- max_planner_rounds={max_planner_rounds}")
     lines.append(f"- max_auto_fix_rounds={max_auto_fix_rounds}")
+    lines.append(f"- max_work_seconds={max_work_seconds if max_work_seconds is not None else '-'}")
+    lines.append(f"- elapsed_work_seconds={elapsed_work_seconds if elapsed_work_seconds is not None else '-'}")
+    lines.append(f"- remaining_work_seconds={remaining_work_seconds if remaining_work_seconds is not None else '-'}")
+    lines.append(f"- worker_pool_target={pool_target}")
+    lines.append(f"- running_child_workers={len(running_workers)}")
+    lines.append(f"- queued_or_pending_child_workers={len(pending_workers)}")
+    lines.append(f"- available_worker_slots={available_worker_slots}")
     lines.append(f"- completion_sentinel={completion_sentinel or '-'}")
     lines.extend(["", *provider_policy_lines(
         allowed_providers=allowed_child_providers,
@@ -2982,6 +3771,29 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             )
     else:
         lines.append("- none")
+    lines.extend(["", "Path search memory:"])
+    lines.append(f"- checkpoint_log={project_path_checkpoints_md_path(project_dir)}")
+    lines.append(f"- path_tree={project_path_tree_html_path(project_dir)}")
+    if path_checkpoints:
+        for record in path_checkpoints[-8:]:
+            lines.append(
+                "- "
+                f"path={normalize_optional_text(record.get('path_id')) or '-'} "
+                f"mode={normalize_optional_text(record.get('mode')) or '-'} "
+                f"type={normalize_optional_text(record.get('task_type')) or '-'} "
+                f"decision={short_summary(normalize_optional_text(record.get('decision')), max_chars=72)} "
+                f"next={short_summary(normalize_optional_text(record.get('next')), max_chars=72)}"
+            )
+    else:
+        lines.append("- none recorded yet")
+    lines.extend(["", "Path search warnings:"])
+    if path_warnings:
+        for warning in path_warnings[:8]:
+            lines.append(
+                f"- {warning['kind']}: task={warning['task_id']} path={warning['path_id']} {warning['message']}"
+            )
+    else:
+        lines.append("- none")
     lines.extend(
         [
             "",
@@ -2989,10 +3801,20 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             "- First decide whether the brief is clear enough to launch workers safely.",
             "- If the brief is missing key repo/spec context or important constraints, ask at most 3 concise questions under a `Questions For Humans` heading and do not emit a launch plan in the same response.",
             "- Do not invoke team-leader or create nested team-leader-managed sessions from inside this child session.",
+            "- Treat each child run as a branch in the path search tree. Assign explicit path metadata so the run can converge rather than wander.",
+            "- Use `path_mode=explore` for cheap evidence-gathering, `exploit` for the current lead path, `retry` for validation or execution recovery, `review` for branch judgment, and `synthesize` for pruning or summary work.",
+            "- Use task-specific prompts: refactor prompts must name invariants and blast radius; bugfix prompts must name reproduction and changed variable; validation prompts must name first failing check; architecture prompts must name the boundary or contract being tested; review prompts must end with a branch decision.",
+            "- Every child prompt must require a final `Path Checkpoint` section with Path ID, Parent, Mode, Task Type, Hypothesis, Action, Artifact, Evidence, Worked, Failed, Decision, Next, and Kill Criteria.",
+            "- Do not let all branches remain open. Promote, park, drop, or retry paths based on evidence from the checkpoint log.",
             f"- Only use child providers from this allowed list: {format_inline_list(allowed_child_providers)}.",
             f"- If a run omits `provider`, the manager will use `{default_child_provider}` by default.",
             "- Set `provider_bin` only when the user explicitly asked for a non-default executable path.",
             "- Use as few child sessions as necessary.",
+            "- For a timed project with remaining_work_seconds above zero, keep productive work going until the work window is exhausted; do not stop only because a prior wave looks complete.",
+            "- If delivery already appears complete while time remains, spend the remaining work window on validation, review, hardening, documentation, synthesis, or alternate-path checks that can improve confidence.",
+            "- Keep the child-worker pool fed: when available_worker_slots is above zero, emit enough independent runs to fill useful slots, capped by the per-wave limit and the remaining project time.",
+            "- Give each child a max_run_seconds value no greater than remaining_work_seconds; use shorter child budgets when the branch has clear kill criteria.",
+            "- Child prompts must tell the child to stop early when its kill criteria are hit or useful evidence stops appearing.",
             f"- Do not emit more than {max_plan_runs_per_wave()} child runs in one plan; if more work is needed, schedule only the next wave.",
             "- Split writers by disjoint file ownership whenever possible.",
             "- Prefer read-only research or review children if write boundaries are unclear.",
@@ -3014,6 +3836,12 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             '      "task_id": "stable-task-id",',
             '      "name": "short-run-name",',
             '      "role": "research|implementation|reviewer|manager",',
+            '      "path_id": "stable-path-node-id",',
+            '      "parent_path_id": "optional-parent-path-id",',
+            '      "path_mode": "explore|exploit|retry|review|synthesize",',
+            '      "task_type": "architecture|bugfix|docs|implementation|refactor|research|review|validation",',
+            '      "hypothesis": "concrete branch hypothesis",',
+            '      "kill_criteria": "evidence that should stop or park this branch",',
             '      "summary": "one-line summary",',
             '      "cwd": "/absolute/or/project-relative/path",',
             '      "sandbox": "read-only|workspace-write",',
@@ -3023,6 +3851,7 @@ def planner_prompt_for_project(project_name: str, brief: dict[str, Any], project
             '      "skip_git_repo_check": false,',
             '      "full_auto": true,',
             '      "dangerous": false,',
+            '      "max_run_seconds": 900,',
             '      "prompt": "full child prompt text"',
             "    }",
             "  ]",
@@ -3513,6 +4342,11 @@ def project_stage_snapshot(
         stage_reason = "Validation passed but the completion sentinel was not found"
         next_action = "Review results or run another planning round"
         focus = normalize_optional_text(brief.get("completion_sentinel")) or "Waiting for completion signal"
+    elif machine_complete is True and project_work_budget_seconds(brief) is not None and not project_budget_reached:
+        current_stage = "budget-continuing"
+        stage_reason = "Delivery criteria are satisfied, but the requested timed work window still has budget"
+        next_action = "Manager will keep filling useful child-worker slots until `max_work_seconds` is exhausted"
+        focus = format_duration(remaining_work_seconds)
     elif machine_complete is True:
         current_stage = "delivered"
         stage_reason = "Machine-evaluable delivery criteria are satisfied"
@@ -3869,6 +4703,10 @@ def render_project_overview(
     brief = load_project_brief(project_dir, project_name)
     validation = load_project_validation(project_dir)
     stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
+    path_checkpoints = load_path_checkpoints(project_dir)
+    path_warnings = project_path_warnings(project_dir, runs, path_checkpoints)
+    path_checkpoints = load_path_checkpoints(project_dir)
+    path_warnings = project_path_warnings(project_dir, runs, path_checkpoints)
     goal = normalize_optional_text(brief.get("goal")) if brief else None
     autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) if brief else None
     clarification_mode = normalize_optional_text(brief.get("clarification_mode")) if brief else None
@@ -3887,6 +4725,8 @@ def render_project_overview(
         "- `launch-plan.md`: latest planner-produced child launch plan",
         "- `validation.md`: latest validation results and delivery status",
         "- `metrics.md`: scorecard for timing, human-touch, parallelism, and waiting overhead",
+        "- `path-checkpoints.md`: explore/exploit checkpoint log for long-running search paths",
+        "- `path-tree.html`: static browser view of the path tree",
         "- `tasks.md`: task-oriented ledger with summaries and ownership",
         "- `manager-summary.md`: concise manager snapshot",
         "- `answers.md`: human-maintained answers keyed by question id",
@@ -3921,6 +4761,8 @@ def render_project_overview(
             f"- Launch plan: `{project_launch_plan_md_path(project_dir)}`",
             f"- Validation: `{project_validation_md_path(project_dir)}`",
             f"- Metrics: `{project_metrics_md_path(project_dir)}`",
+            f"- Path checkpoints: `{project_path_checkpoints_md_path(project_dir)}`",
+            f"- Path tree: `{project_path_tree_html_path(project_dir)}`",
             f"- Detail page: `{project_history_path(project_dir) if compacted else project_default_detail_path(project_dir)}`",
             f"- Goal: {goal or '_No goal recorded yet._'}",
             f"- Autonomy mode: `{autonomy_mode or 'manual'}`",
@@ -3967,6 +4809,9 @@ def render_task_ledger(runs: list[dict[str, Any]]) -> str:
                 str(run.get("task_id") or run["run_id"]),
                 str(run.get("summary") or "-"),
                 str(run.get("role") or "-"),
+                str(run.get("path_id") or "-"),
+                str(run.get("path_mode") or "-"),
+                str(run.get("task_type") or "-"),
                 str(run.get("status") or "-"),
                 str(run.get("dispatch_state") or "-"),
                 format_inline_list(normalize_str_list(run.get("blocked_on"), "blocked_on")),
@@ -3982,8 +4827,8 @@ def render_task_ledger(runs: list[dict[str, Any]]) -> str:
             "# Task Ledger",
             "",
             markdown_table(
-                ["task", "summary", "role", "status", "dispatch", "blocked_on", "run", "depends_on", "owned_paths", "integration", "session"],
-                rows or [["-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]],
+                ["task", "summary", "role", "path", "mode", "type", "status", "dispatch", "blocked_on", "run", "depends_on", "owned_paths", "integration", "session"],
+                rows or [["-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]],
             ),
             "",
         ]
@@ -4018,6 +4863,8 @@ def render_dashboard(
     validation_status = normalize_optional_text(validation.get("status")) if validation else None
     integration_issues = integration_alerts(runs)
     warning_runs = output_warning_runs(runs)
+    path_checkpoints = load_path_checkpoints(project_dir) if project_dir else []
+    path_warnings = project_path_warnings(project_dir, runs, path_checkpoints) if project_dir else []
     for run in sorted(runs, key=run_sort_key):
         rows.append(
             [
@@ -4059,6 +4906,8 @@ def render_dashboard(
         f"- Cancelled: `{counts['cancelled']}`",
         f"- Integration issues: `{len(integration_issues)}`",
         f"- Output warnings: `{len(warning_runs)}`",
+        f"- Path checkpoints: `{len(path_checkpoints)}`",
+        f"- Path warnings: `{len(path_warnings)}`",
         "",
         "## Planner Output",
         "",
@@ -4080,6 +4929,38 @@ def render_dashboard(
         "",
         f"- Status: `{validation_status or 'not-run'}`",
         f"- File: `{project_validation_md_path(project_dir) if project_dir else '-'}`",
+        "",
+        "## Path Search",
+        "",
+        f"- Checkpoints: `{project_path_checkpoints_md_path(project_dir) if project_dir else '-'}`",
+        f"- Tree: `{project_path_tree_html_path(project_dir) if project_dir else '-'}`",
+        "",
+        markdown_table(
+            ["updated", "path", "mode", "type", "decision", "next"],
+            [
+                [
+                    format_short_timestamp(normalize_optional_text(record.get("updated_at"))),
+                    short_summary(normalize_optional_text(record.get("path_id")), max_chars=24),
+                    short_summary(normalize_optional_text(record.get("mode")), max_chars=12),
+                    short_summary(normalize_optional_text(record.get("task_type")), max_chars=14),
+                    short_summary(normalize_optional_text(record.get("decision")), max_chars=42),
+                    short_summary(normalize_optional_text(record.get("next")), max_chars=42),
+                ]
+                for record in path_checkpoints[-8:]
+            ]
+            or [["-", "-", "-", "-", "-", "-"]],
+        ),
+        "",
+        "### Path Warnings",
+        "",
+        *(
+            [
+                f"- `{warning['kind']}` task=`{warning['task_id']}` path=`{warning['path_id']}`: {warning['message']}"
+                for warning in path_warnings
+            ]
+            if path_warnings
+            else ["_No path convergence warnings._"]
+        ),
         "",
         *(project_state_policy_markdown(project_name, project_dir) if project_dir else []),
         "## Run Table",
@@ -4210,6 +5091,8 @@ def render_manager_summary(
     launch_plan = read_project_launch_plan(project_dir) if project_dir else None
     validation_status = normalize_optional_text(validation.get("status")) if validation else None
     warning_runs = output_warning_runs(runs)
+    path_checkpoints = load_path_checkpoints(project_dir) if project_dir else []
+    path_warnings = project_path_warnings(project_dir, runs, path_checkpoints) if project_dir else []
     lines = [
         f"# {project_name} Manager Summary",
         "",
@@ -4229,6 +5112,8 @@ def render_manager_summary(
         f"- Failed: `{counts['failed']}`",
         f"- Cancelled: `{counts['cancelled']}`",
         f"- Output warnings: `{len(warning_runs)}`",
+        f"- Path checkpoints: `{len(path_checkpoints)}`",
+        f"- Path warnings: `{len(path_warnings)}`",
         "",
         "## Planner State",
         "",
@@ -4243,6 +5128,27 @@ def render_manager_summary(
                 f"- Summary: {normalize_optional_text(launch_plan.get('plan_summary')) or '-'}",
             ]
         )
+    lines.extend([""])
+    lines.extend(["## Path Search", ""])
+    if project_dir:
+        lines.append(f"- Checkpoints: `{project_path_checkpoints_md_path(project_dir)}`")
+        lines.append(f"- Tree: `{project_path_tree_html_path(project_dir)}`")
+    if path_checkpoints:
+        for record in path_checkpoints[-5:]:
+            lines.append(
+                f"- `{normalize_optional_text(record.get('path_id')) or '-'}` "
+                f"{normalize_optional_text(record.get('mode')) or '-'}: "
+                f"{short_summary(normalize_optional_text(record.get('decision')), max_chars=80)}"
+            )
+    else:
+        lines.append("- no path checkpoints recorded yet")
+    if path_warnings:
+        lines.append("")
+        lines.append("Path warnings:")
+        for warning in path_warnings[:5]:
+            lines.append(
+                f"- `{warning['kind']}` task=`{warning['task_id']}` path=`{warning['path_id']}`: {warning['message']}"
+            )
     lines.extend([""])
     if project_dir:
         lines.extend(project_state_policy_markdown(project_name, project_dir))
@@ -4434,6 +5340,8 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
     validation = load_project_validation(project_dir)
     stage = project_stage_snapshot(runs, question_records, answers, conflicts, brief, validation)
     launch_plan = read_project_launch_plan(project_dir)
+    path_checkpoints = load_path_checkpoints(project_dir)
+    path_warnings = project_path_warnings(project_dir, runs, path_checkpoints)
     active = [
         run for run in sorted(runs, key=run_sort_key)
         if str(run.get("status") or "") == "running"
@@ -4451,6 +5359,8 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         f"brief={project_brief_md_path(project_dir)}",
         f"launch_plan={project_launch_plan_md_path(project_dir)}",
         f"validation={project_validation_md_path(project_dir)}",
+        f"path_checkpoints={project_path_checkpoints_md_path(project_dir)}",
+        f"path_tree={project_path_tree_html_path(project_dir)}",
         f"goal={normalize_optional_text(brief.get('goal')) if brief else '-'}",
         f"autonomy_mode={normalize_optional_text(brief.get('autonomy_mode')) if brief else 'manual'}",
         f"clarification_mode={normalize_optional_text(brief.get('clarification_mode')) if brief else 'auto'}",
@@ -4477,7 +5387,7 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
         "counts="
         f"running:{counts['running']} blocked:{len(blocked)} completed:{counts['completed']} "
         f"failed:{counts['failed']} cancelled:{counts['cancelled']} integration_issues:{len(integration_issues)} "
-        f"output_warnings:{len(warning_runs)}"
+        f"output_warnings:{len(warning_runs)} path_warnings:{len(path_warnings)}"
     )
     lines.extend(project_state_policy_cli(project_name, project_dir))
     lines.extend(["", "planner:"])
@@ -4489,6 +5399,22 @@ def render_project_cli_summary(root: Path, project_name: str, runs: list[dict[st
             f"applied_at={normalize_optional_text(launch_plan.get('applied_at')) or '-'} "
             f"summary={short_summary(normalize_optional_text(launch_plan.get('plan_summary')), max_chars=80)}"
         )
+    lines.extend(["", "path_search:"])
+    if not path_checkpoints:
+        lines.append("- checkpoints: none")
+    else:
+        for record in path_checkpoints[-5:]:
+            lines.append(
+                f"- {normalize_optional_text(record.get('path_id')) or '-'} "
+                f"{normalize_optional_text(record.get('mode')) or '-'} "
+                f"decision={short_summary(normalize_optional_text(record.get('decision')), max_chars=70)}"
+            )
+    lines.extend(["", "path_warnings:"])
+    if not path_warnings:
+        lines.append("- none")
+    else:
+        for warning in path_warnings[:5]:
+            lines.append(f"- {warning['kind']} [{warning['task_id']}/{warning['path_id']}] {warning['message']}")
     lines.extend(["", "active_runs:"])
     if not active:
         lines.append("- none")
@@ -4588,6 +5514,8 @@ def render_team_status_summary(root: Path, project_name: str, runs: list[dict[st
         f"workspace={project_dir}",
         f"dashboard={project_default_detail_path(project_dir)}",
         f"metrics={project_metrics_md_path(project_dir)}",
+        f"path_checkpoints={project_path_checkpoints_md_path(project_dir)}",
+        f"path_tree={project_path_tree_html_path(project_dir)}",
     ]
     watcher_line = f"watcher={watcher_state}"
     if watcher_heartbeat:
@@ -4616,6 +5544,22 @@ def render_team_status_summary(root: Path, project_name: str, runs: list[dict[st
         for run in queued:
             waiting_on = format_inline_list(normalize_str_list(run.get("blocked_on"), "blocked_on"))
             lines.append(f"- {run.get('task_id') or run['run_id']}: {waiting_on}")
+    lines.extend(["", "path_search:"])
+    if not path_checkpoints:
+        lines.append("- checkpoints: none")
+    else:
+        for record in path_checkpoints[-5:]:
+            lines.append(
+                f"- {normalize_optional_text(record.get('path_id')) or '-'} "
+                f"{normalize_optional_text(record.get('mode')) or '-'} "
+                f"decision={short_summary(normalize_optional_text(record.get('decision')), max_chars=80)}"
+            )
+    lines.extend(["", "path_warnings:"])
+    if not path_warnings:
+        lines.append("- none")
+    else:
+        for warning in path_warnings[:5]:
+            lines.append(f"- {warning['kind']} [{warning['task_id']}/{warning['path_id']}] {warning['message']}")
     lines.extend(["", "open_questions:"])
     if not open_questions:
         lines.append("- none")
@@ -4730,6 +5674,24 @@ def build_team_status_snapshot(root: Path, project_name: str, runs: list[dict[st
             }
             for run in warning_runs
         ],
+        "path_checkpoints": [
+            {
+                "path_id": str(record.get("path_id") or "-"),
+                "mode": str(record.get("mode") or "-"),
+                "decision": str(record.get("decision") or "-"),
+                "next": str(record.get("next") or "-"),
+            }
+            for record in path_checkpoints[-5:]
+        ],
+        "path_warnings": [
+            {
+                "kind": str(warning["kind"]),
+                "task_id": str(warning["task_id"]),
+                "path_id": str(warning["path_id"]),
+                "message": str(warning["message"]),
+            }
+            for warning in path_warnings
+        ],
     }
 
 
@@ -4751,6 +5713,14 @@ def render_team_status_milestones(previous: dict[str, Any] | None, current: dict
                 lines.append(f"- {item['label']}: {item['summary']}")
                 if item["note"] != "-":
                     lines.append(f"  note: {item['note']}")
+        if current.get("path_checkpoints"):
+            lines.append("path_search:")
+            for item in current["path_checkpoints"][:5]:
+                lines.append(f"- {item['path_id']} {item['mode']}: {short_summary(item['decision'], max_chars=80)}")
+        if current.get("path_warnings"):
+            lines.append("path_warnings:")
+            for item in current["path_warnings"][:5]:
+                lines.append(f"- {item['kind']} [{item['task_id']}/{item['path_id']}] {item['message']}")
         return "\n".join(lines)
     if current["stage"] != previous["stage"]:
         lines.append(f"milestone=stage-change {previous['stage']} -> {current['stage']}")
@@ -4821,6 +5791,38 @@ def render_team_status_milestones(previous: dict[str, Any] | None, current: dict
     if warning_events:
         lines.append("warnings:")
         lines.extend(warning_events[:5])
+    previous_path_warnings = {
+        f"{item['kind']}|{item['task_id']}|{item['path_id']}": item["message"]
+        for item in previous.get("path_warnings", [])
+    }
+    current_path_warnings = {
+        f"{item['kind']}|{item['task_id']}|{item['path_id']}": item["message"]
+        for item in current.get("path_warnings", [])
+    }
+    path_warning_events = []
+    for key in sorted(set(previous_path_warnings) | set(current_path_warnings)):
+        old = previous_path_warnings.get(key)
+        new = current_path_warnings.get(key)
+        if old != new:
+            kind, task_id, path_id = key.split("|", 2)
+            path_warning_events.append(f"- {kind} [{task_id}/{path_id}]: {new or 'cleared'}")
+    if path_warning_events:
+        lines.append("path_warnings:")
+        lines.extend(path_warning_events[:5])
+    previous_paths = {
+        f"{item['path_id']}|{item['mode']}|{item['decision']}|{item['next']}"
+        for item in previous.get("path_checkpoints", [])
+    }
+    current_paths = {
+        f"{item['path_id']}|{item['mode']}|{item['decision']}|{item['next']}"
+        for item in current.get("path_checkpoints", [])
+    }
+    new_paths = sorted(current_paths - previous_paths)
+    if new_paths:
+        lines.append("path_search:")
+        for item in new_paths[:5]:
+            path_id, mode, decision, next_step = item.split("|", 3)
+            lines.append(f"- {path_id} {mode}: {short_summary(decision, max_chars=80)} next={short_summary(next_step, max_chars=80)}")
     if len(lines) == 1:
         lines.extend(
             [
@@ -5154,6 +6156,7 @@ def sync_one_project(root: Path, project_name: str, slug: str, runs: list[dict[s
     conflicts = detect_conflict_risks(runs)
     integration_issues = cleanup_state["integration_issues"]
     metrics = build_project_metrics(root, project_name, runs)
+    merge_path_checkpoints(project_dir, runs)
     delete_if_exists(project_dir / "project.md")
     write_text(
         project_dir / "README.md",
@@ -5399,6 +6402,12 @@ def dispatch_options_from_plan_item(
         dry_run=False,
         owned_paths=normalize_str_list(item.get("owned_paths"), "owned_paths"),
         depends_on=normalize_str_list(item.get("depends_on"), "depends_on"),
+        path_id=normalize_optional_text(item.get("path_id")),
+        parent_path_id=normalize_optional_text(item.get("parent_path_id")),
+        path_mode=normalize_path_mode(item.get("path_mode")),
+        task_type=normalize_task_type(item.get("task_type")),
+        hypothesis=normalize_optional_text(item.get("hypothesis")),
+        kill_criteria=normalize_optional_text(item.get("kill_criteria")),
     )
 
 
@@ -5493,11 +6502,45 @@ def apply_planner_outputs(root: Path, index: dict[str, Any]) -> None:
         apply_planner_run(root, index, run)
 
 
+def nonplanner_unsettled_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        run
+        for run in runs
+        if not run_is_planner(run) and run_is_unsettled(run)
+    ]
+
+
+def nonplanner_running_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        run
+        for run in runs
+        if not run_is_planner(run) and str(run.get("status") or "") == "running"
+    ]
+
+
+def nonplanner_pending_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        run
+        for run in nonplanner_unsettled_runs(runs)
+        if str(run.get("status") or "") != "running"
+    ]
+
+
+def worker_pool_needs_top_up(runs: list[dict[str, Any]]) -> bool:
+    running_count = len(nonplanner_running_runs(runs))
+    if running_count <= 0:
+        return False
+    if running_count >= max_parallel_sessions():
+        return False
+    return not nonplanner_pending_runs(runs)
+
+
 def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], runs: list[dict[str, Any]]) -> tuple[bool, str]:
     if not normalize_optional_text(brief.get("goal")):
         return False, "missing-goal"
     if project_time_budget_reached(brief, runs):
         return False, "max-work-seconds-reached"
+    timed_work_window = project_work_budget_seconds(brief) is not None
     open_questions = unanswered_questions(collect_question_records(runs), load_answers(project_dir))
     if open_questions:
         return False, "waiting-for-human"
@@ -5507,8 +6550,6 @@ def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], r
     latest_planner = latest_project_planner_run(runs)
     if latest_planner and str(latest_planner.get("status") or "") in {"running", "prepared", "blocked"}:
         return False, "planner-already-running"
-    if project_has_unsettled_nonplanner_runs(runs):
-        return False, "worker-runs-pending"
     if latest_planner and normalize_optional_text(latest_planner.get("plan_apply_error")):
         if not answers_updated_after(project_dir, normalize_optional_text(latest_planner.get("finished_at"))):
             return False, "planner-apply-error"
@@ -5520,7 +6561,7 @@ def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], r
         int(brief.get("max_auto_fix_rounds") or DEFAULT_PROJECT_MAX_AUTO_FIX_ROUNDS),
     )
     validation = maybe_refresh_project_validation(project_dir, brief, runs) if runs else load_project_validation(project_dir)
-    if project_is_machine_complete(brief, validation) is True:
+    if project_is_machine_complete(brief, validation) is True and not timed_work_window:
         return False, "complete"
     if latest_planner and latest_planner.get("plan_applied_at") and not normalize_str_list(latest_planner.get("planned_run_ids"), "planned_run_ids"):
         if not answers_updated_after(project_dir, normalize_optional_text(latest_planner.get("finished_at"))):
@@ -5542,15 +6583,21 @@ def should_spawn_planner_for_project(project_dir: Path, brief: dict[str, Any], r
     if auto_fix_round_count(runs) >= max_auto_fix_rounds:
         if failed_runs_present or integration_recovery_needed or validation_recovery_reason:
             return False, "max-auto-fix-rounds-reached"
+    if nonplanner_pending_runs(runs):
+        return False, "worker-runs-pending"
     if failed_runs_present:
         return True, "failed-runs"
     if integration_recovery_needed:
         return True, "integration-conflict"
     if validation_recovery_reason:
         return True, validation_recovery_reason
+    if project_has_unsettled_nonplanner_runs(runs):
+        if timed_work_window and worker_pool_needs_top_up(runs):
+            return True, "time-budget-pool-top-up"
+        return False, "worker-runs-pending"
     if latest_planner is None:
         return True, "missing-planner"
-    if project_work_budget_seconds(brief) is not None:
+    if timed_work_window:
         return True, "time-budget-continuation"
     return False, "manual-review"
 
@@ -5621,7 +6668,7 @@ def maybe_auto_drive_projects(root: Path, index: dict[str, Any]) -> None:
             continue
         maybe_refresh_project_validation(project_dir, brief, project_runs(index, project_name))
         autonomy_mode = normalize_optional_text(brief.get("autonomy_mode")) or "manual"
-        if autonomy_mode != "continuous":
+        if autonomy_mode != "continuous" and project_work_budget_seconds(brief) is None:
             continue
         runs = project_runs(index, project_name)
         should_spawn, reason = should_spawn_planner_for_project(project_dir, brief, runs)
@@ -6295,6 +7342,12 @@ def dispatch_options_for_run(run: dict[str, Any]) -> DispatchOptions:
         dry_run=False,
         owned_paths=normalize_str_list(run.get("owned_paths"), "owned_paths"),
         depends_on=normalize_str_list(run.get("depends_on"), "depends_on"),
+        path_id=normalize_optional_text(run.get("path_id")),
+        parent_path_id=normalize_optional_text(run.get("parent_path_id")),
+        path_mode=normalize_path_mode(run.get("path_mode")),
+        task_type=normalize_task_type(run.get("task_type")),
+        hypothesis=normalize_optional_text(run.get("hypothesis")),
+        kill_criteria=normalize_optional_text(run.get("kill_criteria")),
     )
 
 
@@ -6411,6 +7464,8 @@ def project_has_state_files(root: Path, project_name: str) -> bool:
         or project_validation_path(project_dir).exists()
         or project_validation_md_path(project_dir).exists()
         or project_metrics_md_path(project_dir).exists()
+        or project_path_checkpoints_jsonl_path(project_dir).exists()
+        or project_path_tree_html_path(project_dir).exists()
     )
 
 
@@ -6895,6 +7950,16 @@ def materialize_run(
         if project_dir is None:
             project_dir = ensure_project_workspace(root, options.project, project_slug(options.project))
         worktree_path = str(project_dir / "worktrees" / run_id)
+    effective_path_id = normalize_optional_text(options.path_id) or normalize_optional_text(options.task_id) or run_id
+    effective_parent_path_id = normalize_optional_text(options.parent_path_id)
+    effective_path_mode = (
+        normalize_path_mode(options.path_mode)
+        or infer_path_mode(options.role, options.summary, options.prompt_text)
+    )
+    effective_task_type = (
+        normalize_task_type(options.task_type)
+        or infer_task_type(options.role, options.summary, options.prompt_text)
+    )
 
     prompt_path = run_dir / "prompt.md"
     last_message_path = run_dir / "last_message.md"
@@ -6907,7 +7972,23 @@ def materialize_run(
     heartbeat_path = run_dir / "heartbeat.txt"
     runner_path = run_dir / "runner.sh"
 
-    write_text(prompt_path, child_prompt_guard(options.prompt_text))
+    prompt_text = options.prompt_text
+    if project_dir is not None and not (
+        (normalize_optional_text(options.role) or "").lower() == PLANNER_ROLE
+        and (normalize_optional_text(options.task_id) or "").startswith(PLANNER_TASK_PREFIX)
+    ):
+        prompt_text = build_child_convergence_prompt(
+            prompt_text,
+            project_dir=project_dir,
+            path_id=effective_path_id,
+            parent_path_id=effective_parent_path_id,
+            mode=effective_path_mode,
+            task_type=effective_task_type,
+            hypothesis=normalize_optional_text(options.hypothesis),
+            kill_criteria=normalize_optional_text(options.kill_criteria),
+        )
+
+    write_text(prompt_path, child_prompt_guard(prompt_text))
 
     command = adapter.build_exec_command(
         prompt_path=prompt_path,
@@ -6955,6 +8036,12 @@ def materialize_run(
         "task_id": options.task_id,
         "role": options.role,
         "summary": options.summary or derive_summary(options.prompt_text),
+        "path_id": effective_path_id,
+        "parent_path_id": effective_parent_path_id,
+        "path_mode": effective_path_mode,
+        "task_type": effective_task_type,
+        "hypothesis": normalize_optional_text(options.hypothesis),
+        "kill_criteria": normalize_optional_text(options.kill_criteria),
         "status": "dry-run" if options.dry_run else "prepared",
         "run_dir": str(run_dir),
         "cwd": str(options.cd),
@@ -7037,6 +8124,7 @@ def materialize_run(
         print(f"workspace={project_dir}")
         print(f"landing_page={project_dir / 'README.md'}")
         print(f"dashboard={project_default_detail_path(project_dir)}")
+        print(f"path_tree={project_path_tree_html_path(project_dir)}")
     return run
 
 
@@ -7077,6 +8165,12 @@ def common_dispatch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             dry_run=bool(args.dry_run),
             owned_paths=normalize_str_list(args.owned_path, "owned_paths"),
             depends_on=normalize_str_list(args.depends_on, "depends_on"),
+            path_id=normalize_optional_text(getattr(args, "path_id", None)),
+            parent_path_id=normalize_optional_text(getattr(args, "parent_path_id", None)),
+            path_mode=normalize_path_mode(getattr(args, "path_mode", None)),
+            task_type=normalize_task_type(getattr(args, "task_type", None)),
+            hypothesis=normalize_optional_text(getattr(args, "hypothesis", None)),
+            kill_criteria=normalize_optional_text(getattr(args, "kill_criteria", None)),
         ),
     }
 
@@ -7132,6 +8226,12 @@ def cmd_batch(args: argparse.Namespace) -> int:
             temp_args.task_id = spec.get("task_id", args.task_id)
             temp_args.role = spec.get("role", args.role)
             temp_args.summary = spec.get("summary", args.summary)
+            temp_args.path_id = spec.get("path_id", getattr(args, "path_id", None))
+            temp_args.parent_path_id = spec.get("parent_path_id", getattr(args, "parent_path_id", None))
+            temp_args.path_mode = spec.get("path_mode", getattr(args, "path_mode", None))
+            temp_args.task_type = spec.get("task_type", getattr(args, "task_type", None))
+            temp_args.hypothesis = spec.get("hypothesis", getattr(args, "hypothesis", None))
+            temp_args.kill_criteria = spec.get("kill_criteria", getattr(args, "kill_criteria", None))
             temp_args.prompt = prompt
             temp_args.prompt_file = prompt_file
             temp_args.provider = spec.get("provider", args.provider)
@@ -7499,6 +8599,12 @@ def add_common_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task-id", help="Stable task id inside the project workspace")
     parser.add_argument("--role", help="Worker role such as research, implementation, reviewer, or manager")
     parser.add_argument("--summary", help="Short human-readable summary of what this child session is working on")
+    parser.add_argument("--path-id", help="Path-tree node id for explore/exploit checkpoint tracking")
+    parser.add_argument("--parent-path-id", help="Parent path-tree node id")
+    parser.add_argument("--path-mode", choices=PATH_MODES, help="Path-tree mode for this run")
+    parser.add_argument("--task-type", choices=TASK_TYPES, help="Task-specific convergence prompt type")
+    parser.add_argument("--hypothesis", help="Concrete hypothesis this run should test or exploit")
+    parser.add_argument("--kill-criteria", help="Evidence that should stop, park, or pivot this path")
     parser.add_argument("--prompt", help="Prompt text for the child session")
     parser.add_argument("--prompt-file", help="Path to a prompt file for the child session")
     parser.add_argument("--cd", help="Working directory for the child session")
@@ -7544,7 +8650,7 @@ def add_project_capture_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--clarification-mode", choices=CLARIFICATION_MODES, help="Whether the planner should clarify the brief before launching workers")
     parser.add_argument("--validation-command", action="append", default=[], help="Validation command to run when a project wave settles")
     parser.add_argument("--completion-sentinel", help="Text marker that indicates delivery is complete when found in child output")
-    parser.add_argument("--max-work-seconds", type=int, help="Maximum total wall-clock seconds the project may keep launching work before timing out")
+    parser.add_argument("--max-work-seconds", type=int, help="Project work-window seconds; timed projects keep replenishing useful child work until this expires")
     parser.add_argument("--max-planner-rounds", type=int, help="Maximum number of manager planning rounds before stopping")
     parser.add_argument("--max-auto-fix-rounds", type=int, help="Maximum automatic validation-fix or recovery planning rounds")
     parser.add_argument(

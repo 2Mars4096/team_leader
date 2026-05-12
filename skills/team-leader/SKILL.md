@@ -13,15 +13,18 @@ Treat a child session as a full child CLI worker with its own session, context w
 
 Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragments. This path is relative to the skill itself, not the project root. In this repo that file is at `skills/team-leader/scripts/team_leader.py`, and when installed it lives under the Codex skills directory at `.../skills/team-leader/scripts/team_leader.py`. Keep your working directory at the target project unless you pass `--root` and `--cd` explicitly; do not `cd` into the skill directory just to run the controller, because the default `.team-leader/` root is derived from the current working directory. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
-Goal-oriented orchestration can be bounded by time. Set `--max-work-seconds` on the project brief when the user wants the manager to pursue a goal autonomously but stop after a fixed safety budget, and use `--max-run-seconds` when one direct child should have a tighter wall-clock limit. Child exit triggers a one-shot manager refresh, while the background monitor remains a fallback; automatic time-budget continuation requires `autonomy_mode=continuous` and an explicit `max_work_seconds` budget.
+Goal-oriented orchestration can run for a requested work window. Set `--max-work-seconds` on the project brief when the user wants the manager to keep replenishing useful child work until that window expires, while still obeying pool and planner-round caps. A timed project implies continuous driving unless `--autonomy-mode` is set explicitly. Use `--max-run-seconds` when one direct child should have a tighter hard wall-clock limit. Child exit triggers a one-shot manager refresh, while the background monitor remains a fallback.
 
-When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, and one child report per run. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. While any child is active, the manager refreshes those markdown files automatically in the background. Once a project settles cleanly, the manager compacts transient dashboards, question scratchpads, per-run reports, and disposable child-run artifacts into a smaller steady-state workspace.
+When runs are linked to a project, the script also maintains a central markdown workspace under `.team-leader/projects/<project>/` with a default `README.md` landing page, a project brief, the latest planner launch plan, validation status, a live dashboard, task ledger, manager summary, questions for humans, a human-edited answers file, conflict-risk notes, path checkpoints, a static `path-tree.html` view, and one child report per run. Writer runs inside Git repos are isolated into per-run worktrees, and the manager integrates them through a project integration worktree before validation runs. While any child is active, the manager refreshes those markdown files automatically in the background. Once a project settles cleanly, the manager compacts transient dashboards, question scratchpads, per-run reports, and disposable child-run artifacts into a smaller steady-state workspace.
+
+For long-running work, use the path checkpoint layer as the main advantage over a simple goal-following thread. The manager asks planner-produced children to behave as search-tree branches: `explore` cheap evidence, `exploit` the current best path, `retry` recovery attempts, `review` branch quality, or `synthesize` pruning decisions. Child prompts are automatically decorated with task-specific convergence instructions and require a final `Path Checkpoint` section so the project can record what was tried, what worked, what failed, the branch decision, and the next branch. `team-status`, `status`, and dashboard views surface advisory path warnings such as missing checkpoints, stale progress, repeated failures, or retry loops.
 
 The controller now includes conservative safety defaults aimed at avoiding runaway resource use:
 
 - at most `8` child sessions running in parallel by default
 - at most `2` new child launches per `15` seconds by default
 - per-run child heartbeats with stale-run detection for long-running sessions
+- path checkpoint warnings with `TEAM_LEADER_PATH_CHECKPOINT_STALE_SECONDS` for long-running search progress
 - runner-enforced child timeouts with a SIGTERM grace period before SIGKILL
 - child `last_message.md` files truncated to a bounded size with head/tail preservation
 - bounded session-id scans and bounded log tail reads
@@ -121,6 +124,18 @@ python3 scripts/team_leader.py orchestrate \
 
 `orchestrate` launches a manager-planner child when needed. That planner inspects `brief.md`, the repo paths, and any spec paths, then either asks a concise clarification round or emits a machine-readable launch plan. The manager parses that plan and auto-dispatches child sessions from it. Planner output can now choose `provider` and `provider_bin` per child run, subject to the project allowlist and default child provider. When no child provider is set explicitly, that default follows the planner or launcher provider. If the planner raises human questions, they land in `questions.md` and `answers-template.md`.
 
+Planner-produced launch-plan items may also include path metadata:
+
+- `path_id`: stable path-tree node id
+- `parent_path_id`: parent node when this branch extends an earlier attempt
+- `path_mode`: `explore`, `exploit`, `retry`, `review`, or `synthesize`
+- `task_type`: `architecture`, `bugfix`, `docs`, `implementation`, `refactor`, `research`, `review`, or `validation`
+- `hypothesis`: the concrete branch hypothesis
+- `kill_criteria`: evidence that should stop or park the branch
+- `max_run_seconds`: optional hard wall-clock timeout for that child
+
+Use this metadata for long-running tasks so children converge faster and produce useful checkpoints instead of generic summaries.
+
 ### 4. Dispatch a child run directly when needed
 
 Use a direct prompt:
@@ -158,6 +173,10 @@ python3 scripts/team_leader.py dispatch \
   --task-id review-api \
   --summary "Review API changes before implementation starts" \
   --role reviewer \
+  --path-id api-review \
+  --path-mode review \
+  --task-type review \
+  --hypothesis "API changes are safe enough to implement after review." \
   --owned-path services/api \
   --depends-on plan-approved \
   --name api-review \
@@ -167,6 +186,8 @@ python3 scripts/team_leader.py dispatch \
 ```
 
 That project link is what enables automatic markdown aggregation, progress visualization, and dependency-aware next-wave launching.
+
+When a project-linked direct dispatch includes `--path-id`, `--path-mode`, `--task-type`, `--hypothesis`, or `--kill-criteria`, the controller adds the same convergence contract used for planner-produced child runs.
 
 When you want a Codex manager to launch another CLI as the child, validate it first:
 

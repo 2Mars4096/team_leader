@@ -14,7 +14,7 @@ This skill is a thin alias around the `team-leader` controller's `team-status` s
 1. Find the `team-leader` controller script.
 2. Keep the working directory at the target project unless `--root` is explicitly given.
 3. Run the controller with `team-status --project <project>`.
-4. Report the current stage, progress, active child summaries, latest child notes, blocked or queued work, open questions, conflicts, and warnings.
+4. Report the current stage, progress, active child summaries, latest child notes, path-search checkpoints or warnings, blocked or queued work, open questions, conflicts, and warnings.
 5. Treat milestone mode as the default behavior for this skill.
 
 ## Controller Path
@@ -58,5 +58,5 @@ python3 ../team-leader/scripts/team_leader.py status --project <project>
 - Prefer milestone updates by default inside Codex.
 - Summarize the stage change first.
 - Then list active children and their latest notes.
-- Call out blocked or queued runs, open questions, conflicts, and warnings.
+- Call out path-search warnings, blocked or queued runs, open questions, conflicts, and warnings.
 - If the project is settled, say whether it completed, failed, or is waiting on a human answer.

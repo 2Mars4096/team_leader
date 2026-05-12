@@ -6,7 +6,9 @@ Unlike lightweight built-in subagents, each child session is a full external CLI
 
 Long-running child runs emit a per-run heartbeat file. The manager records heartbeat metadata, surfaces heartbeat state in `status` and `watch`, and flags stale or missing heartbeats through the existing warning paths instead of leaving a hung run indistinguishable from a healthy long-running run.
 
-Goal-oriented orchestration can be bounded by time. Set `--max-work-seconds` on a project brief to cap how long the manager may keep launching work toward that goal, and use `--max-run-seconds` when one child needs a stricter wall-clock limit than the overall project budget. Child exit now triggers a one-shot manager refresh, while the background monitor remains a fallback; continuous follow-up waves require an explicit project time budget and still obey the planner-round caps.
+Goal-oriented orchestration can run for a requested work window. Set `--max-work-seconds` on a project brief when the manager should keep replenishing useful child work until that window expires, while still obeying pool and planner-round caps. A timed project implies continuous driving unless `--autonomy-mode` is set explicitly. Use `--max-run-seconds` when one child needs a stricter wall-clock limit than the overall project budget. Child exit triggers a one-shot manager refresh, while the background monitor remains a fallback.
+
+For long-running search-style work, project runs also maintain path checkpoints and a static path tree. Planner-produced and project-linked children can be assigned `explore`, `exploit`, `retry`, `review`, or `synthesize` path modes plus task-specific prompt contracts. Their final `Path Checkpoint` sections are collected into `path-checkpoints.jsonl`, rendered to `path-checkpoints.md`, and visualized in `path-tree.html`, while `status` and `team-status` surface advisory convergence warnings.
 
 ## Skills Included
 
@@ -159,6 +161,9 @@ skills/
     ├── tasks.md               # Assignment state and summaries
     ├── validation.md          # Validation results and delivery status
     ├── metrics.md             # Efficiency scorecard
+    ├── path-checkpoints.jsonl # Machine-readable explore/exploit checkpoint stream
+    ├── path-checkpoints.md    # Human-readable path checkpoint log
+    ├── path-tree.html         # Static browser view of the path tree
     ├── manager-summary.md     # Aggregated manager report
     ├── questions.md           # Questions needing human answers
     ├── answers.md             # Human-edited answers (only file for manual editing)
@@ -204,8 +209,14 @@ All commands use `python3 <path-to>/team_leader.py <command> [options]`.
 - `--child-provider <name>` -- default provider for planner-produced child runs; when omitted it follows the planner or launcher provider
 - `--child-provider-bin <path>` -- executable override for the default child provider
 - `--allow-provider <name>` -- constrain planner output to a provider allowlist
-- `--max-work-seconds <n>` -- cap total project work time for goal-oriented orchestration
-- `--max-run-seconds <n>` -- cap one child run's wall-clock execution time
+- `--max-work-seconds <n>` -- keep goal-oriented orchestration replenishing work until this project work window expires
+- `--max-run-seconds <n>` -- hard cap one child run's wall-clock execution time
+- `--path-id <id>` -- path-tree node id for a project-linked direct child run
+- `--parent-path-id <id>` -- parent path-tree node id
+- `--path-mode <mode>` -- `explore`, `exploit`, `retry`, `promote`, `park`, `drop`, `blocked`, `review`, or `synthesize`
+- `--task-type <type>` -- task-specific convergence prompt type: `architecture`, `bugfix`, `docs`, `implementation`, `refactor`, `research`, `review`, or `validation`
+- `--hypothesis <text>` -- concrete branch hypothesis for the run
+- `--kill-criteria <text>` -- evidence that should stop, park, or pivot the branch
 - `--sandbox read-only|workspace-write` -- child sandbox mode
 - `--full-auto` -- run child in full-auto mode
 - `--root <path>` -- explicit `.team-leader/` path (default: `./.team-leader`)
