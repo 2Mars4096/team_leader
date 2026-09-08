@@ -1,14 +1,30 @@
-# Team Leader
+# Team Leader — Multi-Agent Orchestration for AI Coding CLIs
 
-A Codex skill and standalone controller that manages real child CLI sessions as a team-leader style orchestrator. It launches, tracks, reviews, and aggregates parallel workers through project dashboards, dependency-aware dispatch, and automatic markdown workspaces. Codex-backed runs are still supported, but the controller now treats them as one provider option within a broader child-session model.
+**Team Leader coordinates parallel AI coding agents across Codex CLI, Claude Code, Cursor Agent, and Kiro CLI.** It is a Codex skill and standalone Python controller that plans work, dispatches full child CLI sessions, tracks dependencies, and collects results in persistent project dashboards.
 
-Unlike lightweight built-in subagents, each child session is a full external CLI session with its own context, tool access, and resume lifecycle.
+Each worker has its own context, CLI tools, logs, and resume lifecycle. Use Team Leader for development tasks that benefit from separate implementation, review, research, and validation sessions.
 
-Long-running child runs emit a per-run heartbeat file. The manager records heartbeat metadata, surfaces heartbeat state in `status` and `watch`, and flags stale or missing heartbeats through the existing warning paths instead of leaving a hung run indistinguishable from a healthy long-running run.
+[Quick start](#quick-start) · [Installation](#installation) · [Supported providers](#supported-providers) · [FAQ](docs/faq.md) · [CLI reference](#cli-reference)
 
-Goal-oriented orchestration can run for a requested work window. Set `--max-work-seconds` on a project brief when the manager should keep replenishing useful child work until that window expires, while still obeying pool and planner-round caps. A timed project implies continuous driving unless `--autonomy-mode` is set explicitly. Use `--max-run-seconds` when one child needs a stricter wall-clock limit than the overall project budget. Child exit triggers a one-shot manager refresh, while the background monitor remains a fallback.
+## Why use Team Leader?
 
-For long-running search-style work, project runs also maintain path checkpoints and a static path tree. Planner-produced and project-linked children can be assigned `explore`, `exploit`, `retry`, `review`, or `synthesize` path modes plus task-specific prompt contracts. Their final `Path Checkpoint` sections are collected into `path-checkpoints.jsonl`, rendered to `path-checkpoints.md`, and visualized in `path-tree.html`, while `status` and `team-status` surface advisory convergence warnings.
+- **Parallel coding workflows:** dispatch independent tasks and hold dependent work until its prerequisites finish.
+- **Multiple CLI providers:** assign different supported providers to the planner and individual workers in one project.
+- **Git worktree isolation:** give writer sessions separate worktrees and integrate their changes before project validation.
+- **Persistent progress tracking:** inspect dashboards, task reports, logs, heartbeats, and resumable sessions.
+- **Bounded long-running work:** configure project work windows, child timeouts, concurrency limits, and planner-round caps.
+- **Lightweight controller:** Python 3.10+ with no third-party Python runtime dependencies; child CLIs are installed separately.
+
+## Common use cases
+
+| Task | How Team Leader helps |
+|------|-----------------------|
+| Refactor several modules | Split independent changes among writers, track dependencies, then run project validation. |
+| Coordinate implementation and review | Give implementation and review to separate sessions, with provider choice per task. |
+| Investigate competing solutions | Track explore, exploit, retry, review, and synthesis paths with persistent checkpoints. |
+| Monitor a long-running agent team | Use `team-status`, run logs, and heartbeat warnings to inspect progress and stalled runs. |
+
+For a small edit that one CLI session can finish easily, a single session usually needs less coordination. Team Leader is designed for work with useful task boundaries and a concrete validation command.
 
 ## Skills Included
 
@@ -25,10 +41,12 @@ For long-running search-style work, project runs also maintain path checkpoints 
 
 ## Supported Providers
 
-- `codex` -- native `exec` / `resume` adapter with session IDs and backend reachability checks
-- `claude` -- headless `claude -p` adapter with `claude -r <session-id>` resume
-- `cursor` -- headless `cursor-agent -p` adapter with `--resume <session-id>`
-- `kiro` -- headless `kiro-cli chat --no-interactive` adapter with directory-scoped `--resume`
+| AI coding tool | Provider ID | Executable | Session support |
+|----------------|-------------|------------|-----------------|
+| Codex CLI | `codex` | `codex` | Native `exec` / `resume`, session IDs, backend reachability checks |
+| Claude Code | `claude` | `claude` | Headless `-p`, resume with `-r <session-id>` |
+| Cursor Agent | `cursor` | `cursor-agent` | Headless `-p`, resume with `--resume <session-id>` |
+| Kiro CLI | `kiro` | `kiro-cli` | Headless `chat --no-interactive`, directory-scoped `--resume` |
 
 Common aliases are accepted anywhere a provider name is expected: `cc` or `claude-code` for `claude`, `cursor-agent` for `cursor`, `kiro-cli` for `kiro`, and `codex-cli` or `openai-codex` for `codex`.
 
@@ -65,7 +83,8 @@ Skills are installed into `~/.codex/skills/team-leader/` (and `~/.codex/skills/t
 Clone the repo and copy the skill directories:
 
 ```bash
-git clone git@github.com:2Mars4096/team_leader.git
+git clone https://github.com/2Mars4096/team_leader.git
+mkdir -p ~/.codex/skills
 cp -r team_leader/skills/team-leader ~/.codex/skills/team-leader
 cp -r team_leader/skills/team-status ~/.codex/skills/team-status
 ```
@@ -136,7 +155,7 @@ skills/
 │   ├── SKILL.md                          # Skill instructions for Codex
 │   ├── agents/openai.yaml                # Skill UI metadata
 │   ├── scripts/
-│   │   ├── team_leader.py                # Main controller (~5k lines, stdlib only)
+│   │   ├── team_leader.py                # Main controller (Python stdlib only)
 │   │   └── codex_subsession_manager.py   # Compatibility wrapper
 │   └── references/
 │       ├── example_manifest.json         # Batch dispatch example
@@ -257,6 +276,14 @@ When the user provides only a goal and context:
 - `--max-auto-fix-rounds` -- caps how many validation-failure recovery waves the manager launches automatically in `continuous` mode
 - `--max-planner-rounds` -- caps how many planner iterations are allowed
 
+## Long-Running Agent Orchestration
+
+Long-running child runs emit a per-run heartbeat file. The manager records heartbeat metadata, surfaces heartbeat state in `status` and `watch`, and flags stale or missing heartbeats through the existing warning paths instead of leaving a hung run indistinguishable from a healthy long-running run.
+
+Goal-oriented orchestration can run for a requested work window. Set `--max-work-seconds` on a project brief when the manager should keep replenishing useful child work until that window expires, while still obeying pool and planner-round caps. A timed project implies continuous driving unless `--autonomy-mode` is set explicitly. Use `--max-run-seconds` when one child needs a stricter wall-clock limit than the overall project budget. Child exit triggers a one-shot manager refresh, while the background monitor remains a fallback.
+
+For long-running search-style work, project runs also maintain path checkpoints and a static path tree. Planner-produced and project-linked children can be assigned `explore`, `exploit`, `retry`, `review`, or `synthesize` path modes plus task-specific prompt contracts. Their final `Path Checkpoint` sections are collected into `path-checkpoints.jsonl`, rendered to `path-checkpoints.md`, and visualized in `path-tree.html`, while `status` and `team-status` surface advisory convergence warnings.
+
 ## Safety Defaults
 
 - Max **8** concurrent child sessions
@@ -276,3 +303,12 @@ All shipped providers now sit on the same adapter contract. Codex still keeps it
 Writer children in Git repos are isolated into per-run worktrees. The manager integrates completed work through a project integration worktree before validation runs.
 
 The project workspace (`.team-leader/projects/<project>/`) is persistent state. Reusing the same project name reuses the same folder and history. The only file intended for direct human editing is `answers.md`. For a clean restart, use a new project name.
+
+## Documentation and FAQ
+
+- [Frequently asked questions](docs/faq.md): supported tools, installation, parallel workers, isolation, and limits.
+- [Provider adapter contract](skills/team-leader/references/provider-adapters.md): how CLI integrations work.
+- [Project workspace reference](skills/team-leader/references/project-workspaces.md): dashboards, reports, and persistent state.
+- [Child prompt patterns](skills/team-leader/references/prompt-patterns.md): task instructions and output contracts.
+- [Example batch manifest](skills/team-leader/references/example_manifest.json): a starting point for batch dispatch.
+- [Controller source](skills/team-leader/scripts/team_leader.py) and [adapter tests](tests/test_team_leader_adapters.py): implementation and verification evidence.
