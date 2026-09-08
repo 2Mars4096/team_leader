@@ -1,0 +1,13 @@
+{
+  "inputs": {"parts": ["arm", "shoe"], "views": ["front", "side"]},
+  "body": {
+    "kind": "for_each", "var": "part", "items": {"ref": "inputs.parts"}, "parallel": true,
+    "body": {
+      "kind": "for_each", "var": "view", "items": {"ref": "inputs.views"},
+      "body": {
+        "kind": "do", "worker": "reviewer", "session": "part-{{part}}", "save_as": "comparison",
+        "prompt": "Synthetic scheduling example only. Do not inspect or modify files. Return verdict pass, evidence 'Synthetic comparison {{part}}/{{view}}; no visual quality claim', and data containing the current part and view."
+      }
+    }
+  }
+}

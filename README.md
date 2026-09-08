@@ -15,6 +15,18 @@ Each worker has its own context, CLI tools, logs, and resume lifecycle. Use Team
 - **Bounded long-running work:** configure project work windows, child timeouts, concurrency limits, and planner-round caps.
 - **Lightweight controller:** Python 3.10+ with no third-party Python runtime dependencies; child CLIs are installed separately.
 
+## Natural-language workflows (Codex)
+
+Turn nested instructions into persistent `for_each`, `if`, `sequence`, `do`, and bounded `repeat_until` steps. Configure the total worker pool and named worker types with separate models, instructions, concurrency limits, and session reuse settings.
+
+```bash
+python3 skills/team-leader/scripts/team_leader.py workflow start \
+  --name review --max-workers 2 \
+  --prompt 'For each module, inspect each public function. If a defect is supported by evidence, describe the minimal fix. Finally summarize the findings.'
+```
+
+The controller expands loops lazily, records results, and resumes related Codex sessions. Use a pool file to enable editor roles or choose per-type models. See [workflow configuration and runnable examples](skills/team-leader/references/workflows.md).
+
 ## Common use cases
 
 | Task | How Team Leader helps |

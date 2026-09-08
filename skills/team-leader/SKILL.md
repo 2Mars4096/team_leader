@@ -67,6 +67,20 @@ Child sessions in this skill are separate provider sessions:
 - They can persist their own thread and be resumed later
 - They can be treated as independent managers rather than one-shot helpers
 
+## Natural-language control flow (Codex only)
+
+When the user describes loops, conditions, ordered actions, or bounded revision cycles, use the persistent workflow execution path. Read [references/workflows.md](references/workflows.md) for the node format, pool configuration, and examples.
+
+- `workflow start --name NAME --prompt TEXT --max-workers N` compiles the instruction with a read-only Codex planner and executes validated control flow.
+- `--file PATH` executes a structured workflow instead; `--dry-run` validates/previews without launching.
+- `--pool-file PATH` defines named Codex worker types with `model`, `role`, `instructions`, `sandbox`, `max_parallel`, `max_session_steps`, and `max_run_seconds`.
+- `--model` supplies the worker model fallback; `--planner-model` selects the compiler model independently.
+- `workflow status|pause|resume --name NAME` inspects and controls saved execution. Pause drains in-flight steps.
+
+Choose read-only types for comparisons and explicitly configured workspace-write types for edits. Preserve the user's loop structure; use discovery steps when collections depend on actual files or references. Supply scoped prompt templates and session keys for related steps. Include explicit quality acceptance conditions. Do not collapse nested iterations into one giant worker prompt. The runtime manages queueing and session reuse; no manager session is needed per loop.
+
+Workflow writers use the requested directory directly and serialize within their workflow. Use a dedicated checkout if unrelated work could overlap. Worker results must identify evidence and assessed versions; automatic artifact freshness validation is not provided.
+
 ## Workflow
 
 ### 1. Initialize the controller directory

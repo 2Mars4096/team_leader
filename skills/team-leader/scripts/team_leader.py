@@ -25,6 +25,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+def workflow_engine():
+    # Load beside this controller, including when imported by test harnesses.
+    import importlib.util
+    name = "team_leader_workflow_engine"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("workflow_engine.py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
 UUID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
@@ -1216,10 +1228,16 @@ def load_index(root: Path) -> dict[str, Any]:
 def save_index(root: Path, data: dict[str, Any]) -> None:
     ensure_root(root)
     data["version"] = INDEX_VERSION
-    write_text(
-        index_path(root),
-        json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-    )
+    payload = json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.replace(temporary, index_path(root))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def dispatch_wait_field(dispatch_state: str | None) -> str | None:
@@ -4120,6 +4138,9 @@ def compute_dispatch_state(index: dict[str, Any], run: dict[str, Any]) -> tuple[
         return status, []
     if status == "dry-run":
         return "dry-run", []
+    workflow = index.get("workflows", {}).get(run.get("workflow"))
+    if workflow and workflow["status"] not in ("running", "compiling"):
+        return "blocked", ["workflow:" + workflow["status"]]
     blocked_on = unresolved_dependencies(index, run)
     blocked_on.extend(
         blocker
@@ -5930,6 +5951,8 @@ def compact_run_artifacts(
     reason: str,
     include_failed: bool = False,
 ) -> tuple[bool, int]:
+    if run.get("workflow"):
+        return False, 0
     status = str(run.get("status") or "")
     if reason in {"settled-project", "active-project-retention"}:
         allowed_statuses = AUTO_COMPACT_RUN_STATUSES
@@ -6972,7 +6995,12 @@ def read_pid_file(path: Path) -> int | None:
 
 
 def index_has_unsettled_runs(index: dict[str, Any]) -> bool:
-    return project_has_unsettled_runs(index["runs"])
+    workflows = index.get("workflows", {})
+    relevant = [r for r in index["runs"] if r.get("status") == "running"
+                or r.get("workflow") not in workflows
+                or workflows[r["workflow"]].get("status") in ("running", "compiling")]
+    return project_has_unsettled_runs(relevant) or any(
+        w.get("status") in ("running", "compiling") for w in workflows.values())
 
 
 def ensure_monitor(root: Path, index: dict[str, Any]) -> None:
@@ -7197,6 +7225,7 @@ def refresh_index_state(root: Path, index: dict[str, Any]) -> None:
         refresh_run(run)
     maybe_integrate_completed_runs(root, index)
     apply_planner_outputs(root, index)
+    workflow_engine().tick(sys.modules[__name__], root, index)
     launch_ready_runs(root, index)
     maybe_auto_drive_projects(root, index)
     save_index_and_sync(root, index)
@@ -7256,8 +7285,11 @@ def build_runner_script(
         lines.extend(
             [
                 "(",
+                f"  sleep {timeout_seconds} &",
+                "  alarm_pid=$!",
+                "  trap 'kill \"$alarm_pid\" 2>/dev/null || true; exit 0' TERM",
+                "  wait \"$alarm_pid\"",
                 "  trap '' TERM",
-                f"  sleep {timeout_seconds}",
                 "  if kill -0 \"$child_pid\" 2>/dev/null; then",
                 "    timed_out_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
                 f"    printf '%s\\n' \"$timed_out_at\" > {timed_out_q}",
@@ -7303,7 +7335,15 @@ def build_runner_script(
         ]
     )
     if tick_cmd:
-        lines.append(f"{tick_cmd} >/dev/null 2>&1 || true")
+        # The callback is the manager, so restore its executable lookup environment.
+        callback_env = ["env", "-u", CHILD_RUN_ENV]
+        for key in sorted(env_exports or {}):
+            callback_env.extend(["-u", key])
+        callback_env.append("PATH=" + os.environ.get("PATH", os.defpath))
+        for key in sorted(env_exports or {}):
+            if key in os.environ:
+                callback_env.append(key + "=" + os.environ[key])
+        lines.append(f"{quote_command(callback_env)} {tick_cmd} >/dev/null 2>&1 || true")
     lines.extend(
         [
             "exit \"$status\"",
@@ -7363,6 +7403,14 @@ def refresh_runner_for_run(run: dict[str, Any]) -> None:
         last_message_path=Path(run["last_message_path"]),
         options=options,
     )
+    if run.get("workflow_resume_id"):
+        command = [adapter.resolved_bin(), "exec", "resume", "--json",
+                   "--output-last-message", str(run["last_message_path"]),
+                   "--skip-git-repo-check", "-c", 'approval_policy="never"',
+                   "-c", "sandbox_mode=" + json.dumps(options.sandbox)]
+        if options.model:
+            command.extend(["--model", options.model])
+        command.extend([run["workflow_resume_id"], "-"])
     provider_bin_raw = normalize_optional_text(run.get("provider_bin")) or adapter.resolved_bin()
     real_provider_bin = resolve_executable(provider_bin_raw, cwd=Path(str(run["cwd"])))
     command[0] = real_provider_bin
@@ -8113,6 +8161,8 @@ def materialize_run(
         run.update(extra_fields)
 
     index["runs"].append(run)
+    if run.get("workflow"):
+        save_index(root, index)
     if not options.dry_run:
         launch_ready_runs(root, index)
     save_index_and_sync(root, index)
@@ -8706,6 +8756,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Manage real child CLI sessions as subsessions through a provider adapter layer.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    workflow_engine().add_parser(sub, sys.modules[__name__])
 
     init_p = sub.add_parser("init", help="Initialize the controller directory")
     init_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
