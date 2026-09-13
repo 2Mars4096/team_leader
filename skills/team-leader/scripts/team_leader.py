@@ -44,29 +44,6 @@ UUID_RE = re.compile(
 INDEX_VERSION = 3
 DEFAULT_PROVIDER = "codex"
 LAUNCHER_PROVIDER_ENV = "TEAM_LEADER_LAUNCHER_PROVIDER"
-LAUNCHER_PROVIDER_ENV_HINTS: dict[str, tuple[str, ...]] = {
-    "codex": (
-        "CODEX_THREAD_ID",
-        "CODEX_SANDBOX",
-        "CODEX_CI",
-        "CODEX_MANAGED_BY_NPM",
-    ),
-    "claude": (
-        "CLAUDECODE",
-        "CLAUDE_CODE",
-        "CLAUDE_PROJECT_DIR",
-        "CLAUDE_SESSION_ID",
-    ),
-    "cursor": (
-        "CURSOR_AGENT",
-        "CURSOR_TRACE_ID",
-        "CURSOR_WORKSPACE_ID",
-    ),
-    "kiro": (
-        "KIRO_SESSION_ID",
-        "KIRO_PROJECT_DIR",
-    ),
-}
 PROVIDER_ALIASES: dict[str, str] = {
     "openai-codex": "codex",
     "codex-cli": "codex",
@@ -1030,11 +1007,6 @@ def launcher_default_provider() -> str:
     configured = normalize_provider_alias(os.environ.get(LAUNCHER_PROVIDER_ENV))
     if configured in PROVIDERS:
         return configured
-    for provider_name, env_names in LAUNCHER_PROVIDER_ENV_HINTS.items():
-        if provider_name not in PROVIDERS:
-            continue
-        if any(normalize_optional_text(os.environ.get(env_name)) for env_name in env_names):
-            return provider_name
     return DEFAULT_PROVIDER
 
 
@@ -8758,6 +8730,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     workflow_engine().add_parser(sub, sys.modules[__name__])
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "team_leader_openrouter_workers", Path(__file__).with_name("openrouter_workers.py"))
+    openrouter_workers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(openrouter_workers)
+    openrouter_workers.add_parser(sub)
 
     init_p = sub.add_parser("init", help="Initialize the controller directory")
     init_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")

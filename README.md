@@ -17,6 +17,23 @@ Each worker has its own context, CLI tools, logs, and resume lifecycle. Use Team
 
 ## Natural-language workflows (Codex)
 
+Codex with native OpenAI models is the default. For explicitly selected,
+cost-aware third-party workers, the skill bundles model-intelligence selection
+and an OpenRouter runner:
+
+```bash
+python3 skills/team-leader/scripts/team_leader.py openrouter plan manifest.json --output assigned.json
+python3 skills/team-leader/scripts/team_leader.py openrouter run assigned.json
+python3 skills/team-leader/scripts/team_leader.py openrouter run assigned.json \
+  --execute --max-estimated-cost-usd 0.10 --output-dir .team-leader/openrouter/wave-1
+```
+
+The first two commands assign models and preview the run; only `--execute`
+makes paid inference calls. See [OpenRouter setup, cache initialization, and manifest format](skills/team-leader/references/openrouter-workers.md).
+API workers return results for Codex to review; they do not have CLI tools or
+participate in the persistent Codex workflow pool. `.env.example` provides the
+key template; save it at `~/.config/team-leader/.env` for automatic use across projects (or pass `--env-file PATH`). No separate model-intelligence skill installation is required.
+
 Turn nested instructions into persistent `for_each`, `if`, `sequence`, `do`, and bounded `repeat_until` steps. Configure the total worker pool and named worker types with separate models, instructions, concurrency limits, and session reuse settings.
 
 ```bash

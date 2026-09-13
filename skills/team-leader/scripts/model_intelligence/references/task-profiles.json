@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "profiles": {
+    "pdf-reading": {
+      "label": "PDF and document reading",
+      "signals": [
+        {"source": "arena", "benchmark": "document", "category": ".*", "weight": 0.50},
+        {"source": "arena", "benchmark": "vision", "category": "ocr|diagram|document|chart|overall", "weight": 0.20},
+        {"source": "artificial_analysis", "benchmark": ".*(aa-lcr|long-context|mmmu|multimodal).*", "category": ".*", "weight": 0.20},
+        {"source": "livebench", "benchmark": "data-analysis|reasoning", "category": ".*", "weight": 0.10}
+      ],
+      "default_requirements": []
+    },
+    "code-generation": {
+      "label": "Code generation and implementation",
+      "signals": [
+        {"source": "artificial_analysis", "benchmark": ".*(coding|livecodebench|scicode|terminal).*", "category": ".*", "weight": 0.30},
+        {"source": "swe_bench", "benchmark": ".*", "category": ".*", "weight": 0.30},
+        {"source": "aider", "benchmark": "aider-polyglot", "category": ".*", "weight": 0.25},
+        {"source": "livebench", "benchmark": "coding", "category": ".*", "weight": 0.15}
+      ],
+      "default_requirements": ["tools"]
+    },
+    "code-review": {
+      "label": "Code review and repository understanding",
+      "signals": [
+        {"source": "artificial_analysis", "benchmark": ".*(coding|terminal|instruction|omniscience).*", "category": ".*", "weight": 0.35},
+        {"source": "swe_bench", "benchmark": ".*", "category": ".*", "weight": 0.25},
+        {"source": "arena", "benchmark": "text|webdev", "category": "coding|hard|expert|instruction|overall", "weight": 0.25},
+        {"source": "livebench", "benchmark": "coding|instruction-following|reasoning", "category": ".*", "weight": 0.15}
+      ],
+      "default_requirements": ["tools"]
+    },
+    "agent-orchestration": {
+      "label": "Long-running agent orchestration and tool use",
+      "signals": [
+        {"source": "artificial_analysis", "benchmark": ".*(agent|terminal|briefcase|automation|apex|tau).*", "category": ".*", "weight": 0.55},
+        {"source": "arena", "benchmark": "agent|text", "category": "agent|hard|expert|instruction|overall", "weight": 0.25},
+        {"source": "livebench", "benchmark": "instruction-following|reasoning", "category": ".*", "weight": 0.20}
+      ],
+      "default_requirements": ["tools"]
+    },
+    "web-research": {
+      "label": "Web research and grounded synthesis",
+      "signals": [
+        {"source": "arena", "benchmark": "search", "category": ".*", "weight": 0.55},
+        {"source": "artificial_analysis", "benchmark": ".*(omniscience|faithfulness|instruction|briefcase).*", "category": ".*", "weight": 0.30},
+        {"source": "livebench", "benchmark": "reasoning|language|instruction-following", "category": ".*", "weight": 0.15}
+      ],
+      "default_requirements": ["tools"]
+    },
+    "reasoning": {
+      "label": "Mathematical and analytical reasoning",
+      "signals": [
+        {"source": "artificial_analysis", "benchmark": ".*(math|reasoning|intelligence).*", "category": ".*", "weight": 0.40},
+        {"source": "livebench", "benchmark": "mathematics|reasoning", "category": ".*", "weight": 0.35},
+        {"source": "arena", "benchmark": "text", "category": "math|expert|hard-prompts|hard-prompts-english", "weight": 0.25}
+      ],
+      "default_requirements": []
+    },
+    "data-analysis": {
+      "label": "Structured data analysis",
+      "signals": [
+        {"source": "livebench", "benchmark": "data-analysis|reasoning", "category": ".*", "weight": 0.45},
+        {"source": "artificial_analysis", "benchmark": ".*(intelligence|coding|math).*", "category": ".*", "weight": 0.30},
+        {"source": "arena", "benchmark": "text", "category": "expert|math|industry-business-and-management-and-financial-operations", "weight": 0.25}
+      ],
+      "default_requirements": []
+    },
+    "writing": {
+      "label": "Writing, editing, and synthesis",
+      "signals": [
+        {"source": "arena", "benchmark": "text", "category": "creative-writing|instruction-following|industry-writing-and-literature-and-language|overall", "weight": 0.65},
+        {"source": "arena", "benchmark": "document", "category": ".*", "weight": 0.20},
+        {"source": "livebench", "benchmark": "language|if", "category": ".*", "weight": 0.15}
+      ],
+      "default_requirements": []
+    },
+    "translation": {
+      "label": "Translation and multilingual language work",
+      "signals": [
+        {"source": "arena", "benchmark": "text", "category": "chinese|french|german|japanese|korean|non-english|polish|russian|spanish", "weight": 0.70},
+        {"source": "livebench", "benchmark": "language|if", "category": ".*", "weight": 0.30}
+      ],
+      "default_requirements": []
+    },
+    "general": {
+      "label": "General reasoning and knowledge work",
+      "signals": [
+        {"source": "artificial_analysis", "benchmark": ".*(intelligence|briefcase|omniscience|instruction).*", "category": ".*", "weight": 0.55},
+        {"source": "arena", "benchmark": "text", "category": "overall|expert|hard|instruction", "weight": 0.25},
+        {"source": "livebench", "benchmark": "reasoning|language|instruction-following|data-analysis", "category": ".*", "weight": 0.20}
+      ],
+      "default_requirements": []
+    }
+  }
+}

@@ -1,11 +1,19 @@
 ---
 name: team-leader
-description: Use when a user wants a team-leader style Codex manager that launches, tracks, reviews, and aggregates real child CLI sessions, especially when each child should keep full external CLI capabilities rather than acting like a lightweight built-in subagent.
+description: Orchestrate worker teams with Codex by default, including persistent child CLI sessions and explicitly requested cost-aware OpenRouter API workers. Use for task decomposition, delegation, tracking, review, and aggregation.
 ---
 
 # Team Leader
 
 ## Overview
+
+OpenRouter credentials load automatically from `~/.config/team-leader/.env` across projects. Use the controller defaults before asking for credentials. `--env-file PATH` explicitly overrides this shared file. Never print the key.
+
+When OpenRouter is explicitly selected, default its workers to `deepseek/deepseek-v4.1-flash`. Honor an explicit task model, manifest `default_model`, or `MODEL_INTELLIGENCE_OPENROUTER_MODEL` override. Use manifest `default_model: "auto"` only when automatic cost/quality selection is requested. Keep the manager on Codex.
+
+Default to Codex with native OpenAI models for the manager and workers. Do not switch providers merely because an API key exists or another CLI environment is detected. Preserve explicit user provider/model choices. The controller respects an explicit `TEAM_LEADER_LAUNCHER_PROVIDER` override; omit custom-provider profiles/configuration for the normal native OpenAI path.
+
+When the user explicitly chooses OpenRouter or third-party models for cost efficiency, read [references/openrouter-workers.md](references/openrouter-workers.md). The bundled model-intelligence planner and API runner require no separately installed skill. Keep Codex as manager, select bounded tasks for external workers, then review their outputs and perform edits/tests in Codex. Native CLI workers and OpenRouter workers may be used in separate waves of the same task. OpenRouter API workers have no filesystem tools or resumable CLI session; they use the explicit `openrouter` command, not `dispatch --provider openrouter` or workflow pool entries.
 
 This skill manages real child sessions through a provider adapter layer. The controller now ships verified adapters for `codex`, `claude`, `cursor`, and `kiro`.
 
