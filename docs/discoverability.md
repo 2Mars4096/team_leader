@@ -6,13 +6,13 @@ Repository: https://github.com/2Mars4096/team_leader
 
 Description:
 
-> Multi-agent orchestration for Codex CLI, Claude Code, Cursor Agent, and Kiro CLI. Run parallel AI coding agents with Git worktree isolation, dependency tracking, and live dashboards. Python controller + Codex skills.
+> Multi-agent orchestration for Codex CLI, Claude Code, Cursor Agent, and Kiro CLI. Run parallel AI coding agents with Git worktree isolation, dependency tracking, and live dashboards. Python controller, Codex/Claude Code skills, and configurable third-party API workers.
 
 Apply the description and relevant topics with an authenticated GitHub CLI account that can administer this repository:
 
 ```bash
 gh repo edit 2Mars4096/team_leader \
-  --description 'Multi-agent orchestration for Codex CLI, Claude Code, Cursor Agent, and Kiro CLI. Run parallel AI coding agents with Git worktree isolation, dependency tracking, and live dashboards. Python controller + Codex skills.' \
+  --description 'Multi-agent orchestration for Codex CLI, Claude Code, Cursor Agent, and Kiro CLI. Run parallel AI coding agents with Git worktree isolation, dependency tracking, and live dashboards. Python controller, Codex/Claude Code skills, and configurable third-party API workers.' \
   --add-topic multi-agent \
   --add-topic agent-orchestration \
   --add-topic ai-agents \
@@ -32,6 +32,21 @@ gh repo view 2Mars4096/team_leader \
 ```
 
 This command adds topics while preserving existing ones. GitHub allows up to 20 topics; inspect existing topics before applying if the combined set could exceed that limit. [GitHub topic documentation](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/classifying-your-repository-with-topics).
+
+## Current discovery surfaces
+
+The repository README and FAQ are the public landing content. They now include
+Claude Code manager installation, the distinction between CLI and API workers,
+and a linked third-party API guide with executable examples. Search engines and
+AI answers can link directly to these sections. There is no deployed website in
+this repository, so there are no site metadata, sitemap, or structured-data
+changes to apply here.
+
+Additional relevance targets are “Claude Code team orchestration skill,”
+“multi-agent controller third-party APIs,” and “OpenAI-compatible API workers.”
+Do not describe unsupported API protocols or the Codex-only workflow engine as
+universally compatible. API protocol tests use local fixtures; they do not prove
+live availability of every vendor or model.
 
 ## Content approach
 
@@ -58,6 +73,8 @@ Record a baseline on the publication date, then repeat after two and four weeks:
 
 Example AI-search evaluation prompts:
 
+- Can Claude Code manage workers through a custom inference API?
+- Which multi-agent controllers support both Anthropic Messages and OpenAI-compatible endpoints?
 - What tools can coordinate Codex CLI and Claude Code workers in one project?
 - How can I run parallel AI coding agents in separate Git worktrees?
 - Is there a Python controller for Codex, Claude Code, Cursor Agent, and Kiro CLI?

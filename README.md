@@ -1,343 +1,161 @@
-# Team Leader — Multi-Agent Orchestration for AI Coding CLIs
+# Team Leader — Coordinate AI Coding Agents
 
-**Team Leader coordinates parallel AI coding agents across Codex CLI, Claude Code, Cursor Agent, and Kiro CLI.** It is a Codex skill and standalone Python controller that plans work, dispatches full child CLI sessions, tracks dependencies, and collects results in persistent project dashboards.
+Team Leader splits work among AI coding agents, tracks their progress, and brings
+their results together. Use it as a skill in Codex or Claude Code, or run its
+Python controller directly.
 
-Each worker has its own context, CLI tools, logs, and resume lifecycle. Use Team Leader for development tasks that benefit from separate implementation, review, research, and validation sessions.
+It is useful when a project has tasks that can run separately: implementing
+several modules, reviewing changes, or investigating possible fixes. Each CLI
+worker has its own session and tools. For a small edit, one agent is usually enough.
 
-[Quick start](#quick-start) · [Installation](#installation) · [Supported providers](#supported-providers) · [FAQ](docs/faq.md) · [CLI reference](#cli-reference)
+[Installation](#installation) · [Quick start](#quick-start) · [Supported providers](#supported-providers) · [API workers](#api-workers) · [FAQ](docs/faq.md)
 
-## Why use Team Leader?
+## What it handles
 
-- **Parallel coding workflows:** dispatch independent tasks and hold dependent work until its prerequisites finish.
-- **Multiple CLI providers:** assign different supported providers to the planner and individual workers in one project.
-- **Git worktree isolation:** give writer sessions separate worktrees and integrate their changes before project validation.
-- **Persistent progress tracking:** inspect dashboards, task reports, logs, heartbeats, and resumable sessions.
-- **Bounded long-running work:** configure project work windows, child timeouts, concurrency limits, and planner-round caps.
-- **Lightweight controller:** Python 3.10+ with no third-party Python runtime dependencies; child CLIs are installed separately.
+- Runs independent tasks in parallel and waits for prerequisites when needed.
+- Gives workers separate Git working directories, then combines their changes for testing.
+- Saves progress, reports, and logs so you can monitor work and resume sessions.
+- Lets you choose different coding tools or API models for different tasks.
 
-## Natural-language workflows (Codex)
+## Supported providers
 
-Codex with native OpenAI models is the default. For explicitly selected,
-cost-aware third-party workers, the skill bundles model-intelligence selection
-and an OpenRouter runner:
+| Coding tool | Provider ID | Executable |
+| --- | --- | --- |
+| Codex CLI | `codex` | `codex` |
+| Claude Code | `claude` | `claude` |
+| Cursor Agent | `cursor` | `cursor-agent` |
+| Kiro CLI | `kiro` | `kiro-cli` |
 
-```bash
-python3 skills/team-leader/scripts/team_leader.py openrouter plan manifest.json --output assigned.json
-python3 skills/team-leader/scripts/team_leader.py openrouter run assigned.json
-python3 skills/team-leader/scripts/team_leader.py openrouter run assigned.json \
-  --execute --max-estimated-cost-usd 0.10 --output-dir .team-leader/openrouter/wave-1
-```
-
-The first two commands assign models and preview the run; only `--execute`
-makes paid inference calls. See [OpenRouter setup, cache initialization, and manifest format](skills/team-leader/references/openrouter-workers.md).
-API workers return results for Codex to review; they do not have CLI tools or
-participate in the persistent Codex workflow pool. `.env.example` provides the
-key template; save it at `~/.config/team-leader/.env` for automatic use across projects (or pass `--env-file PATH`). No separate model-intelligence skill installation is required.
-
-Turn nested instructions into persistent `for_each`, `if`, `sequence`, `do`, and bounded `repeat_until` steps. Configure the total worker pool and named worker types with separate models, instructions, concurrency limits, and session reuse settings.
-
-```bash
-python3 skills/team-leader/scripts/team_leader.py workflow start \
-  --name review --max-workers 2 \
-  --prompt 'For each module, inspect each public function. If a defect is supported by evidence, describe the minimal fix. Finally summarize the findings.'
-```
-
-The controller expands loops lazily, records results, and resumes related Codex sessions. Use a pool file to enable editor roles or choose per-type models. See [workflow configuration and runnable examples](skills/team-leader/references/workflows.md).
-
-## Common use cases
-
-| Task | How Team Leader helps |
-|------|-----------------------|
-| Refactor several modules | Split independent changes among writers, track dependencies, then run project validation. |
-| Coordinate implementation and review | Give implementation and review to separate sessions, with provider choice per task. |
-| Investigate competing solutions | Track explore, exploit, retry, review, and synthesis paths with persistent checkpoints. |
-| Monitor a long-running agent team | Use `team-status`, run logs, and heartbeat warnings to inspect progress and stalled runs. |
-
-For a small edit that one CLI session can finish easily, a single session usually needs less coordination. Team Leader is designed for work with useful task boundaries and a concrete validation command.
-
-## Skills Included
-
-| Skill | Purpose |
-|-------|---------|
-| `team-leader` | Planning, dispatch, monitoring, and aggregation of child CLI sessions |
-| `team-status` | Compact progress view for monitoring without opening markdown files |
-
-## Prerequisites
-
-- **Python 3.10+** (stdlib only, no pip packages required)
-- At least one supported child CLI installed and configured: `codex`, `claude`, `cursor-agent`, or `kiro-cli`
-- **Git** (for worktree-based writer isolation)
-
-## Supported Providers
-
-| AI coding tool | Provider ID | Executable | Session support |
-|----------------|-------------|------------|-----------------|
-| Codex CLI | `codex` | `codex` | Native `exec` / `resume`, session IDs, backend reachability checks |
-| Claude Code | `claude` | `claude` | Headless `-p`, resume with `-r <session-id>` |
-| Cursor Agent | `cursor` | `cursor-agent` | Headless `-p`, resume with `--resume <session-id>` |
-| Kiro CLI | `kiro` | `kiro-cli` | Headless `chat --no-interactive`, directory-scoped `--resume` |
-
-Common aliases are accepted anywhere a provider name is expected: `cc` or `claude-code` for `claude`, `cursor-agent` for `cursor`, `kiro-cli` for `kiro`, and `codex-cli` or `openai-codex` for `codex`.
-
-`windsurf` and `antigravity` are not shipped as provider adapters yet. This controller only first-classes CLIs with a documented standalone headless launch surface and a resume story the manager can automate safely.
-
-Heartbeat tuning is available through `TEAM_LEADER_RUN_HEARTBEAT_INTERVAL_SECONDS` and `TEAM_LEADER_RUN_HEARTBEAT_STALE_SECONDS` when a provider needs a slower cadence or a looser stale threshold. Timeout termination grace is available through `TEAM_LEADER_RUN_TIMEOUT_GRACE_SECONDS`.
+Install and sign in to each tool you want to use. Codex is the controller's
+default; the Claude Code skill selects Claude for planning and workers. You can
+choose another provider explicitly.
 
 ## Installation
 
-### Install into Codex (recommended)
+You need **Python 3.10+** and **Git** for separate worker checkouts. The controller
+uses only Python's standard library. CLI workers need one of the tools above;
+API workers need a compatible endpoint and its credentials.
 
-From inside a Codex session, ask Codex to install the skill:
+### Install into Codex
 
-```
-Install the team-leader skill from 2Mars4096/team_leader
-```
+Ask Codex:
 
-Codex uses its built-in skill installer to run:
-
-```bash
-install-skill-from-github.py --repo 2Mars4096/team_leader --path skills/team-leader
+```text
+Install the team-leader and team-status skills from 2Mars4096/team_leader.
 ```
 
-To also install the monitoring-only companion skill:
+The skills go in `~/.codex/skills/`. Restart Codex after installation.
 
-```bash
-install-skill-from-github.py --repo 2Mars4096/team_leader --path skills/team-leader skills/team-status
-```
-
-Skills are installed into `~/.codex/skills/team-leader/` (and `~/.codex/skills/team-status/`). Restart Codex after installation to pick up new skills.
-
-### Manual installation
-
-Clone the repo and copy the skill directories:
+### Install into Claude Code
 
 ```bash
 git clone https://github.com/2Mars4096/team_leader.git
-mkdir -p ~/.codex/skills
-cp -r team_leader/skills/team-leader ~/.codex/skills/team-leader
-cp -r team_leader/skills/team-status ~/.codex/skills/team-status
+mkdir -p ~/.claude/skills
+cp -R team_leader/skills/team-leader ~/.claude/skills/
+cp -R team_leader/skills/team-status ~/.claude/skills/
 ```
 
-## Quick Start
+For a manual Codex installation, use `~/.codex/skills/` instead.
+Claude Code also supports project-local installation in `.claude/skills/`.
+See [Claude's skill documentation](https://code.claude.com/docs/en/skills).
 
-### Using inside Codex CLI (recommended)
+## Quick start
 
-Once installed, the `$team-leader` skill is available in any Codex session. Tell Codex what you want built and ask it to use the skill:
+Open the project you want to work on and give the manager a goal and a test command.
 
+**In Codex:**
+
+```text
+Use $team-leader to refactor checkout in this repository.
+Name the project checkout-refactor. Validate with pytest -q.
 ```
-Use $team-leader to refactor the checkout flow. The repo is at /path/to/repo.
-Run tests with "pytest -q" to validate.
+
+**In Claude Code:**
+
+```text
+/team-leader Refactor checkout in this repository. Name the project checkout-refactor. Use Claude workers and validate with pytest -q.
 ```
 
-Codex reads the skill instructions and drives the controller automatically: it runs `intake` to capture the brief, `orchestrate` to plan and dispatch workers, and monitors progress through `status` and `team-status`. The manager can stay in Codex while child runs use another provider such as `claude`, `cursor`, or `kiro`.
-
-For monitoring only, use the companion skill:
-
-```
-Use $team-status to check progress on the checkout-refactor project.
-```
+The manager plans tasks, starts workers, reviews their results, and runs validation.
+To check progress, ask Codex to use `$team-status` or Claude Code to use
+`/team-status` for `checkout-refactor`.
 
 ### Using the controller script directly
 
-From your **target project directory** (not the skill directory):
+Run commands from the **project you want to work on**. Set `TL` to the controller
+in your checkout or installed skill. This example uses Claude for planning and workers:
 
 ```bash
-# 1. Record the project goal
-python3 ~/.codex/skills/team-leader/scripts/team_leader.py intake \
-  --project my-project \
+TL=/path/to/team_leader/skills/team-leader/scripts/team_leader.py
+
+python3 "$TL" provider-check --provider claude
+
+python3 "$TL" intake \
+  --project checkout-refactor \
   --goal "Refactor checkout to reduce payment failures" \
-  --max-work-seconds 7200 \
   --repo-path . \
+  --planner-provider claude \
   --child-provider claude \
-  --allow-provider codex \
   --allow-provider claude \
   --validation-command "pytest -q"
 
-# 2. Validate provider binaries before launch
-python3 ~/.codex/skills/team-leader/scripts/team_leader.py provider-check \
-  --provider codex \
-  --provider claude
-
-# 2b. Optional: verify one provider end to end
-python3 ~/.codex/skills/team-leader/scripts/team_leader.py provider-smoke-test \
-  --provider claude \
-  --timeout 30
-
-# 3. Plan and dispatch workers
-python3 ~/.codex/skills/team-leader/scripts/team_leader.py orchestrate \
-  --project my-project
-
-# 4. Check progress
-python3 ~/.codex/skills/team-leader/scripts/team_leader.py status --project my-project
-
-# 5. Watch live updates
-python3 ~/.codex/skills/team-leader/scripts/team_leader.py team-status --project my-project
+python3 "$TL" orchestrate --project checkout-refactor
+python3 "$TL" team-status --project checkout-refactor --once
 ```
 
-> **Important:** Always run the controller from the target project directory. The `.team-leader/` state directory is created relative to the current working directory. Do not `cd` into the skill directory to run the script.
+Progress is saved under `.team-leader/` in that project. Reusing a project name
+continues its history; use a new name for a fresh start.
 
-## Repository Structure
+## API workers
 
-```
-skills/
-├── team-leader/
-│   ├── SKILL.md                          # Skill instructions for Codex
-│   ├── agents/openai.yaml                # Skill UI metadata
-│   ├── scripts/
-│   │   ├── team_leader.py                # Main controller (Python stdlib only)
-│   │   └── codex_subsession_manager.py   # Compatibility wrapper
-│   └── references/
-│       ├── example_manifest.json         # Batch dispatch example
-│       ├── provider-adapters.md          # Guide for adding CLI adapters
-│       ├── project-workspaces.md         # Workspace layout documentation
-│       └── prompt-patterns.md            # Prompt templates for child sessions
-└── team-status/
-    ├── SKILL.md                          # Monitoring-only skill instructions
-    └── agents/openai.yaml
-```
+Use `api run` for models served through **OpenAI-compatible Chat Completions** or
+**Anthropic Messages**. A plan specifies each worker's endpoint, model, and
+credential variable, and can mix providers. This includes compatible third-party
+gateways and local servers.
 
-**Runtime state** (created per-project, not shipped):
+API workers receive supplied text and return proposals. The manager handles file
+edits and tests. They do not have CLI tools or resumable sessions.
 
-```
-.team-leader/                  # Controller state root (in the target project)
-├── runs/                      # Per-run directories with prompts, logs, PIDs
-└── projects/<project>/        # Per-project markdown workspace
-    ├── README.md              # Landing page
-    ├── brief.md               # Goal, repo paths, specs, constraints
-    ├── launch-plan.md         # Planner-produced child session plan
-    ├── dashboard.md           # Live run progress and child notes
-    ├── tasks.md               # Assignment state and summaries
-    ├── validation.md          # Validation results and delivery status
-    ├── metrics.md             # Efficiency scorecard
-    ├── path-checkpoints.jsonl # Machine-readable explore/exploit checkpoint stream
-    ├── path-checkpoints.md    # Human-readable path checkpoint log
-    ├── path-tree.html         # Static browser view of the path tree
-    ├── manager-summary.md     # Aggregated manager report
-    ├── questions.md           # Questions needing human answers
-    ├── answers.md             # Human-edited answers (only file for manual editing)
-    ├── answers-template.md    # Copy-ready answer lines
-    ├── conflicts.md           # Overlap risk between writers
-    └── reports/<run-id>.md    # One report per child session
-```
+Follow the [API worker guide](skills/team-leader/references/api-workers.md) to
+create a plan, configure credentials, and preview or execute a batch. Execution
+requires `--execute` and a cost-estimate limit; the limit checks estimates rather
+than capping the provider's bill.
 
-## CLI Reference
+For OpenRouter model selection based on saved cost and quality data, or PDF
+inputs, use the separate [OpenRouter guide](skills/team-leader/references/openrouter-workers.md).
 
-All commands use `python3 <path-to>/team_leader.py <command> [options]`.
+## Operating limits
 
-| Command | Description |
-|---------|-------------|
-| `init` | Create the `.team-leader/` state directory |
-| `intake` | Record or update a project brief |
-| `orchestrate` | Launch planner and auto-dispatch workers from the brief |
-| `dispatch` | Launch a single child session |
-| `batch` | Launch multiple children from a JSON manifest |
-| `status` | Show tracked runs and project summary |
-| `tick` | Refresh state once and dispatch any ready follow-up work |
-| `team-status` | Compact milestone-style progress updates |
-| `team-metrics` | Efficiency scorecard (age, speed, human-touch, overlap) |
-| `watch` | Live terminal view with auto-refresh |
-| `show` | Show details and last message for one run |
-| `tail` | Tail stdout/stderr for a run |
-| `resume-cmd` | Print a resume command for a child session |
-| `cancel` | Stop a child session (`--force` for SIGKILL) |
-| `reconcile` | Refresh status and backfill session IDs |
-| `attach-session` | Manually attach a session ID to a run |
-| `providers` | List available CLI adapters |
-| `provider-check` | Validate provider executable paths and basic CLI readiness |
-| `provider-smoke-test` | Launch one real child run and wait for an end-to-end result |
+CLI runs default to at most **8 concurrent workers** and **2 new starts per
+15 seconds**. Use `--max-work-seconds` to set a project work window and
+`--max-run-seconds` to limit an individual worker. Workers consume usage from
+their selected provider.
 
-`provider-check` exits non-zero when any requested provider is blocked, so it can gate shell scripts and CI preflight cleanly.
+Separate checkouts reduce conflicts, but combining changes can still require
+review. Check the manager's reports and validation results before accepting the work.
+If the manager asks questions, put answers in the project's `answers.md` file.
+The [workspace guide](skills/team-leader/references/project-workspaces.md)
+explains the saved files and how much work the manager can do automatically.
 
-### Key options
+## CLI reference
 
-- `--project <name>` -- link runs to a project workspace
-- `--provider <name>` -- provider for one direct run or for the planner child
-- `--provider-bin <path>` -- executable override for that provider
-- `--planner-provider <name>` -- persist the planner provider in `brief.md`
-- `--child-provider <name>` -- default provider for planner-produced child runs; when omitted it follows the planner or launcher provider
-- `--child-provider-bin <path>` -- executable override for the default child provider
-- `--allow-provider <name>` -- constrain planner output to a provider allowlist
-- `--max-work-seconds <n>` -- keep goal-oriented orchestration replenishing work until this project work window expires
-- `--max-run-seconds <n>` -- hard cap one child run's wall-clock execution time
-- `--path-id <id>` -- path-tree node id for a project-linked direct child run
-- `--parent-path-id <id>` -- parent path-tree node id
-- `--path-mode <mode>` -- `explore`, `exploit`, `retry`, `promote`, `park`, `drop`, `blocked`, `review`, or `synthesize`
-- `--task-type <type>` -- task-specific convergence prompt type: `architecture`, `bugfix`, `docs`, `implementation`, `refactor`, `research`, `review`, or `validation`
-- `--hypothesis <text>` -- concrete branch hypothesis for the run
-- `--kill-criteria <text>` -- evidence that should stop, park, or pivot the branch
-- `--sandbox read-only|workspace-write` -- child sandbox mode
-- `--full-auto` -- run child in full-auto mode
-- `--root <path>` -- explicit `.team-leader/` path (default: `./.team-leader`)
-- `--cd <path>` -- working directory for child sessions
-- `--depends-on <task-id>` -- hold a task until prerequisites complete
-- `--owned-path <path>` -- declare file ownership for conflict detection
-- `--dry-run` -- preview without launching
+Run `python3 "$TL" --help` for commands, or add `--help` after a command for its
+options. Common commands are:
 
-## Workflow
+| Command | Purpose |
+| --- | --- |
+| `intake` / `orchestrate` | Record a goal, then plan and start workers |
+| `dispatch` / `batch` | Start one worker or a batch of assigned tasks |
+| `status` / `team-status` | Check progress |
+| `show` / `tail` | Inspect a worker's result or logs |
+| `resume-cmd` | Print the command to resume a session |
+| `cancel` | Stop a worker |
+| `provider-check` | Check that a coding tool is ready |
 
-### Manager-first flow (recommended)
+## Further reading
 
-When the user provides only a goal and context:
-
-1. **`intake`** -- capture the project brief (goal, repo paths, specs, constraints)
-2. **`orchestrate`** -- launch a planner child that produces a task plan, then auto-dispatch workers
-3. **Monitor** -- use `status --project` or `team-status --project` to track progress
-4. **Answer questions** -- check `questions.md`, edit `answers.md` with responses
-5. **Re-orchestrate** -- run `orchestrate` again if the planner needs another round after new answers
-
-### Autonomy modes
-
-| Mode | Behavior |
-|------|----------|
-| `manual` | You explicitly run `orchestrate` each time |
-| `guided` | Manager runs validation and tracks delivery, but won't auto-start new planner waves |
-| `continuous` | Manager auto-starts planner waves and pushes until validation passes or limits are reached |
-
-### Clarification modes
-
-| Mode | Behavior |
-|------|----------|
-| `auto` | Planner may ask targeted questions before launching workers |
-| `off` | Skip clarification and plan immediately |
-
-### Recovery limits
-
-- `--max-auto-fix-rounds` -- caps how many validation-failure recovery waves the manager launches automatically in `continuous` mode
-- `--max-planner-rounds` -- caps how many planner iterations are allowed
-
-## Long-Running Agent Orchestration
-
-Long-running child runs emit a per-run heartbeat file. The manager records heartbeat metadata, surfaces heartbeat state in `status` and `watch`, and flags stale or missing heartbeats through the existing warning paths instead of leaving a hung run indistinguishable from a healthy long-running run.
-
-Goal-oriented orchestration can run for a requested work window. Set `--max-work-seconds` on a project brief when the manager should keep replenishing useful child work until that window expires, while still obeying pool and planner-round caps. A timed project implies continuous driving unless `--autonomy-mode` is set explicitly. Use `--max-run-seconds` when one child needs a stricter wall-clock limit than the overall project budget. Child exit triggers a one-shot manager refresh, while the background monitor remains a fallback.
-
-For long-running search-style work, project runs also maintain path checkpoints and a static path tree. Planner-produced and project-linked children can be assigned `explore`, `exploit`, `retry`, `review`, or `synthesize` path modes plus task-specific prompt contracts. Their final `Path Checkpoint` sections are collected into `path-checkpoints.jsonl`, rendered to `path-checkpoints.md`, and visualized in `path-tree.html`, while `status` and `team-status` surface advisory convergence warnings.
-
-## Safety Defaults
-
-- Max **8** concurrent child sessions
-- Max **2** new launches per **15** seconds
-- Oversized child `last_message.md` files are truncated with head/tail preservation
-- `team-status` caps output in captured environments by default
-- Non-TTY `watch` falls back to a single snapshot unless explicitly allowed to stream
-
-## Architecture Notes
-
-The controller keeps provider-specific behavior at the adapter boundary: option validation, command construction, session-ID detection, and resume command generation. The run registry and batch manifest format remain stable when adding a new adapter for another CLI (e.g., `claude`, `cursor`).
-
-Provider choice can vary per child run. Planner output may now set `provider` and `provider_bin` for each task, so a Codex manager can launch Claude reviewers, Cursor writers, and Kiro researchers in the same project as long as their CLIs are installed and pass `provider-check`.
-
-All shipped providers now sit on the same adapter contract. Codex still keeps its provider-specific hooks for backend reachability and thread detection so `codex -> codex` preserves the prior behavior while mixed-provider projects stay possible.
-
-Writer children in Git repos are isolated into per-run worktrees. The manager integrates completed work through a project integration worktree before validation runs.
-
-The project workspace (`.team-leader/projects/<project>/`) is persistent state. Reusing the same project name reuses the same folder and history. The only file intended for direct human editing is `answers.md`. For a clean restart, use a new project name.
-
-## Documentation and FAQ
-
-- [Frequently asked questions](docs/faq.md): supported tools, installation, parallel workers, isolation, and limits.
-- [Provider adapter contract](skills/team-leader/references/provider-adapters.md): how CLI integrations work.
-- [Project workspace reference](skills/team-leader/references/project-workspaces.md): dashboards, reports, and persistent state.
-- [Child prompt patterns](skills/team-leader/references/prompt-patterns.md): task instructions and output contracts.
-- [Example batch manifest](skills/team-leader/references/example_manifest.json): a starting point for batch dispatch.
-- [Controller source](skills/team-leader/scripts/team_leader.py) and [adapter tests](tests/test_team_leader_adapters.py): implementation and verification evidence.
+- [FAQ](docs/faq.md): compatibility, installation, and common questions.
+- [Codex workflows](skills/team-leader/references/workflows.md): turn instructions with loops and conditions into repeatable work. This feature requires Codex, including when Claude is the manager.
+- [Task prompt examples](skills/team-leader/references/prompt-patterns.md) and [batch manifest](skills/team-leader/references/example_manifest.json): assign work directly.
+- [Provider adapters](skills/team-leader/references/provider-adapters.md): how to add another coding tool.
+- [Controller source](skills/team-leader/scripts/team_leader.py) and [tests](tests/): implementation and checks.
