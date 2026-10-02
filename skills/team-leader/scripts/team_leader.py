@@ -7031,6 +7031,7 @@ def start_run_process(run: dict[str, Any]) -> None:
         stderr=stderr_fh,
         cwd=str(run["cwd"]),
         start_new_session=True,
+        env=child_process_environment(run),
     )
     stdout_fh.close()
     stderr_fh.close()
@@ -7041,6 +7042,14 @@ def start_run_process(run: dict[str, Any]) -> None:
     run["launched_at"] = launch_time
     run["started_epoch"] = epoch_now()
     write_text(run_dir / "state.txt", "running\n")
+
+
+def child_process_environment(run: dict[str, Any]) -> dict[str, str]:
+    env = os.environ.copy()
+    if provider_for_run(run).name == "claude":
+        # These are independent controller-managed processes, not nested REPLs.
+        env.pop("CLAUDECODE", None)
+    return env
 
 
 def launch_ready_runs(root: Path, index: dict[str, Any]) -> None:

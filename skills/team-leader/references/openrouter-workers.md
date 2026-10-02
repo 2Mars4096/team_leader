@@ -1,7 +1,7 @@
 # Optional OpenRouter workers
 
 Use only when the user asks for third-party workers. Native Codex/OpenAI remains
-the default. The API runner returns text/code proposals; Codex owns planning,
+the default. The API runner returns text/code proposals; the active Codex or Claude Code manager owns planning,
 tool use, edits, tests, follow-up waves, and the final answer.
 
 The model-intelligence implementation is bundled under
@@ -60,7 +60,7 @@ from the shared/explicit `.env` file or environment, then this bundled default. 
 `default_model` to `auto` to select priced models above a task-specific quality
 floor instead. Explicit task models still take precedence. `economy`,
 `balanced`, and `quality` control selection. Prompt paths are relative to the
-manifest. Dependent tasks belong in later waves after Codex reviews results.
+manifest. Dependent tasks belong in later waves after the manager reviews results.
 
 ```bash
 python3 scripts/team_leader.py openrouter plan manifest.json --output assigned.json
@@ -98,7 +98,7 @@ billing cap: input estimates, changed prices, reasoning and PDF parsing charges
 can affect actual costs. Use a provider-side credit limit for a billing cap.
 
 Read `run.json` and per-task result JSON, check successful outputs against local
-evidence/tests, and integrate in Codex. Retain failure information and decide
+evidence/tests, and integrate in the active manager session. Retain failure information and decide
 explicitly whether another paid wave is useful. Store each wave in a distinct
 output directory. Results are separate from CLI session dashboards and cannot
 be resumed with `resume-cmd`.

@@ -1,6 +1,6 @@
 ---
 name: team-status
-description: Use when a user wants a compact live progress view for a team-leader managed project, especially to see active child Codex sessions, stage changes, and latest child notes inside Codex without opening project markdown files.
+description: Use when a user wants a compact live progress view for a team-leader managed project, especially to see active child CLI sessions, stage changes, and latest child notes inside Codex or Claude Code without opening project markdown files.
 ---
 
 # Team Status
@@ -54,8 +54,8 @@ python3 ../team-leader/scripts/team_leader.py status --project <project>
 
 ## Output Style
 
-- Prefer `team-status` over `watch` inside Codex.
-- Prefer milestone updates by default inside Codex.
+- Prefer `team-status` over `watch` inside Codex or Claude Code.
+- Prefer milestone updates by default inside Codex or Claude Code.
 - Summarize the stage change first.
 - Then list active children and their latest notes.
 - Call out path-search warnings, blocked or queued runs, open questions, conflicts, and warnings.

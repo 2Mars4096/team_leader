@@ -1,6 +1,6 @@
 ---
 name: team-leader
-description: Orchestrate worker teams with Codex by default, including persistent child CLI sessions and explicitly requested third-party API workers. Use for task decomposition, delegation, tracking, review, and aggregation.
+description: Orchestrate worker teams from Codex or Claude Code, including persistent child CLI sessions and explicitly selected third-party API workers. Use for task decomposition, delegation, tracking, review, and aggregation.
 ---
 
 # Team Leader
@@ -9,19 +9,25 @@ description: Orchestrate worker teams with Codex by default, including persisten
 
 OpenRouter credentials load automatically from `~/.config/team-leader/.env` (using the OS account home, not a launcher-overridden `HOME`) across projects. Use the controller defaults before asking for credentials. `--env-file PATH` explicitly overrides this shared file. Never print the key.
 
-When OpenRouter is explicitly selected, default its workers to `deepseek/deepseek-v4.1-flash`. Honor an explicit task model, manifest `default_model`, or `MODEL_INTELLIGENCE_OPENROUTER_MODEL` override. Use manifest `default_model: "auto"` only when automatic cost/quality selection is requested. Keep the manager on Codex.
+When OpenRouter is explicitly selected, default its workers to `deepseek/deepseek-v4.1-flash`. Honor an explicit task model, manifest `default_model`, or `MODEL_INTELLIGENCE_OPENROUTER_MODEL` override. Use manifest `default_model: "auto"` only when automatic cost/quality selection is requested. Keep the active CLI as manager.
 
-Default to Codex with native OpenAI models for the manager and workers. Do not switch providers merely because an API key exists or another CLI environment is detected. Preserve explicit user provider/model choices. The controller respects an explicit `TEAM_LEADER_LAUNCHER_PROVIDER` override; omit custom-provider profiles/configuration for the normal native OpenAI path.
+In Codex, default to Codex with native OpenAI models for the manager and workers. In Claude Code, keep Claude as manager and prefix controller commands with `TEAM_LEADER_LAUNCHER_PROVIDER=claude` unless the user selects another provider. Do not switch providers merely because an API key exists or another CLI environment is detected. Preserve explicit user provider/model choices. The controller respects an explicit `TEAM_LEADER_LAUNCHER_PROVIDER` override; omit custom-provider profiles/configuration for the normal native OpenAI path.
 
-When the user explicitly chooses OpenRouter model selection, read [references/openrouter-workers.md](references/openrouter-workers.md). The bundled model-intelligence planner and API runner require no separately installed skill. Keep Codex as manager, select bounded tasks for external workers, then review their outputs and perform edits/tests in Codex. Native CLI workers and OpenRouter workers may be used in separate waves of the same task. OpenRouter API workers have no filesystem tools or resumable CLI session; they use the explicit `openrouter` command, not `dispatch --provider openrouter` or workflow pool entries.
+When the user explicitly chooses OpenRouter model selection, read [references/openrouter-workers.md](references/openrouter-workers.md). The bundled model-intelligence planner and API runner require no separately installed skill. Keep the active CLI as manager, select bounded tasks for external workers, then review their outputs and perform edits/tests locally. Native CLI workers and OpenRouter workers may be used in separate waves of the same task. OpenRouter API workers have no filesystem tools or resumable CLI session; they use the explicit `openrouter` command, not `dispatch --provider openrouter` or workflow pool entries.
 
 For other third-party endpoints or explicit model assignments, read [references/api-workers.md](references/api-workers.md). Use `api run` with named providers, endpoint URLs, credential environment-variable names, and per-task models. This path supports OpenAI-compatible Chat Completions and Anthropic Messages without a DeepSeek default or model cache.
+
+## Claude Code manager
+
+Install this same skill directory under `~/.claude/skills/team-leader` (or `.claude/skills/team-leader` in a project), then invoke `/team-leader`. Install the companion `team-status` beside it for `/team-status`. Resolve scripts relative to the loaded skill directory. Use `TEAM_LEADER_LAUNCHER_PROVIDER=claude` on controller commands; explicit provider flags still take precedence. Use `intake` and `orchestrate` for Claude planning and workers. The `workflow` command currently uses Codex sessions and requires Codex even when the manager is Claude; do not choose it for a Claude-only installation.
+
+## Shared controller behavior
 
 This skill manages real child sessions through a provider adapter layer. The controller now ships verified adapters for `codex`, `claude`, `cursor`, and `kiro`.
 
 Treat a child session as a full child CLI worker with its own session, context window, tool use, and follow-up lifecycle. Older docs may still call this a "subsession", especially for Codex-backed runs, but the broader term in this skill is "child session". This is more flexible than a lightweight in-process subagent because a child session can keep working independently, be resumed later, and itself act as a manager when useful.
 
-Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragments. This path is relative to the skill itself, not the project root. In this repo that file is at `skills/team-leader/scripts/team_leader.py`, and when installed it lives under the Codex skills directory at `.../skills/team-leader/scripts/team_leader.py`. Keep your working directory at the target project unless you pass `--root` and `--cd` explicitly; do not `cd` into the skill directory just to run the controller, because the default `.team-leader/` root is derived from the current working directory. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
+Use the control script at `scripts/team_leader.py` instead of ad hoc shell fragments. This path is relative to the skill itself, not the project root. In this repo that file is at `skills/team-leader/scripts/team_leader.py`, and when installed it lives under the host CLI skills directory at `.../skills/team-leader/scripts/team_leader.py`. Keep your working directory at the target project unless you pass `--root` and `--cd` explicitly; do not `cd` into the skill directory just to run the controller, because the default `.team-leader/` root is derived from the current working directory. A compatibility wrapper remains at `scripts/codex_subsession_manager.py`, but the primary interface is now `team_leader.py`. The controller stores a local `.team-leader/` registry with prompts, commands, logs, last messages, PIDs, and detected session IDs. Older `.agent-subsessions/` and `.codex-subsessions/` directories are still recognized automatically.
 
 Goal-oriented orchestration can run for a requested work window. Set `--max-work-seconds` on the project brief when the user wants the manager to keep replenishing useful child work until that window expires, while still obeying pool and planner-round caps. A timed project implies continuous driving unless `--autonomy-mode` is set explicitly. Use `--max-run-seconds` when one direct child should have a tighter hard wall-clock limit. Child exit triggers a one-shot manager refresh, while the background monitor remains a fallback.
 
@@ -400,7 +406,7 @@ Populate `--owned-path` when a child is allowed to write. The project workspace 
 
 ## Guardrails
 
-- Each child session consumes normal Codex usage. Use only as many concurrent children as the task justifies.
+- Each child session consumes usage from its selected provider. Use only as many concurrent children as the task justifies.
 - The manager now isolates Git-backed writers into separate worktrees and integrates them through the project integration worktree, but it still does not auto-resolve arbitrary merge conflicts.
 - `conflicts.md` reports unresolved overlap or integration issues that still need manager or human judgment.
 - This skill manages child provider sessions, not arbitrary background jobs. Keep the current workflow centered on real CLI session primitives rather than custom task shims.

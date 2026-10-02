@@ -18,6 +18,14 @@ SPEC.loader.exec_module(team_leader)
 
 
 class TeamLeaderAdapterTests(unittest.TestCase):
+    def test_claude_children_do_not_inherit_nested_session_marker(self):
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1", "ANTHROPIC_API_KEY": "test-key"}):
+            env = team_leader.child_process_environment({"provider": "claude"})
+            self.assertNotIn("CLAUDECODE", env)
+            self.assertEqual(env["ANTHROPIC_API_KEY"], "test-key")
+            self.assertEqual(os.environ["CLAUDECODE"], "1")
+            self.assertEqual(team_leader.child_process_environment({"provider": "codex"})["CLAUDECODE"], "1")
+
     def make_options(self, **overrides):
         payload = {
             "provider": "codex",
