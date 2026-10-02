@@ -8738,6 +8738,12 @@ def build_parser() -> argparse.ArgumentParser:
     spec.loader.exec_module(openrouter_workers)
     openrouter_workers.add_parser(sub)
 
+    api_spec = importlib.util.spec_from_file_location(
+        "team_leader_api_workers", Path(__file__).with_name("api_workers.py"))
+    api_workers = importlib.util.module_from_spec(api_spec)
+    api_spec.loader.exec_module(api_workers)
+    api_workers.add_parser(sub, openrouter_workers)
+
     init_p = sub.add_parser("init", help="Initialize the controller directory")
     init_p.add_argument("--root", help=f"Controller root directory (default: ./{DEFAULT_ROOT_NAME}; legacy roots still recognized: {LEGACY_ROOTS_LABEL})")
     init_p.set_defaults(func=cmd_init)

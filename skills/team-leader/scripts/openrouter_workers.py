@@ -25,7 +25,7 @@ ENV_KEYS = {"OPENROUTER_API_KEY", "ARTIFICIAL_ANALYSIS_API_KEY",
             "MODEL_INTELLIGENCE_OPENROUTER_MODEL", "OPENROUTER_PDF_ENGINE"}
 
 
-def load_env(path: Path, env: dict[str, str]) -> None:
+def load_env(path: Path, env: dict[str, str], allowed_keys: set[str] | None = None) -> None:
     """Read literal assignments without shell execution or overriding exported keys."""
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
@@ -35,7 +35,7 @@ def load_env(path: Path, env: dict[str, str]) -> None:
             line = line[7:].lstrip()
         key, sep, value = line.partition("=")
         key = key.strip()
-        if not sep or key not in ENV_KEYS:
+        if not sep or key not in (ENV_KEYS if allowed_keys is None else allowed_keys):
             continue
         try:
             parts = shlex.split(value, comments=True, posix=True)

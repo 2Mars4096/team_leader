@@ -108,3 +108,5 @@ documents additional manifest fields; the
 [delegation reference](../scripts/model_intelligence/references/delegation.md)
 covers PDF inputs and the external worker boundary. API contract:
 [OpenRouter API reference](https://openrouter.ai/docs/api_reference/overview).
+
+For direct providers and custom compatible gateways, see [Third-party API workers](api-workers.md).

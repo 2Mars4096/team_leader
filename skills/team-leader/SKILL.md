@@ -1,6 +1,6 @@
 ---
 name: team-leader
-description: Orchestrate worker teams with Codex by default, including persistent child CLI sessions and explicitly requested cost-aware OpenRouter API workers. Use for task decomposition, delegation, tracking, review, and aggregation.
+description: Orchestrate worker teams with Codex by default, including persistent child CLI sessions and explicitly requested third-party API workers. Use for task decomposition, delegation, tracking, review, and aggregation.
 ---
 
 # Team Leader
@@ -13,7 +13,9 @@ When OpenRouter is explicitly selected, default its workers to `deepseek/deepsee
 
 Default to Codex with native OpenAI models for the manager and workers. Do not switch providers merely because an API key exists or another CLI environment is detected. Preserve explicit user provider/model choices. The controller respects an explicit `TEAM_LEADER_LAUNCHER_PROVIDER` override; omit custom-provider profiles/configuration for the normal native OpenAI path.
 
-When the user explicitly chooses OpenRouter or third-party models for cost efficiency, read [references/openrouter-workers.md](references/openrouter-workers.md). The bundled model-intelligence planner and API runner require no separately installed skill. Keep Codex as manager, select bounded tasks for external workers, then review their outputs and perform edits/tests in Codex. Native CLI workers and OpenRouter workers may be used in separate waves of the same task. OpenRouter API workers have no filesystem tools or resumable CLI session; they use the explicit `openrouter` command, not `dispatch --provider openrouter` or workflow pool entries.
+When the user explicitly chooses OpenRouter model selection, read [references/openrouter-workers.md](references/openrouter-workers.md). The bundled model-intelligence planner and API runner require no separately installed skill. Keep Codex as manager, select bounded tasks for external workers, then review their outputs and perform edits/tests in Codex. Native CLI workers and OpenRouter workers may be used in separate waves of the same task. OpenRouter API workers have no filesystem tools or resumable CLI session; they use the explicit `openrouter` command, not `dispatch --provider openrouter` or workflow pool entries.
+
+For other third-party endpoints or explicit model assignments, read [references/api-workers.md](references/api-workers.md). Use `api run` with named providers, endpoint URLs, credential environment-variable names, and per-task models. This path supports OpenAI-compatible Chat Completions and Anthropic Messages without a DeepSeek default or model cache.
 
 This skill manages real child sessions through a provider adapter layer. The controller now ships verified adapters for `codex`, `claude`, `cursor`, and `kiro`.
 
