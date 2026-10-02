@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1040" viewBox="0 0 1280 1040" role="img" aria-labelledby="title desc">
+  <title id="title">One request. Five workflow building blocks.</title>
+  <desc id="desc">Illustrative workflow: discover modules, loop through modules and their functions, review each function, branch on evidence of a bug, repeat fix-test-review at most twice, then run the full test suite and report acceptance. Missing evidence or exhausted retries blocks the workflow.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#101e2a"/><stop offset="1" stop-color="#09131c"/></linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#bddedb" stroke-opacity=".045"/></pattern>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0L6 3L0 6" fill="none" stroke="#91acae" stroke-width="1.4"/></marker>
+    <style>
+      text{font-family:'Avenir Next','DejaVu Sans',sans-serif;fill:#edf5f3} .muted{fill:#a7bcbc} .mint{fill:#82e2c0} .gold{fill:#ffcc7b} .coral{fill:#ffab9d} .mono{font-family:'SFMono-Regular','DejaVu Sans Mono',monospace} .line{fill:none;stroke:#91acae;stroke-width:2;marker-end:url(#arrow)} .small{font-size:16px} .body{font-size:20px} .label{font-size:17px;letter-spacing:1px} .bold{font-weight:650}
+    </style>
+  </defs>
+  <rect width="1280" height="1040" rx="24" fill="url(#bg)"/>
+  <rect width="1280" height="1040" rx="24" fill="url(#grid)"/>
+  <rect x="48" y="38" width="32" height="5" rx="2" fill="#82e2c0"/>
+  <text x="94" y="46" class="label mint">TEAM LEADER / NATURAL-LANGUAGE WORKFLOWS</text>
+  <text x="48" y="105" font-size="44" class="bold">One request. A whole review process.</text>
+  <rect x="48" y="134" width="1184" height="76" rx="14" fill="#1b2e39" stroke="#35505a"/>
+  <text x="72" y="165" class="body"><tspan class="mint">“For every module and function,</tspan> review the code. <tspan class="gold">If there’s a confirmed bug,</tspan></text>
+  <text x="72" y="194" class="body"><tspan class="coral">fix and recheck it, up to twice.</tspan> Finally, run the full test suite and report what passed.”</text>
+
+  <text x="48" y="250" class="label muted">THE FLOW</text>
+  <rect x="80" y="270" width="706" height="58" rx="12" fill="#203841" stroke="#4d7778"/>
+  <text x="104" y="306" class="body bold">Discover modules and the project’s test commands</text>
+  <path d="M433 329V355" class="line"/>
+
+  <rect x="80" y="365" width="706" height="398" rx="18" fill="#142c31" stroke="#589d8b" stroke-width="2"/>
+  <text x="104" y="399" class="label mint bold">FOR EACH MODULE</text>
+  <text x="762" y="399" class="small muted" text-anchor="end">two reviews can run at once</text>
+  <rect x="104" y="421" width="658" height="308" rx="14" fill="#112229" stroke="#355b60"/>
+  <text x="128" y="452" class="label mint">FOR EACH PUBLIC FUNCTION</text>
+
+  <rect x="128" y="478" width="232" height="58" rx="10" fill="#203841"/>
+  <text x="244" y="513" text-anchor="middle" class="body bold">Review the function</text>
+  <path d="M362 507H407" class="line"/>
+  <rect x="418" y="478" width="318" height="58" rx="10" fill="#3a3225" stroke="#a58c58"/>
+  <text x="577" y="513" text-anchor="middle" class="body gold bold">Evidence of a bug?</text>
+
+  <path d="M485 538V560H244V597" class="line"/>
+  <text x="315" y="553" class="small gold">NO / ELSE</text>
+  <rect x="128" y="608" width="232" height="58" rx="10" fill="#1c3934" stroke="#406b5d"/>
+  <text x="244" y="644" text-anchor="middle" class="body mint">Record pass</text>
+
+  <path d="M648 538V573" class="line"/>
+  <text x="665" y="562" class="small gold">YES / IF</text>
+  <rect x="418" y="584" width="318" height="99" rx="12" fill="#382e31" stroke="#ad7b77"/>
+  <text x="577" y="615" text-anchor="middle" class="body coral bold">Fix → test → review</text>
+  <text x="577" y="645" text-anchor="middle" class="small">Repeat until the check passes</text>
+  <text x="577" y="669" text-anchor="middle" class="small coral">MAXIMUM 2 ROUNDS</text>
+  <text x="433" y="710" text-anchor="middle" class="small muted">Continue to the next function, then the next module</text>
+  <path d="M433 765V799" class="line"/>
+
+  <rect x="80" y="810" width="706" height="58" rx="12" fill="#203841" stroke="#4d7778"/>
+  <text x="104" y="846" class="body bold">Run the full test suite → check acceptance</text>
+  <path d="M265 870V901" class="line"/>
+  <path d="M605 870V901" class="line"/>
+  <rect x="80" y="912" width="338" height="55" rx="10" fill="#1c3934"/>
+  <text x="249" y="946" text-anchor="middle" class="body mint">PASS → final summary</text>
+  <rect x="440" y="912" width="346" height="55" rx="10" fill="#382e31"/>
+  <text x="613" y="946" text-anchor="middle" class="body coral">FAIL → report blockers</text>
+
+  <path d="M832 244V966" stroke="#35505a"/>
+  <text x="870" y="250" class="label muted">5 BUILDING BLOCKS</text>
+  <text x="870" y="296" class="mono mint" font-size="21">01  do</text>
+  <text x="870" y="328" class="body">One action with a result.</text>
+  <text x="870" y="352" class="small muted">Discover, review, fix, or test.</text>
+  <path d="M870 378H1230" stroke="#29434c"/>
+  <text x="870" y="415" class="mono mint" font-size="21">02  sequence</text>
+  <text x="870" y="447" class="body">Steps in a chosen order.</text>
+  <text x="870" y="471" class="small muted">Discover → review → final tests.</text>
+  <path d="M870 497H1230" stroke="#29434c"/>
+  <text x="870" y="534" class="mono mint" font-size="21">03  for_each</text>
+  <text x="870" y="566" class="body">A loop inside another loop.</text>
+  <text x="870" y="590" class="small muted">Modules → their public functions.</text>
+  <path d="M870 616H1230" stroke="#29434c"/>
+  <text x="870" y="653" class="mono gold" font-size="21">04  if / else</text>
+  <text x="870" y="685" class="body">Choose a path from evidence.</text>
+  <text x="870" y="709" class="small muted">Repair a bug or record a pass.</text>
+  <path d="M870 735H1230" stroke="#29434c"/>
+  <text x="870" y="772" class="mono coral" font-size="21">05  repeat_until</text>
+  <text x="870" y="804" class="body">Try again, with a clear limit.</text>
+  <text x="870" y="828" class="small muted">Recheck after each repair.</text>
+  <rect x="870" y="862" width="362" height="104" rx="12" fill="#1b2e39"/>
+  <text x="890" y="892" class="small bold">Missing evidence? Limit reached?</text>
+  <text x="890" y="919" class="small muted">Block and explain what is needed.</text>
+  <text x="890" y="944" class="small muted">Edits run separately from reviews.</text>
+  <text x="48" y="1008" class="small muted">ILLUSTRATIVE FLOW · Actual steps are compiled from your request · Workflow engine requires Codex</text>
+</svg>

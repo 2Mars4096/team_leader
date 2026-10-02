@@ -8,7 +8,7 @@ It is useful when a project has tasks that can run separately: implementing
 several modules, reviewing changes, or investigating possible fixes. Each CLI
 worker has its own session and tools. For a small edit, one agent is usually enough.
 
-[Installation](#installation) · [Quick start](#quick-start) · [Supported providers](#supported-providers) · [API workers](#api-workers) · [FAQ](docs/faq.md)
+[Installation](#installation) · [Quick start](#quick-start) · [Workflow demo](#one-request-five-workflow-building-blocks) · [Supported providers](#supported-providers) · [API workers](#api-workers) · [FAQ](docs/faq.md)
 
 ## What it handles
 
@@ -105,6 +105,70 @@ python3 "$TL" team-status --project checkout-refactor --once
 
 Progress is saved under `.team-leader/` in that project. Reusing a project name
 continues its history; use a new name for a fresh start.
+
+## One request, five workflow building blocks
+
+“Review every module and function. If you find a confirmed bug, fix and recheck
+it, up to twice. Then run the full test suite.”
+
+That request combines all **five supported building blocks**: an action (`do`),
+ordered steps (`sequence`), loops (`for_each`), decisions (`if` with `else`), and
+bounded retries (`repeat_until`). Loops can nest, and independent reviews can
+run together.
+
+![Workflow demonstration: discover modules, loop through modules and functions, branch on confirmed bugs, repeat fixes and checks up to twice, then run final tests. The five building blocks are explained beside the flow.](docs/workflow-demo.svg)
+
+<details>
+<summary><strong>Copy the complete natural-language request</strong></summary>
+
+Paste this into Codex with the team-leader skill installed. Replace the checkout
+path with a dedicated checkout of your project. This starts real Codex work.
+
+```text
+Use $team-leader's workflow engine to create a workflow named module-review
+in /path/to/dedicated-checkout.
+
+Create two worker types:
+- reviewer: read-only, at most two active reviews.
+- editor: allowed to edit and run tests, at most one active task.
+Limit the workflow to three outstanding tasks overall.
+
+First, discover the project's own modules, their public functions, and the
+available test commands. Exclude generated files and third-party code.
+
+For each module, review its public functions one at a time. Different modules
+may be reviewed in parallel. Reuse a reviewer conversation within each module.
+
+For each function:
+1. Have the reviewer check for bugs and save the verdict with concrete evidence.
+2. If a bug is confirmed, repeat these steps until the reviewer passes it,
+   with a maximum of two repair rounds:
+   - Have the editor make a minimal fix and run the relevant tests.
+   - Have the reviewer check the revised code and test evidence again.
+3. Otherwise, leave the code unchanged and record the passing review.
+Collect each function's result and then each module's results.
+
+After all modules finish, have the editor run the full test suite.
+If it passes, have the reviewer summarize the changes, checks, and remaining
+limitations. Otherwise, report the failures and mark acceptance as unresolved.
+
+Represent the loops, branches, and repeat limit explicitly in the workflow.
+Missing required files or ambiguous test results must return uncertain and
+block the workflow. If two repair rounds do not pass, block and report why.
+A failed final test suite must also produce an uncertain acceptance result.
+```
+
+The manager creates the worker settings and submits the request to the workflow
+planner. Inspect the compiled steps and saved results under
+`.team-leader/workflows/module-review/`. The diagram illustrates the intended
+flow; it is not a recorded run or a guarantee of the planner's exact output.
+
+</details>
+
+The workflow engine currently requires **Codex**. Edits run separately from
+reviews; uncertain results or exhausted repair limits block further work.
+See the [workflow guide](skills/team-leader/references/workflows.md) for settings,
+pausing, and resuming.
 
 ## API workers
 
