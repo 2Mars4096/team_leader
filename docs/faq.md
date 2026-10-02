@@ -14,7 +14,7 @@ Yes. Copy the two skill directories into `~/.claude/skills/`, then invoke
 `/team-leader` or `/team-status`. Use `TEAM_LEADER_LAUNCHER_PROVIDER=claude` on
 controller commands to choose Claude planners and workers. The `intake` and
 `orchestrate` path works without Codex; the nested `workflow` command still
-requires Codex. See [Claude Code installation](../README.md#install-into-claude-code).
+requires Codex. See [Claude Code installation](../README.md#install-into-codex-or-claude-code).
 
 ## Is Team Leader limited to DeepSeek or OpenRouter APIs?
 

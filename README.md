@@ -36,17 +36,21 @@ You need **Python 3.10+** and **Git** for separate worker checkouts. The control
 uses only Python's standard library. CLI workers need one of the tools above;
 API workers need a compatible endpoint and its credentials.
 
-### Install into Codex
+### Install into Codex or Claude Code
 
-Ask Codex:
+Ask either tool:
 
 ```text
-Install the team-leader and team-status skills from 2Mars4096/team_leader.
+Install the team-leader and team-status skills from 2Mars4096/team_leader
+for the coding tool I am using.
 ```
 
-The skills go in `~/.codex/skills/`. Restart Codex after installation.
+The skills go in `~/.codex/skills/` for Codex or `~/.claude/skills/` for Claude Code. Restart Codex after installation.
 
-### Install into Claude Code
+<details>
+<summary>Manual installation</summary>
+
+For Claude Code:
 
 ```bash
 git clone https://github.com/2Mars4096/team_leader.git
@@ -58,6 +62,8 @@ cp -R team_leader/skills/team-status ~/.claude/skills/
 For a manual Codex installation, use `~/.codex/skills/` instead.
 Claude Code also supports project-local installation in `.claude/skills/`.
 See [Claude's skill documentation](https://code.claude.com/docs/en/skills).
+
+</details>
 
 ## Quick start
 
@@ -108,66 +114,69 @@ continues its history; use a new name for a fresh start.
 
 ## One request, five workflow building blocks
 
-“Review every module and function. If you find a confirmed bug, fix and recheck
-it, up to twice. Then run the full test suite.”
+Review every function, fix confirmed bugs, then test the whole project.
 
-That request combines all **five supported building blocks**: an action (`do`),
-ordered steps (`sequence`), loops (`for_each`), decisions (`if` with `else`), and
-bounded retries (`repeat_until`). Loops can nest, and independent reviews can
-run together.
+```mermaid
+flowchart TD
+    A[Find modules and functions] --> B[Review a function]
+    B --> C{Confirmed bug?}
+    C -- Yes --> D[Fix, test, and review again<br/>Up to 2 rounds]
+    C -- No --> E{More functions?}
+    D -- Pass --> E
+    E -- Yes --> B
+    E -- No --> F[Run the full test suite]
+    F --> G[Report results and remaining issues]
 
-![Workflow demonstration: discover modules, loop through modules and functions, branch on confirmed bugs, repeat fixes and checks up to twice, then run final tests. The five building blocks are explained beside the flow.](docs/workflow-demo.svg)
-
-<details>
-<summary><strong>Copy the complete natural-language request</strong></summary>
-
-Paste this into Codex with the team-leader skill installed. Replace the checkout
-path with a dedicated checkout of your project. This starts real Codex work.
-
-```text
-Use $team-leader's workflow engine to create a workflow named module-review
-in /path/to/dedicated-checkout.
-
-Create two worker types:
-- reviewer: read-only, at most two active reviews.
-- editor: allowed to edit and run tests, at most one active task.
-Limit the workflow to three outstanding tasks overall.
-
-First, discover the project's own modules, their public functions, and the
-available test commands. Exclude generated files and third-party code.
-
-For each module, review its public functions one at a time. Different modules
-may be reviewed in parallel. Reuse a reviewer conversation within each module.
-
-For each function:
-1. Have the reviewer check for bugs and save the verdict with concrete evidence.
-2. If a bug is confirmed, repeat these steps until the reviewer passes it,
-   with a maximum of two repair rounds:
-   - Have the editor make a minimal fix and run the relevant tests.
-   - Have the reviewer check the revised code and test evidence again.
-3. Otherwise, leave the code unchanged and record the passing review.
-Collect each function's result and then each module's results.
-
-After all modules finish, have the editor run the full test suite.
-If it passes, have the reviewer summarize the changes, checks, and remaining
-limitations. Otherwise, report the failures and mark acceptance as unresolved.
-
-Represent the loops, branches, and repeat limit explicitly in the workflow.
-Missing required files or ambiguous test results must return uncertain and
-block the workflow. If two repair rounds do not pass, block and report why.
-A failed final test suite must also produce an uncertain acceptance result.
+    style C fill:#fff3cd,stroke:#b8860b,color:#332800
+    style D fill:#fde8e4,stroke:#b85c4a,color:#3b201b
+    style G fill:#dff3e8,stroke:#408060,color:#173d29
 ```
 
-The manager creates the worker settings and submits the request to the workflow
-planner. Inspect the compiled steps and saved results under
-`.team-leader/workflows/module-review/`. The diagram illustrates the intended
-flow; it is not a recorded run or a guarantee of the planner's exact output.
+**Paste this into Codex** with the team-leader skill installed. Replace the path
+with a dedicated checkout of your project. The indented text is your request;
+you do not need to write a workflow configuration.
 
-</details>
+```text
+Use $team-leader to create and run a workflow named module-review
+in /path/to/dedicated-checkout. Preserve the loops and branches below.
 
-The workflow engine currently requires **Codex**. Edits run separately from
-reviews; uncertain results or exhausted repair limits block further work.
-See the [workflow guide](skills/team-leader/references/workflows.md) for settings,
+Workers:
+  reviewer — read-only, up to 2 at once
+  editor — can edit and run tests, 1 at a time
+  Maximum 3 outstanding tasks overall.
+
+FIRST discover the project's modules, public functions, and test commands.
+  Exclude generated files and third-party code.
+
+FOR EACH module (independent reviews may run in parallel):
+  FOR EACH public function (one at a time within this module):
+    REVIEW the function and save the verdict with concrete evidence.
+
+    IF a bug is confirmed:
+      REPEAT UNTIL the review passes, at most 2 rounds:
+        EDITOR: make a minimal fix and run the relevant tests.
+        REVIEWER: check the revised code and test results.
+    ELSE:
+      Record the passing review and leave the code unchanged.
+
+  Collect this module's results.
+
+FINALLY have the editor run the full test suite.
+  IF it passes:
+    Summarize changes, checks, and remaining limitations.
+  ELSE:
+    Report failures and return an uncertain acceptance result.
+
+If required evidence is missing, return uncertain and block the workflow.
+If two repair rounds do not pass, block and report why.
+```
+
+This uses all five building blocks: **actions**, **ordered steps**, **nested
+loops**, **if/else**, and **repeat until**. Edits run separately from reviews;
+missing evidence or exhausted repair limits block further work.
+
+The workflow engine requires **Codex**. See the
+[workflow guide](skills/team-leader/references/workflows.md) for configuration,
 pausing, and resuming.
 
 ## API workers
