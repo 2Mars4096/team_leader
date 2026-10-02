@@ -9,7 +9,16 @@ import subprocess
 import sys
 
 BUNDLE = Path(__file__).with_name("model_intelligence") / "scripts"
-DEFAULT_ENV_FILE = Path.home() / ".config" / "team-leader" / ".env"
+def account_home() -> Path:
+    """Resolve the OS account home, even when a launcher overrides HOME."""
+    try:
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):
+        return Path.home()
+
+
+DEFAULT_ENV_FILE = account_home() / ".config" / "team-leader" / ".env"
 ACTIONS = {"plan": "plan_workers.py", "run": "run_workers.py",
            "query": "query.py", "refresh": "refresh.py"}
 ENV_KEYS = {"OPENROUTER_API_KEY", "ARTIFICIAL_ANALYSIS_API_KEY",

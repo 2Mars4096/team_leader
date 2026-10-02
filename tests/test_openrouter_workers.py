@@ -15,6 +15,13 @@ spec.loader.exec_module(entry)
 
 
 class OpenRouterTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "OS account lookup requires POSIX")
+    def test_shared_path_ignores_launcher_home_override(self):
+        import pwd
+        expected = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with mock.patch.dict(os.environ, {"HOME": "/tmp/different-codex-account"}):
+            self.assertEqual(entry.account_home(), expected)
+
     def test_model_defaults_and_override_precedence(self):
         bundle = SCRIPTS / "model_intelligence/scripts"
         sys.path.insert(0, str(bundle))

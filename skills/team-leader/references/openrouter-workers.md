@@ -15,7 +15,7 @@ Commands below run from the target project. Resolve `scripts/team_leader.py`
 relative to the installed team-leader skill (in this repository,
 `skills/team-leader/scripts/team_leader.py`).
 
-Team-leader automatically loads `~/.config/team-leader/.env` from every project.
+Team-leader automatically loads `~/.config/team-leader/.env` (using the OS account home, not a launcher-overridden `HOME`) from every project.
 This is the shared credential file on this Mac; do not ask the user for a key or
 credential path before trying the controller with its defaults. Keep credentials
 outside the installed skill so reinstalling the skill preserves them.

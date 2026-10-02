@@ -7,7 +7,7 @@ description: Orchestrate worker teams with Codex by default, including persisten
 
 ## Overview
 
-OpenRouter credentials load automatically from `~/.config/team-leader/.env` across projects. Use the controller defaults before asking for credentials. `--env-file PATH` explicitly overrides this shared file. Never print the key.
+OpenRouter credentials load automatically from `~/.config/team-leader/.env` (using the OS account home, not a launcher-overridden `HOME`) across projects. Use the controller defaults before asking for credentials. `--env-file PATH` explicitly overrides this shared file. Never print the key.
 
 When OpenRouter is explicitly selected, default its workers to `deepseek/deepseek-v4.1-flash`. Honor an explicit task model, manifest `default_model`, or `MODEL_INTELLIGENCE_OPENROUTER_MODEL` override. Use manifest `default_model: "auto"` only when automatic cost/quality selection is requested. Keep the manager on Codex.
 
